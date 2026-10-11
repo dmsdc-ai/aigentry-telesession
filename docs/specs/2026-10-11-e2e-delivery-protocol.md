@@ -103,9 +103,10 @@ origin agent never needs to poll leg n directly.
 Ordering is `seq` (assigned at commit time, under the single-writer lock), not file mtime or name.
 
 ### 4.4 Status view (`telesession_request_status` result)
-`{ok, nonce, correlation_id, request_id, status, status_reasons, replies, next_cursor, ledger:{mode, write_failed, late_dropped, ack_event_failed}, stage, stages, unproven, deadline_passed, reply_count, late_after_ttl_count, cursor, ack_seq, final_ack_seq, delivered_to_origin_agent, checkpoint, outbox, rejected, completion_fact:null}`;
+`{ok, nonce, correlation_id, request_id, status, status_reasons, replies, next_cursor, ledger:{mode, write_failed, late_dropped, ack_event_failed}, stage, stages, unproven, deadline_passed, reply_count, late_after_ttl_count, cursor, ack_seq, final_ack_seq, first_ack_seq, delivered_to_origin_agent, checkpoint, outbox, rejected, completion_fact:null}`;
 `status` ∈ `pending | completed | rejected | unknown | expired | not_tracked`.
 `final_ack_seq` = seq of the final reply (same value as `ack_seq`, which is kept as an alias).
+`first_ack_seq` = seq of the first final reply (decides `completed`, §5; null until a final reply).
 `delivered_to_origin_agent` = `checkpoint !== null && checkpoint.cursor >= ack_seq` (false while `ack_seq` is null).
 `status_reasons` lists explicit codes such as `REMOTE_PROVENANCE_UNAVAILABLE`, `DEADLINE_PASSED`, `OUTBOX_UNCERTAIN`, `AWAITING_ORIGIN_AGENT_READ`, `NEWER_FINAL_ACK_UNREAD`.
 
@@ -317,7 +318,7 @@ it at `<stateDir>/ledger` when a state dir is configured (no new env var).
 | T7 | deadline passed without ACK | status `unknown`, never `not_delivered` |
 | T11 | verified reply after the transport TTL | stored as addendum `late_after_ttl:true`; status counts it |
 | T12 | remote destination stage without provenance | `REMOTE_PROVENANCE_UNAVAILABLE`; addendum `relayed_by_leg1_destination` |
-| T13 | ACK recorded, not yet read by the origin agent | `pending`; `completed` only after checkpoint ≥ `ack_seq` |
+| T13 | ACK recorded, not yet read by the origin agent | `pending`; `completed` only after the checkpoint covers `first_ack_seq` |
 | T8 | route resolution with two locator forms of one peer | same canonical peer; unknown form unresolved |
 | T9 | read-only ledger directory | no crash; reads work; writes `LEDGER_READ_ONLY` |
 | T10 | MCP: six strict tools; `request_status` schema | existing refusals unchanged |

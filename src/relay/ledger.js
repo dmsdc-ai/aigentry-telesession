@@ -590,7 +590,7 @@ export function openLedger(opts, seams) {
       unproven: { ...rec.unproven }, terminal: rec.terminal ? { ...rec.terminal } : null,
       deadline_passed: deadlinePassed, reply_count: rec.replies.length,
       late_after_ttl_count: rec.replies.filter((x) => x.late_after_ttl).length, late_pending: rec.late_pending.length,
-      cursor: rec.next_seq - 1, ack_seq: rec.ack_seq, final_ack_seq: rec.ack_seq, delivered_to_origin_agent: delivered,
+      cursor: rec.next_seq - 1, ack_seq: rec.ack_seq, final_ack_seq: rec.ack_seq, first_ack_seq: firstAck, delivered_to_origin_agent: delivered,
       checkpoint: rec.checkpoint ? { ...rec.checkpoint } : null, outbox, rejected: { ...rec.rejected }, completion_fact: null,
     };
   }
