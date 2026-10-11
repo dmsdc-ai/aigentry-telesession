@@ -207,6 +207,35 @@ describe("transport with correlation ledger (loopback fake telepty)", { skip: NO
     assert.equal(st.ledger.late_dropped, 0);
   });
 
+  // Review N11 (first bullet): a failed ledger write for the first reply is retried, not ignored.
+  test("a failed first-reply ledger write is surfaced and backfilled as seq 1 before any addendum", async (t) => {
+    const sb = makeSandbox("ts-ledger-n11-");
+    const fake = await startFakeTelepty();
+    const real = openLedger({ dir: path.join(sb.root, "ledger") });
+    let failOnce = true;
+    const ledger = { ...real, get mode() { return real.mode; }, appendReply(a) {
+      if (failOnce) { failOnce = false; return { ok: false, code: "LEDGER_WRITE_FAILED" }; }
+      return real.appendReply(a);
+    } };
+    const cfg = normalizeConfig({ teleptyUrl: fake.origin, token: fake.token, targets: ["target-1"], inboxPrefix: PREFIX, stateDir: sb.stateDir });
+    const tr = createTeleptyTransport(cfg, sb.seam(), { ledger });
+    t.after(async () => { await tr.close(); real.close(); await fake.close(); sb.remove(); });
+    const s = await tr.send({ target: "target-1", text: "job", request_id: "n11" });
+    assert.equal(s.ok, true, JSON.stringify(s));
+    fake.replyFrom("target-1", s.reply_to, `REPLY ${s.nonce} first`);
+    const r1 = await tr.readReply({ nonce: s.nonce, wait_ms: 8000 });
+    assert.equal(r1.reply, "trusted", JSON.stringify(r1));
+    assert.equal(failOnce, false, "the injected failure fired");
+    const st1 = await tr.requestStatus({ nonce: s.nonce });
+    assert.equal(st1.ledger.write_failed, 1, "surfaced");
+    fake.replyFrom("target-1", s.reply_to, `REPLY ${s.nonce} second`);
+    const r2 = await tr.readReply({ nonce: s.nonce, wait_ms: 8000, cursor: 1 });
+    assert.deepEqual(r2.replies.map((x) => [x.seq, x.text]), [[2, `REPLY ${s.nonce} second`]], JSON.stringify(r2));
+    const all = await tr.readReply({ nonce: s.nonce, cursor: 0 });
+    assert.deepEqual(all.replies.map((x) => [x.seq, x.text]), [[1, `REPLY ${s.nonce} first`], [2, `REPLY ${s.nonce} second`]]);
+    assert.equal(all.text, all.replies[0].text, "ledger seq 1 is read_reply's text");
+  });
+
   // Review G3 (B3): an open failure is surfaced with its code, not reported as LEDGER_NOT_CONFIGURED.
   test("G3 stale ledger lock → request_status and health report LEDGER_UNAVAILABLE with the open code", async (t) => {
     const sb = makeSandbox("ts-ledger-g3-");
