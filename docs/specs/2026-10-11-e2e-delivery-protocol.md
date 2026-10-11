@@ -102,7 +102,7 @@ origin agent never needs to poll leg n directly.
 Ordering is `seq` (assigned at commit time, under the single-writer lock), not file mtime or name.
 
 ### 4.4 Status view (`telesession_request_status` result)
-`{ok, nonce, correlation_id, request_id, status, status_reasons, replies, next_cursor, ledger:{mode, write_failed, late_dropped}, stage, stages, unproven, deadline_passed, reply_count, late_after_ttl_count, cursor, ack_seq, final_ack_seq, delivered_to_origin_agent, checkpoint, outbox, rejected, completion_fact:null}`;
+`{ok, nonce, correlation_id, request_id, status, status_reasons, replies, next_cursor, ledger:{mode, write_failed, late_dropped, ack_event_failed}, stage, stages, unproven, deadline_passed, reply_count, late_after_ttl_count, cursor, ack_seq, final_ack_seq, delivered_to_origin_agent, checkpoint, outbox, rejected, completion_fact:null}`;
 `status` ∈ `pending | completed | rejected | unknown | expired | not_tracked`.
 `final_ack_seq` = seq of the final reply (same value as `ack_seq`, which is kept as an alias).
 `delivered_to_origin_agent` = `checkpoint !== null && checkpoint.cursor >= ack_seq` (false while `ack_seq` is null).
@@ -124,6 +124,11 @@ Allowed transitions / effects:
   sender); the token only classifies which verified reply is final and never authenticates. A later final
   reply is a new event (its sha256 is part of the event key) and moves `ack_seq` forward; `ack_seq` never
   moves back.
+  Recording that event is checked: a failure (other than the expected `REMOTE_PROVENANCE_UNAVAILABLE`
+  for a relayed record, or `TERMINAL`) is counted in `ledger.write_failed` and `ledger.ack_event_failed`, and
+  every `request_status` / `read_reply` pass re-evaluates the stored final-tagged replies with
+  `seq > ack_seq` (from the destination, or from `via` for a relayed record), so the completion is
+  recovered idempotently. Stored replies were verified against the record's epoch, which is reused.
 - Status `completed` requires `origin_ack_received` AND `delivered_to_origin_agent`; with the ACK
   recorded but not yet read by the origin agent the status is `pending` (`AWAITING_ORIGIN_AGENT_READ`).
 - A destination-stage event that cannot be authenticated because remote host provenance is unavailable
