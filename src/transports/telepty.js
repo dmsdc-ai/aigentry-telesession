@@ -820,6 +820,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       else if (rec.target_epoch == null) rec.reply.candidates.forEach((c) => early.push({ key: keyOf(rec), nonce: rec.nonce, sha256: c.sha256, reason: "target_epoch_unknown" }));
     }
     if (early.length) commitVerdicts(early);
+    if (ledger) for (const rec of records()) if (rec.state === "answered" && isLive(rec, Date.now())) syncFirstReply(rec);
     const now = Date.now();
     const due = [];
     for (const rec of records()) {
@@ -904,6 +905,9 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
   // A verified reply into the ledger (seq order) + the destination stage it proves. For a relayed final
   // destination the leg-1 target's reply cannot prove the remote stage (telepty #100).
   function ledgerReply(nonce, sha256, row, receivedAt, late) {
+    // An addendum never lands before the trusted first reply holds seq 1 (review N11).
+    const owner = late ? null : byNonce(nonce);
+    if (owner && owner.reply.trusted && owner.reply.trusted.sha256 !== sha256 && !syncFirstReply(owner)) return false;
     const t = late ? ledger.readLateText(nonce, sha256) : getText(nonce, sha256);
     if (!t.ok) { ledgerStats.write_failed += 1; return false; }
     const from = { host: LOCAL, session: row.verified_sender_sid };
@@ -922,6 +926,16 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       });
     }
     return true;
+  }
+
+  // A first-reply ledger write that failed (counted in write_failed) is retried until the ledger has seq 1,
+  // so ledger seqs stay in step with read_reply. The trusted reply was verified against target_epoch.
+  function syncFirstReply(rec) {
+    if (!rec.reply.trusted || !tracks(rec.nonce)) return true;
+    const lr = ledger.record(rec.nonce);
+    if (!lr || lr.replies.length > 0) return true;
+    const tr = rec.reply.trusted;
+    return ledgerReply(rec.nonce, tr.sha256, { verified_sender_sid: tr.verified_sender.sid, verified_sender_epoch: rec.target_epoch }, tr.received_at, false);
   }
 
   // Late bytes held by the ledger: same audit binding as a live candidate, window up to retention.

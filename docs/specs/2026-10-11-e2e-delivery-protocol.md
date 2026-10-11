@@ -194,7 +194,9 @@ treat `nonce` as its own idempotency key. Exactly-once is never claimed.
 `telesession_read_reply` input gains optional `cursor` (int ≥ 0). Output keeps every existing field
 (`reply:"trusted"`, `text`, `inject_id`, `verified_sender`, `received_at` = the first reply, seq 1) and
 adds `replies: [{seq, text, sha256, from, received_at}]` (seq > cursor, ordered) and `next_cursor`.
-Callers that ignore the new fields see exactly the old behaviour.
+Callers that ignore the new fields see exactly the old behaviour. Ledger seq 1 is always the first
+(trusted) reply: if its ledger write fails (counted in `ledger.write_failed`), it is retried on later
+passes while the nonce is live, and no addendum is stored before it.
 
 New tool `telesession_request_status` — input `{nonce, cursor?}` (strict); read-only except that a
 `cursor` argument records the caller's checkpoint (`checkpoint = max(old, cursor)`): the origin
