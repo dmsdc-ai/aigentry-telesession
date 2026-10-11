@@ -73,6 +73,7 @@ origin agent never needs to poll leg n directly.
 | `stage` | enum §5 | highest stage reached (monotonic) |
 | `stages` | map stage→ISO\|null | first-evidence time per stage; null = no evidence |
 | `terminal` | null \| `{state:"rejected", at, reason}` | only an authenticated destination refusal sets it |
+| `reconstructed` | true\|absent | record rebuilt for an accepted inject that had none (crash or ledger failure between the store commit and the ledger create; audit recovery of an uncertain send). Done on transport open, after recovery and on a request_id dedupe hit. The store keeps neither destination nor correlation id, so it is fail-closed: `destination {host:"unknown"}`, the target as `via`, `correlation_id: null`; its replies are kept, a completion stays `REMOTE_PROVENANCE_UNAVAILABLE`, status reason `RECONSTRUCTED` |
 | `retired_at` | ISO\|null | retirement marker (§6.1); the record and its reply files stay |
 | `created_ms`, `deadline_ms`, `retain_until_ms` | int (epoch ms) | `deadline_ms` ends the *observation window*, not the record. Stored as integers; only the status view renders times (`stages`, `checkpoint.at`, `terminal.at`) as ISO |
 | `replies` | list of reply index entries (§4.3) | ordered by `seq` |
