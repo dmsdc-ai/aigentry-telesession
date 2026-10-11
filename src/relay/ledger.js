@@ -195,9 +195,20 @@ export function openLedger(opts, seams) {
       fsx.closeSync(fd);
     }
   } catch (err) {
-    if (err && err.code === "EEXIST") throw new LedgerError("LEDGER_LOCKED");
+    if (err && err.code === "EEXIST") throw new LedgerError(lockHolderDead() ? "LEDGER_LOCK_STALE" : "LEDGER_LOCKED");
     if (!READ_ONLY_CODES.has(err && err.code)) throw new LedgerError("LEDGER_WRITE_FAILED", errnoName(err));
     mode = "read_only";
+  }
+
+  // Detection only: the lock is never reclaimed (pid reuse). Operator recovery: confirm no telesession
+  // process uses this state dir, then remove `<ledger dir>/lock`.
+  function lockHolderDead() {
+    const r = readBounded(lockPath, LOCK_BYTES);
+    if (r.status !== "ok") return false;
+    let pid;
+    try { pid = JSON.parse(r.buf.toString("utf8")).pid; } catch { return false; }
+    if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+    try { process.kill(pid, 0); return false; } catch (e) { return Boolean(e) && e.code === "ESRCH"; }
   }
   let closed = false;
   let lost = false;

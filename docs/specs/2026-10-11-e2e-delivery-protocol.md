@@ -158,6 +158,14 @@ unreferenced file, swept on open). Bounds: records 1024, replies per nonce 32, o
 re-enter idempotently (§7, §10). The ledger never stores the origin prompt text, tokens or bearer values; an outbox item keeps its relay
 payload only until its receipt is recorded.
 
+Lock holder: the lock file records the holder pid. If it exists and that pid is not alive (`ESRCH`),
+open fails with `LEDGER_LOCK_STALE`; a live, unreadable or unparseable holder is `LEDGER_LOCKED`. The lock
+is never reclaimed automatically (pid reuse). Operator recovery: confirm that no telesession process uses
+the state dir, then remove `<ledger dir>/lock`. The transport keeps an open failure's code: while the ledger
+is unavailable, `telesession_request_status` returns `LEDGER_UNAVAILABLE` with `ledger_code` and
+`telesession_health` reports `ledger: {state:"unavailable", code:"LEDGER_UNAVAILABLE", ledger_code}`
+(`LEDGER_NOT_CONFIGURED` only when no ledger was configured).
+
 Read-only / permission-limited directory: open does not crash. If the lock cannot be created
 (`EACCES`/`EROFS`/`EPERM`) and `ledger.json` is readable, the ledger opens `read_only`: reads work,
 every mutation returns `{ok:false, code:"LEDGER_READ_ONLY"}`. Otherwise `LedgerError` with a code.
