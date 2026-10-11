@@ -32,7 +32,7 @@ const sha256 = (s) => createHash("sha256").update(Buffer.from(s, "utf8")).digest
 const hex = (n) => randomBytes(n).toString("hex");
 
 export function parseWire(prompt) {
-  const m = /^\[telesession nonce=([0-9a-f]{32}) reply-to=([A-Za-z0-9._-]+)\]\n([\s\S]*)$/.exec(String(prompt));
+  const m = /^\[telesession nonce=([0-9a-f]{32}) reply-to=([A-Za-z0-9._-]+)(?: correlation=[0-9a-f]{32})?\]\n([\s\S]*)$/.exec(String(prompt));
   return m ? { nonce: m[1], replyTo: m[2], text: m[3] } : null;
 }
 

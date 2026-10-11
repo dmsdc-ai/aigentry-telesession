@@ -79,12 +79,13 @@ code; `ISSUED_LIMIT` (16 live nonces, TTL 15 min). Every send: meta must list al
 (`TARGET_NOT_PRESENT`) → lazy inbox (receiver + `register {create_only:true, delivery_type:"aterm",
 command:"telesession-inbox"}`; only 201 with string token/epoch and same id counts; 409/200 →
 `INBOX_COLLISION`; lost response → `INBOX_REGISTRATION_UNKNOWN`, no retry/delete) → inject
-`{prompt:"[telesession nonce=<n> reply-to=<inbox>]\n"+text, from, reply_to, exact_target:true}` with
+`{prompt:"[telesession nonce=<n> reply-to=<inbox> correlation=<id>]\n"+text, from, reply_to, exact_target:true}` with
 the inbox bearer → 200 must echo `success, inject_id, exact_target:true, session_id===target` else
 `EXACT_ROUTING_UNCONFIRMED` (`accepted:"unknown"`) → one observation read for `session_epoch`.
-OK: `{inject_id, target, nonce, reply_to, accepted:true, delivery:"queued"|"unknown",
+OK: `{inject_id, target, nonce, correlation_id, reply_to, accepted:true, delivery:"queued"|"unknown",
 target_epoch_known, reply:"not_observed", durability:"memory_only", daemon_restart}`. No response:
-`{accepted:"unknown", inject_id:null, delivery:"unknown", reason}` — never re-sent.
+`{accepted:"unknown", inject_id:null, correlation_id, delivery:"unknown", reason}` — never re-sent.
+`correlation_id` (32 hex) is minted per send, immutable, and is the `correlation=` field of the header.
 
 ### 3.3 receipt (issued ids only, else `INJECT_NOT_ISSUED`)
 `consumption_observed` | `queued` (`inject_parked`) | `refused` (`aborted`) | `unknown` + `tracking_state`.

@@ -67,6 +67,7 @@ const isPlain = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 function isRecord(key, r) {
   return isPlain(r) && r.nonce === key && HEX32_RE.test(r.nonce) && HEX64_RE.test(r.payload_sha256)
     && isEndpoint(r.origin) && isEndpoint(r.destination) && isEndpoint(r.reply_to) && (r.via === null || isEndpoint(r.via))
+    && (r.correlation_id === undefined || r.correlation_id === null || HEX32_RE.test(r.correlation_id))
     && isPlain(r.stages) && Array.isArray(r.replies) && Number.isSafeInteger(r.next_seq) && r.next_seq >= 1
     && Array.isArray(r.events) && Array.isArray(r.late_pending) && isPlain(r.rejected) && isPlain(r.unproven)
     && Number.isSafeInteger(r.created_ms) && Number.isSafeInteger(r.deadline_ms) && Number.isSafeInteger(r.retain_until_ms);
@@ -339,16 +340,19 @@ export function openLedger(opts, seams) {
         || !isEndpoint(a.origin) || !isEndpoint(a.destination) || !isEndpoint(a.reply_to)
         || !(a.via === undefined || a.via === null || isEndpoint(a.via))
         || !(a.generation === null || (typeof a.generation === "string" && a.generation.length > 0 && a.generation.length <= 256))
-        || !HEX64_RE.test(a.payload_sha256 || "") || !Number.isSafeInteger(a.deadline_ms) || a.deadline_ms < 0) {
+        || !HEX64_RE.test(a.payload_sha256 || "") || !Number.isSafeInteger(a.deadline_ms) || a.deadline_ms < 0
+        || !(a.correlation_id === undefined || HEX32_RE.test(a.correlation_id))) {
       return fail("INVALID_ARGUMENT");
     }
     const prior = state.records[a.nonce];
     if (prior) {
-      return prior.payload_sha256 === a.payload_sha256 ? { ok: true, deduplicated: true } : fail("NONCE_CONFLICT");
+      return prior.payload_sha256 === a.payload_sha256 ? { ok: true, deduplicated: true, correlation_id: prior.correlation_id ?? null } : fail("NONCE_CONFLICT");
     }
     if (state.retired.includes(a.nonce)) return fail("NONCE_RETIRED");
     const t = now();
     const retainMs = Number.isSafeInteger(a.retain_ms) && a.retain_ms > 0 ? a.retain_ms : LEDGER_LIMITS.retainMs;
+    // Minted once at creation (the origin); immutable, never derived from request_id or nonce.
+    const correlationId = a.correlation_id ?? randomBytes(16).toString("hex");
     const r = commit((d) => {
       if (Object.keys(d.records).length >= LEDGER_LIMITS.records) {
         const due = Object.values(d.records).filter((x) => t > x.retain_until_ms).map((x) => x.nonce);
@@ -356,7 +360,7 @@ export function openLedger(opts, seams) {
         if (Object.keys(d.records).length >= LEDGER_LIMITS.records) return fail("LEDGER_FULL");
       }
       d.records[a.nonce] = {
-        nonce: a.nonce, request_id: a.request_id ?? null, origin: endpointOf(a.origin), destination: endpointOf(a.destination),
+        nonce: a.nonce, correlation_id: correlationId, request_id: a.request_id ?? null, origin: endpointOf(a.origin), destination: endpointOf(a.destination),
         via: a.via ? endpointOf(a.via) : null,
         via_generation: a.via && typeof a.via_generation === "string" && a.via_generation.length <= 256 ? a.via_generation : null,
         reply_to: endpointOf(a.reply_to), generation: a.generation,
@@ -365,8 +369,11 @@ export function openLedger(opts, seams) {
         replies: [], next_seq: 1, checkpoint: null, ack_seq: null, unproven: {}, late_pending: [], events: [], rejected: {},
       };
     });
-    return r.ok ? { ok: true, deduplicated: false } : r;
+    return r.ok ? { ok: true, deduplicated: false, correlation_id: correlationId } : r;
   }
+
+  // An event/receipt may carry the correlation id; a different one is refused with no state change.
+  const correlationMismatch = (rec, cid) => cid !== undefined && cid !== (rec.correlation_id ?? null);
 
   function reject(nonce, reason) {
     commit((d) => { const q = d.records[nonce]; if (q) q.rejected[reason] = (q.rejected[reason] || 0) + 1; });
@@ -378,6 +385,7 @@ export function openLedger(opts, seams) {
     const rec = state.records[ev.nonce];
     if (!rec) return fail("UNKNOWN_CORRELATION");
     if (!EVENT_STAGES.has(ev.stage) || !isEndpoint(ev.from)) return fail("INVALID_ARGUMENT");
+    if (correlationMismatch(rec, ev.correlation_id)) return fail("CORRELATION_MISMATCH");
     if (ev.payload_sha256 !== rec.payload_sha256) return reject(rec.nonce, "HASH_MISMATCH");
     if (rec.terminal) return fail("TERMINAL");
     const final = DESTINATION_STAGES.has(ev.stage);
@@ -442,11 +450,12 @@ export function openLedger(opts, seams) {
     return r.ok ? { ok: true, seq: r.value, deduplicated: false } : r;
   }
 
-  function appendReply({ nonce, text, from, verified, received_at, late_after_ttl } = {}) {
+  function appendReply({ nonce, text, from, verified, received_at, late_after_ttl, correlation_id } = {}) {
     if (mode !== "read_write") return fail("LEDGER_READ_ONLY");
     const rec = state.records[nonce];
     if (!rec) return fail("UNKNOWN_CORRELATION");
     if (typeof text !== "string" || !isEndpoint(from)) return fail("INVALID_ARGUMENT");
+    if (correlationMismatch(rec, correlation_id)) return fail("CORRELATION_MISMATCH");
     if (verified !== true) return fail("UNAUTHENTICATED");
     if (Buffer.byteLength(text, "utf8") > LEDGER_LIMITS.replyTextBytes) return fail("LEDGER_FULL");
     const sha = sha256hex(text);
@@ -548,7 +557,7 @@ export function openLedger(opts, seams) {
     else if (deadlinePassed) { status = "unknown"; reasons.push("DEADLINE_PASSED"); }
     else status = "pending";
     return {
-      ok: true, nonce: rec.nonce, request_id: rec.request_id, status, status_reasons: reasons,
+      ok: true, nonce: rec.nonce, correlation_id: rec.correlation_id ?? null, request_id: rec.request_id, status, status_reasons: reasons,
       stage: rec.stage === null ? "unknown" : rec.stage,
       stages: Object.fromEntries(STAGES.map((k) => [k, rec.stages[k] === null ? "unknown" : rec.stages[k]])),
       unproven: { ...rec.unproven }, terminal: rec.terminal ? { ...rec.terminal } : null,

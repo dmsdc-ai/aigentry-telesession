@@ -110,6 +110,56 @@ test("B1 processing_completed identity includes the reply sha: a later final rep
   assert.equal(l.status({ nonce: NONCE }).ack_seq, 2, "ack_seq never moves back");
 });
 
+test("correlation_id: minted 32-hex at creation (or the given one), immutable, persisted and in the status view", (t) => {
+  const { l, open, dir } = setup(t);
+  const minted = l.status({ nonce: NONCE }).correlation_id;
+  assert.match(minted, /^[0-9a-f]{32}$/);
+  const again = l.createRequest({
+    nonce: NONCE, request_id: "req-1", origin: ORIGIN, destination: DEST, reply_to: ORIGIN,
+    generation: "gen-1", payload_sha256: PAYLOAD, deadline_ms: 120000, correlation_id: "1".repeat(32),
+  });
+  assert.deepEqual([again.ok, again.deduplicated, again.correlation_id], [true, true, minted], "never overwritten");
+  const given = l.createRequest({
+    nonce: "b".repeat(32), origin: ORIGIN, destination: DEST, reply_to: ORIGIN,
+    generation: "gen-1", payload_sha256: PAYLOAD, deadline_ms: 120000, correlation_id: "2".repeat(32),
+  });
+  assert.equal(given.correlation_id, "2".repeat(32));
+  assert.equal(l.createRequest({
+    nonce: "c".repeat(32), origin: ORIGIN, destination: DEST, reply_to: ORIGIN,
+    generation: "gen-1", payload_sha256: PAYLOAD, deadline_ms: 120000, correlation_id: "not-hex",
+  }).code, "INVALID_ARGUMENT");
+  l.close();
+  const l2 = open();
+  t.after(() => l2.close());
+  assert.equal(l2.status({ nonce: NONCE }).correlation_id, minted);
+  assert.equal(l2.record("b".repeat(32)).correlation_id, "2".repeat(32));
+  // A record written before correlation_id existed still loads and accepts events without one.
+  l2.close();
+  const file = path.join(dir, "ledger.json");
+  const j = JSON.parse(fs.readFileSync(file, "utf8"));
+  delete j.records[NONCE].correlation_id;
+  fs.unlinkSync(file);
+  fs.writeFileSync(file, JSON.stringify(j), { mode: 0o600 });
+  const l3 = open();
+  t.after(() => l3.close());
+  assert.equal(l3.status({ nonce: NONCE }).correlation_id, null);
+  assert.equal(l3.appendReply({ nonce: NONCE, text: "old reply", from: DEST, verified: true }).seq, 1);
+  assert.equal(l3.recordEvent(ack("processing_completed")).applied, true);
+});
+
+test("correlation_id mismatch on an event or reply → CORRELATION_MISMATCH with no state change; match or absent is accepted", (t) => {
+  const { l } = setup(t);
+  const cid = l.status({ nonce: NONCE }).correlation_id;
+  const before = l.record(NONCE);
+  const wrong = "0".repeat(32) === cid ? "1".repeat(32) : "0".repeat(32);
+  assert.equal(l.recordEvent(ack("processing_completed", { correlation_id: wrong })).code, "CORRELATION_MISMATCH");
+  assert.equal(l.appendReply({ nonce: NONCE, text: "x", from: DEST, verified: true, correlation_id: wrong }).code, "CORRELATION_MISMATCH");
+  assert.deepEqual(l.record(NONCE), before, "no state change");
+  assert.equal(l.appendReply({ nonce: NONCE, text: "x", from: DEST, verified: true, correlation_id: cid }).seq, 1);
+  assert.equal(l.recordEvent(ack("processing_completed", { correlation_id: cid })).applied, true);
+  assert.equal(l.status({ nonce: NONCE }).stage, "origin_ack_received");
+});
+
 test("T3 out-of-order ACKs: completed before consumed; stage never regresses, timestamp filled later", (t) => {
   const { l, now } = setup(t);
   l.recordEvent(ack("transport_accepted", { from: HOP, hop: "intermediary" }));

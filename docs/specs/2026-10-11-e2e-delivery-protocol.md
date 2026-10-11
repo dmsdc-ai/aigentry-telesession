@@ -40,6 +40,7 @@ terminates on one endpoint host only).
 | hop | any session/daemon in between (local daemon queue, a relaying orchestrator, a bridge) |
 | leg | one origin→destination pair with its own record; a relaying session that forwards work opens a new leg whose origin is itself |
 | route | the request path (hops) — recorded, not assumed to be the reply path |
+| `correlation_id` | 32 hex minted once at request creation by the origin; immutable; carried on the wire header and accepted on events/receipts (§4.1). `nonce` stays the per-leg reply key and `request_id` the caller's idempotency key; neither is ever overwritten |
 | return route | `reply_to` endpoint (+ resolver locator) fixed at creation; immutable |
 
 Rules: (R1) an intermediary hop ACK can advance only `transport_accepted`/`durable_received` of the
@@ -59,7 +60,8 @@ origin agent never needs to poll leg n directly.
 ### 4.1 Ledger request record (`ledger.json` → `records[<nonce>]`)
 | field | type | notes |
 |---|---|---|
-| `nonce` | 32 hex | correlation id; immutable; also the reply-file key |
+| `nonce` | 32 hex | per-leg reply key (`REPLY <nonce>`); immutable; also the reply-file key |
+| `correlation_id` | 32 hex\|null | minted at creation (origin), immutable; on the wire as `[telesession nonce=<n> reply-to=<inbox> correlation=<id>]`; returned by `telesession_send` and the status view; null only for records written before the field existed |
 | `request_id` | string\|null | caller idempotency key (`^[A-Za-z0-9._:-]{1,128}$`) |
 | `origin` | endpoint | immutable |
 | `destination` | endpoint | immutable; only it may produce destination stages |
@@ -82,7 +84,7 @@ origin agent never needs to poll leg n directly.
 | `rejected` | map reason→count | refused events (wrong hash / generation / host / unauthenticated / hop-final) |
 
 ### 4.2 Event (input to `recordEvent`)
-`{nonce, stage, payload_sha256, generation, from: endpoint, authenticated: boolean, hop: "destination"|"intermediary", provenance_unavailable?: boolean, reply_seq?, reply_sha256?, reason?}`.
+`{nonce, stage, payload_sha256, generation, from: endpoint, authenticated: boolean, hop: "destination"|"intermediary", provenance_unavailable?: boolean, reply_seq?, reply_sha256?, correlation_id?, reason?}`.
 `stage` ∈ `transport_accepted, durable_received, agent_consumed, processing_completed, rejected`.
 
 ### 4.3 Reply / addendum (index entry in the record; text in a reply file)
@@ -100,7 +102,7 @@ origin agent never needs to poll leg n directly.
 Ordering is `seq` (assigned at commit time, under the single-writer lock), not file mtime or name.
 
 ### 4.4 Status view (`telesession_request_status` result)
-`{ok, nonce, request_id, status, status_reasons, replies, next_cursor, ledger:{mode, write_failed, late_dropped}, stage, stages, unproven, deadline_passed, reply_count, late_after_ttl_count, cursor, ack_seq, final_ack_seq, delivered_to_origin_agent, checkpoint, outbox, rejected, completion_fact:null}`;
+`{ok, nonce, correlation_id, request_id, status, status_reasons, replies, next_cursor, ledger:{mode, write_failed, late_dropped}, stage, stages, unproven, deadline_passed, reply_count, late_after_ttl_count, cursor, ack_seq, final_ack_seq, delivered_to_origin_agent, checkpoint, outbox, rejected, completion_fact:null}`;
 `status` ∈ `pending | completed | rejected | unknown | expired | not_tracked`.
 `final_ack_seq` = seq of the final reply (same value as `ack_seq`, which is kept as an alias).
 `delivered_to_origin_agent` = `checkpoint !== null && checkpoint.cursor >= ack_seq` (false while `ack_seq` is null).
@@ -136,7 +138,8 @@ Allowed transitions / effects:
   It means "outcome unknown, no longer tracked", not "not delivered".
 
 Event validation, in order, with no state change on failure (counted in `rejected[reason]`):
-unknown nonce → `UNKNOWN_CORRELATION`; `payload_sha256` ≠ record → `HASH_MISMATCH`;
+unknown nonce → `UNKNOWN_CORRELATION`; a `correlation_id` present and ≠ record → `CORRELATION_MISMATCH`
+(not counted, no state change; also checked on reply receipts, `appendReply`); `payload_sha256` ≠ record → `HASH_MISMATCH`;
 `authenticated !== true` → `UNAUTHENTICATED`; destination stages (3, 4, rejected) from a non-destination
 endpoint or with `hop:"intermediary"` → `SOURCE_MISMATCH` / `HOP_NOT_FINAL`; `generation` ≠ record
 generation (or record generation null for a destination stage) → `GENERATION_MISMATCH`.
@@ -258,7 +261,9 @@ deletes data or restarts a live service is a **separate approval**.
   outbox item (definite refusal or retries exhausted). Cancel = operator action, separate approval.
 - Success only when the origin ledger records an authenticated destination `processing_completed`
   (→ `origin_ack_received`). Integrity (hash), sender authentication (adapter attestation),
-  correlation (nonce + generation) and delivery stage are verified and reported separately.
+  correlation (`correlation_id`, nonce + generation) and delivery stage are verified and reported separately.
+- Multi-leg routes (review N12): a relaying leg-1 destination may carry the origin's `correlation_id` into
+  the legs it opens; the origin ledger does not yet link a leg-n nonce to the leg-1 nonce.
 
 ## 13. Phase-2 implementation slice
 
