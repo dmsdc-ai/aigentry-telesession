@@ -3,15 +3,16 @@
  *
  * Parent side: startChildHost(mode, spec) spawns `node child-host.js --telesession-child-host <mode>`
  * with stdin ignored, stderr to a log file, and stdout as a pipe used ONLY for the fixture protocol
- * (one JSON object per line: {event:"ready"|"result"|"closed"|"error", ...}). Every child is reaped
- * by a bounded stop (SIGTERM, then SIGKILL).
+ * (one JSON object per line: {event:"ready"|"result"|"closed"|"error", ...}), plus an IPC channel used
+ * ONLY for the graceful stop request. Every child is reaped by a bounded stop (SIGTERM on POSIX, an IPC
+ * {cmd:"stop"} on win32 where SIGTERM is TerminateProcess; then SIGKILL).
  *
  * Child side (only when argv carries the flag; importing this file — e.g. when `node --test test/`
  * loads it — has no side effect):
  *   store-hold      openStore on spec.dir via the REAL src/store.js, optionally commit spec.requests,
- *                   report ready, then idle until SIGTERM → store.close() → "closed" → exit 0.
+ *                   report ready, then idle until graceful stop → store.close() → "closed" → exit 0.
  *   transport-send  createTeleptyTransport via the REAL src/index.js with spec.config (+ storeOptions),
- *                   report ready, run one send(spec.send), report the result, idle until SIGTERM →
+ *                   report ready, run one send(spec.send), report the result, idle until graceful stop →
  *                   transport.close() → "closed" → exit 0.
  * A SIGKILL from the parent is the abrupt crash under test; nothing in the child can react to it.
  */
@@ -53,7 +54,7 @@ export function startChildHost(mode, spec, { name = mode } = {}) {
   const fd = fs.openSync(logFile, "w");
   const child = spawn(process.execPath, [CHILD_HOST, FLAG, mode], {
     env: { ...baseEnv(), TELESESSION_CHILD_SPEC: JSON.stringify(spec) },
-    stdio: ["ignore", "pipe", fd],
+    stdio: ["ignore", "pipe", fd, "ipc"],
     windowsHide: true,
   });
   fs.closeSync(fd);
@@ -99,10 +100,15 @@ export function startChildHost(mode, spec, { name = mode } = {}) {
     return waitExit(5000);
   }
 
-  // Graceful stop with a bound: SIGTERM, then SIGKILL.
+  // Graceful stop with a bound: SIGTERM (POSIX) or an IPC stop request (win32), then SIGKILL.
+  // On win32 child.kill("SIGTERM") is TerminateProcess, so the child's SIGTERM handler would never run.
   async function stop(graceMs = 5000) {
     if (child.exitCode === null && child.signalCode === null) {
-      try { child.kill("SIGTERM"); } catch { /* gone */ }
+      if (process.platform === "win32") {
+        try { child.send({ cmd: "stop" }, () => { /* send errors: the SIGKILL bound below still reaps */ }); } catch { /* gone */ }
+      } else {
+        try { child.kill("SIGTERM"); } catch { /* gone */ }
+      }
       const r = await waitExit(graceMs);
       if (r === null) await crash();
     }
@@ -124,15 +130,18 @@ async function childMain(mode) {
   const spec = JSON.parse(process.env.TELESESSION_CHILD_SPEC || "{}");
   let closeFn = async () => {};
   let stopping = false;
-  process.on("SIGTERM", () => {
+  const gracefulStop = () => {
     if (stopping) return;
     stopping = true;
     Promise.resolve()
       .then(() => closeFn())
       .then((r) => emit({ event: "closed", result: r ?? null }))
       .catch((e) => emit({ event: "closed", error: (e && e.code) || "CLOSE_THREW" }))
-      .finally(() => process.exit(0));
-  });
+      // Exit only after "closed" is flushed: stdout pipe writes may be asynchronous.
+      .finally(() => process.stdout.write("", () => process.exit(0)));
+  };
+  process.on("SIGTERM", gracefulStop);
+  process.on("message", (m) => { if (m && m.cmd === "stop") gracefulStop(); });
   const keepAlive = setInterval(() => {}, 1 << 30);
 
   if (mode === "store-hold") {

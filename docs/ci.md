@@ -45,6 +45,30 @@ cancelled, skipped and todo counts to the job summary, and lists every skipped t
 if there is no TAP output or zero passing tests. A cancelled test (for example, one that never settles) makes
 `node --test` exit non-zero and fails the job.
 
+### Observed hosted run and Windows fixture contracts
+
+Run 38112321584 at main `351966216308962b16ca8986e2b0f17b591fac47`:
+
+- `npm ci` passed on all three OSes. Unit tests passed on ubuntu and macos, and the pack dry-run passed.
+- **Windows unit failed:** 101 tests, 63 pass, 10 fail, 28 skipped, 0 cancelled. All 10 failures were in
+  `test/store.test.js`, and they come from two test-fixture causes, not a demonstrated store defect:
+  1. **Fault-seam path identity (9 vectors).** These are the open/write/fsync tmp faults for ENOSPC and EIO,
+     directory-fsync errno handling, graceful-close lock unlink, and ENOSPC on a reply write.
+     - `src/store.js` canonicalizes its dir with `fs.realpathSync.native`, and every call it makes uses that form.
+     - The sandbox used the JS `fs.realpathSync`, so exact-path predicates (`tmpIn`, `ctx.paths[0] === stateDir`,
+       `callsTouching(lock)`) never matched on Windows. The failure was `hits` 0 !== 1.
+     - Only the rename vectors passed, because they match on `basename`. The run log does not show the two path
+       strings, so the exact difference (8.3 short name or case) is unconfirmed.
+     - Fix: the sandbox now uses the same native realpath, and a regression test asserts it on every OS.
+  2. **Graceful stop (1 vector).** On Windows `child.kill("SIGTERM")` is TerminateProcess, so the child's SIGTERM
+     handler never ran and no `closed` event arrived.
+     - Fix: on win32 the fixture sends a cooperative IPC `{cmd:"stop"}`, and the child runs the same
+       close → `closed` → exit path. POSIX still uses SIGTERM.
+     - The abrupt-crash evidence (SIGKILL, lock stays, `STORE_LOCKED`) is unchanged on every OS.
+
+These fixes are test-side only. They count as verified only once a hosted re-run is green. Fixing them adds
+one test, so Windows should report 102 tests.
+
 ### What a green matrix proves, and what it does not
 
 It proves that, on each hosted OS with Node 20.20.0:

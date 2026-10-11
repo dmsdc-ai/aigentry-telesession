@@ -18,8 +18,8 @@ the next aigentry release.
 | Area | Status |
 |---|---|
 | Synthetic Linux VM run (fake telepty) | Historical: 22 isolation checks; 36 passed / 0 failed / 13 excluded. This was a fake-telepty suite. It is **not** evidence for an installed package or a live product, and the 13 excluded tests were not run. |
-| Launcher unit tests (`test/tunnel-child.test.js`), original suite | Independent run: **12 passed / 6 cancelled**. The cancellations come from the test harness: the fake child has no default pid. A product code defect was not demonstrated. The test file in this snapshot is that original, uncorrected suite. |
-| Launcher unit tests, independently corrected fake suite | 10/10 passed in an independent run. The corrected suite is **not** part of this snapshot; a harness correction is pending separately. |
+| Launcher unit tests (`test/tunnel-child.test.js`) | The original suite ran 12 passed / 6 cancelled in an independent run, a test-harness defect (the fake child turned an explicit `pid: undefined` into 4242). This snapshot carries the corrected fake. Hosted CI run 38112321584 (main `35196621`): passed on ubuntu, macos and windows. |
+| Launcher independent suite (`test/tunnel-child-independent.test.js`) | 10/10 in an independent run; included in this snapshot. Hosted CI run 38112321584: passed on ubuntu, macos and windows. |
 | Launcher independent pure verification and security triage | Ongoing at snapshot time. |
 | Real-daemon restart regression tests (RC5, `test/real-daemon-restart.test.js`) | Authored and syntax-checked only. Never run. |
 | Existing real-daemon tests (`transport-telepty.test.js`, `mcp.test.js`) | Not run against a candidate telepty daemon. |
@@ -28,7 +28,7 @@ the next aigentry release.
 | Tunnel launch (tunnel client + launcher) | NOTRUN |
 | Real telepty daemon activation and restart | NOTRUN |
 | Native macOS / Windows / Linux acceptance | NOTRUN |
-| Hosted CI | None configured. Cross-platform release CI is planned separately. |
+| Hosted CI (`ci.yml`, explicit unit files, Node 20.20.0) | Run 38112321584 at main `35196621`: `npm ci` passed on all 3 OSes; unit passed on ubuntu and macos; pack dry-run passed. **Windows unit FAILED**: 101 tests, 63 pass, 10 fail, 28 skipped, 0 cancelled. All 10 failures are in `test/store.test.js` (9 fault-seam exact-path predicates, 1 SIGTERM graceful stop). A test-side fix is pending review and a hosted re-run; see `docs/ci.md`. Unit CI is not product acceptance. |
 
 No test result in this table was produced by creating this snapshot. No tests, builds or installs were
 run to create it.

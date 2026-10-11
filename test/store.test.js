@@ -233,6 +233,18 @@ describe("open / commit / graceful close-reopen (real fs)", () => {
 });
 
 describe("atomic write faults (fault-fs over the real fs)", () => {
+  // The exact-path predicates below only bite if the sandbox speaks the store's (native realpath) path form.
+  test("sandbox stateDir is the store's canonical path; the store's tmp writes match tmpIn(stateDir)", (t) => {
+    const sb = sandbox(t);
+    const ff = createFaultFs();
+    const s = sb.open({}, { fs: ff.fs });
+    assert.equal(fs.realpathSync.native(sb.stateDir), sb.stateDir);
+    ff.resetCalls();
+    assert.deepEqual(s.commit((d) => { d.counters.canon = 1; }), { ok: true });
+    const pred = tmpIn(sb.stateDir);
+    assert.ok(ff.calls.some((c) => c.op === "openSync" && pred(c)), "store opened its tmp under the sandbox stateDir");
+  });
+
   const points = [
     { name: "open tmp", op: "openSync" },
     { name: "write tmp", op: ["writeSync", "writeFileSync"] },
@@ -591,7 +603,7 @@ describe("lock: strict single writer, no takeover (SPEC-R2 §5)", () => {
     assert.equal(s.snapshot().inbox.id, inboxId);
   });
 
-  test("graceful stop of a store child (SIGTERM → close) releases the lock; parent reopens", async (t) => {
+  test("graceful stop of a store child (SIGTERM on POSIX / IPC stop on win32 → close) releases the lock; parent reopens", async (t) => {
     const sb = sandbox(t);
     const inboxId = newInboxId(PREFIX);
     const rec = makeRequest({ request_id: "graceful-1", sender: sender(inboxId) });

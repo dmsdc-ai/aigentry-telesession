@@ -161,7 +161,9 @@ export const tmpLeftovers = (dir) => {
 // ── Hermetic sandbox: a fake home H, a project cwd P outside H, both under os.tmpdir() ──
 
 export function makeSandbox(prefix = "ts-store-") {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+  // Native realpath, as src/store.js uses for its dir: on Windows the JS realpath can keep 8.3 short names /
+  // drive-letter case that the native one expands, so exact path predicates would never match the store's calls.
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
   const home = path.join(root, "home");
   const project = path.join(root, "work", "project");
   fs.mkdirSync(home, { mode: 0o700 });
