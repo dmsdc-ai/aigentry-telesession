@@ -27,6 +27,8 @@ export const STAGES = Object.freeze(["transport_accepted", "durable_received", "
 const EVENT_STAGES = new Set(["transport_accepted", "durable_received", "agent_consumed", "processing_completed", "rejected"]);
 const DESTINATION_STAGES = new Set(["agent_consumed", "processing_completed", "rejected"]);
 const OUTBOX_STATES = ["queued", "intent", "sent", "uncertain", "failed"];
+// A quarantine is a review marker on an outbox item (never replayed automatically, never deleted here).
+const QUARANTINE_REASONS = new Set(["no_live_correlation", "past_deadline", "payload_changed", "max_attempts"]);
 const HEX32_RE = /^[0-9a-f]{32}$/;
 const HEX64_RE = /^[0-9a-f]{64}$/;
 const REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -70,12 +72,15 @@ const isPlain = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const isReplyEntry = (x) => isPlain(x) && Number.isSafeInteger(x.seq) && x.seq >= 1 && HEX64_RE.test(x.sha256) && isEndpoint(x.from);
 const isLateEntry = (x) => isPlain(x) && HEX64_RE.test(x.sha256);
 const isOutboxItem = (k, o) => isPlain(o) && o.key === k && HEX32_RE.test(k) && OUTBOX_STATES.includes(o.state) && HEX32_RE.test(o.nonce)
-  && isEndpoint(o.to) && typeof o.kind === "string" && KIND_RE.test(o.kind) && HEX64_RE.test(o.payload_sha256);
+  && isEndpoint(o.to) && typeof o.kind === "string" && KIND_RE.test(o.kind) && HEX64_RE.test(o.payload_sha256)
+  && (o.quarantine === undefined || o.quarantine === null
+    || (isPlain(o.quarantine) && QUARANTINE_REASONS.has(o.quarantine.reason) && typeof o.quarantine.at === "string"));
 
 function isRecord(key, r) {
   return isPlain(r) && r.nonce === key && HEX32_RE.test(r.nonce) && HEX64_RE.test(r.payload_sha256)
     && isEndpoint(r.origin) && isEndpoint(r.destination) && isEndpoint(r.reply_to) && (r.via === null || isEndpoint(r.via))
     && (r.correlation_id === undefined || r.correlation_id === null || HEX32_RE.test(r.correlation_id))
+    && (r.retired_at === undefined || r.retired_at === null || typeof r.retired_at === "string")
     && isPlain(r.stages) && Array.isArray(r.replies) && r.replies.every(isReplyEntry) && Number.isSafeInteger(r.next_seq) && r.next_seq >= 1
     && Array.isArray(r.events) && Array.isArray(r.late_pending) && r.late_pending.every(isLateEntry) && isPlain(r.rejected) && isPlain(r.unproven)
     && Number.isSafeInteger(r.created_ms) && Number.isSafeInteger(r.deadline_ms) && Number.isSafeInteger(r.retain_until_ms);
@@ -317,7 +322,8 @@ export function openLedger(opts, seams) {
     return "intermediary";
   }
 
-  // ── Open-time recovery (writable only): intent without receipt → uncertain; retire past retention. ──
+  // ── Open-time recovery (writable only): intent without receipt → uncertain; mark records past retention
+  // retired (marker only: the record and its reply files stay); quarantine stale outbox items. ──
   if (mode === "read_write") {
     try {
       for (const name of fsx.readdirSync(dir)) if (TMP_RE.test(name)) { try { fsx.unlinkSync(path.join(dir, name)); } catch { /* best effort */ } }
@@ -334,21 +340,22 @@ export function openLedger(opts, seams) {
     } catch { /* best effort sweep */ }
     const stuck = Object.values(state.outbox).some((o) => o.state === "intent");
     const t = now();
-    const old = Object.values(state.records).filter((r) => t > r.retain_until_ms);
+    const old = Object.values(state.records).filter((r) => t > r.retain_until_ms && !r.retired_at);
     if (stuck || old.length) {
       const r = commit((d) => {
         for (const o of Object.values(d.outbox)) if (o.state === "intent") { o.state = "uncertain"; o.last_error = "PROCESS_RESTART"; }
         retire(d, old.map((x) => x.nonce));
       });
       if (!r.ok) { releaseLock(); throw new LedgerError(r.code, r.errno); }
-      for (const rec of old) for (const x of [...rec.replies, ...rec.late_pending]) unlinkReply(rec.nonce, x.sha256);
     }
+    sweepOutbox();
   }
 
+  // Retire = a marker. Deleting a retired record or its files is an operator action (prunable(): dry run).
   function retire(d, nonces) {
+    const at = iso(now());
     for (const n of nonces) {
-      delete d.records[n];
-      for (const [k, o] of Object.entries(d.outbox)) if (o.nonce === n) delete d.outbox[k];
+      if (d.records[n] && !d.records[n].retired_at) d.records[n].retired_at = at;
       if (!d.retired.includes(n)) d.retired.push(n);
       while (d.retired.length > LEDGER_LIMITS.retired) d.retired.shift();
     }
@@ -567,6 +574,8 @@ export function openLedger(opts, seams) {
     const items = Object.values(state.outbox).filter((o) => o.nonce === rec.nonce);
     const outbox = Object.fromEntries(OUTBOX_STATES.map((k) => [k, items.filter((o) => o.state === k).length]));
     const deadlinePassed = t > rec.deadline_ms;
+    const retired = Boolean(rec.retired_at) || t > rec.retain_until_ms;
+    const quarantined = items.filter((o) => o.quarantine);
     const delivered = rec.ack_seq !== null && rec.checkpoint !== null && rec.checkpoint.cursor >= rec.ack_seq;
     // Completed once the checkpoint covered the first final reply (records before this field: ack_seq);
     // a later final reply never flips it back, it is flagged until read.
@@ -583,6 +592,10 @@ export function openLedger(opts, seams) {
     } else if (outbox.uncertain > 0) { status = "unknown"; reasons.push("OUTBOX_UNCERTAIN"); }
     else if (deadlinePassed) { status = "unknown"; reasons.push("DEADLINE_PASSED"); }
     else status = "pending";
+    // Tracking ended: an open outcome reads `expired` (unknown, not "not delivered"); a known one stays.
+    if (retired && status !== "completed" && status !== "rejected") status = "expired";
+    if (retired) reasons.push("RETIRED");
+    outbox.quarantined = quarantined.length;
     return {
       ok: true, nonce: rec.nonce, correlation_id: rec.correlation_id ?? null, request_id: rec.request_id, status, status_reasons: reasons,
       stage: rec.stage === null ? "unknown" : rec.stage,
@@ -591,7 +604,10 @@ export function openLedger(opts, seams) {
       deadline_passed: deadlinePassed, reply_count: rec.replies.length,
       late_after_ttl_count: rec.replies.filter((x) => x.late_after_ttl).length, late_pending: rec.late_pending.length,
       cursor: rec.next_seq - 1, ack_seq: rec.ack_seq, final_ack_seq: rec.ack_seq, first_ack_seq: firstAck, delivered_to_origin_agent: delivered,
-      checkpoint: rec.checkpoint ? { ...rec.checkpoint } : null, outbox, rejected: { ...rec.rejected }, completion_fact: null,
+      checkpoint: rec.checkpoint ? { ...rec.checkpoint } : null, outbox, rejected: { ...rec.rejected },
+      lifecycle: retired ? "retired" : deadlinePassed ? "past_deadline" : "active", retired_at: rec.retired_at ?? null,
+      quarantined: quarantined.map((o) => ({ key: o.key, kind: o.kind, state: o.state, reason: o.quarantine.reason, at: o.quarantine.at })),
+      completion_fact: null,
     };
   }
 
@@ -600,9 +616,8 @@ export function openLedger(opts, seams) {
     if (typeof nonce !== "string" || !HEX32_RE.test(nonce)) return fail("INVALID_ARGUMENT");
     if (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < 0)) return fail("INVALID_ARGUMENT");
     let rec = state.records[nonce];
-    if (!rec || now() > rec.retain_until_ms) {
-      return { ok: true, nonce, status: rec || state.retired.includes(nonce) ? "expired" : "not_tracked", completion_fact: null };
-    }
+    // A retired record stays readable (view: lifecycle retired); only a nonce whose record is gone is a stub.
+    if (!rec) return { ok: true, nonce, status: state.retired.includes(nonce) ? "expired" : "not_tracked", completion_fact: null };
     if (cursor !== undefined && mode === "read_write") {
       const c = Math.min(cursor, rec.next_seq - 1);
       if (rec.checkpoint === null || c > rec.checkpoint.cursor) {
@@ -643,10 +658,16 @@ export function openLedger(opts, seams) {
     const key = sha256hex(`${nonce}:${payload}:${hopKey(to)}:${kind}`).slice(0, 32);
     if (state.outbox[key]) return { ok: true, key, deduplicated: true };
     if (Object.keys(state.outbox).length >= LEDGER_LIMITS.outbox) return fail("LEDGER_FULL");
+    // Same nonce/destination/kind with another payload: the new one is a new key, the old queued one is
+    // quarantined (never sent alongside it).
+    const changed = Object.values(state.outbox).filter((o) => o.nonce === nonce && o.kind === kind && hopKey(o.to) === hopKey(to)
+      && o.state === "queued" && !o.quarantine).map((o) => o.key);
+    const at = iso(now());
     const r = commit((d) => {
+      for (const k of changed) d.outbox[k].quarantine = { reason: "payload_changed", at };
       d.outbox[key] = {
         key, nonce, kind, to: endpointOf(to), payload_sha256: payload, text, state: "queued", attempts: 0,
-        created_at: iso(now()), intent_at: null, receipt: null, last_error: null,
+        created_at: at, intent_at: null, receipt: null, last_error: null, quarantine: null,
       };
     });
     return r.ok ? { ok: true, key, deduplicated: false } : r;
@@ -667,11 +688,43 @@ export function openLedger(opts, seams) {
     return r.ok ? { ok: true } : r;
   }
 
+  // §11: queued/uncertain items whose record is retired or gone (no_live_correlation) or past its deadline
+  // (past_deadline) are quarantined. Runs on open and before every relay tick; idempotent.
+  function sweepOutbox() {
+    if (mode !== "read_write") return fail("LEDGER_READ_ONLY");
+    const t = now();
+    const due = [];
+    for (const o of Object.values(state.outbox)) {
+      if (o.quarantine || (o.state !== "queued" && o.state !== "uncertain")) continue;
+      const rec = state.records[o.nonce];
+      const reason = !rec || rec.retired_at || t > rec.retain_until_ms ? "no_live_correlation" : t > rec.deadline_ms ? "past_deadline" : null;
+      if (reason) due.push([o.key, reason]);
+    }
+    if (due.length === 0) return { ok: true, quarantined: [] };
+    const at = iso(t);
+    const r = commit((d) => { for (const [k, reason] of due) d.outbox[k].quarantine = { reason, at }; });
+    return r.ok ? { ok: true, quarantined: due.map(([k]) => k) } : r;
+  }
+
+  // Dry-run listing for the operator's prune (deletion itself is not implemented here).
+  function prunable() {
+    const t = now();
+    return {
+      ok: true,
+      records: Object.values(state.records).filter((r) => r.retired_at || t > r.retain_until_ms).map((r) => ({
+        nonce: r.nonce, request_id: r.request_id, retired_at: r.retired_at ?? null, reply_files: r.replies.length + r.late_pending.length,
+      })),
+      outbox: Object.values(state.outbox).filter((o) => o.quarantine).map((o) => ({
+        key: o.key, nonce: o.nonce, state: o.state, reason: o.quarantine.reason, at: o.quarantine.at,
+      })),
+    };
+  }
+
   return Object.freeze({
     get mode() { return mode; },
     createRequest, recordEvent, appendReply, readReplies, status, has, record,
     holdLate, latePending, readLateText, promoteLate, dropLate,
-    enqueue, outbox, outboxTransition,
+    enqueue, outbox, outboxTransition, sweepOutbox, prunable,
     close() {
       if (closed) return;
       try { releaseLock(); } catch { /* owner-matched only */ }

@@ -14,7 +14,8 @@
   "bin": {
     "telesession-mcp": "bin/telesession-mcp.js",
     "telesession-tunnel-child": "bin/telesession-tunnel-child.js",
-    "telesession-relay-tick": "bin/telesession-relay-tick.js"
+    "telesession-relay-tick": "bin/telesession-relay-tick.js",
+    "telesession-ledger-prune": "bin/telesession-ledger-prune.js"
   },
   "scripts": {
     "test": "node --test test/",

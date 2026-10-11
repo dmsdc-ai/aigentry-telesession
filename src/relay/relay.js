@@ -28,7 +28,7 @@ export async function relayTick({ ledger, send, resolver, maxItems = Infinity, d
   };
   for (const item of ledger.outbox()) {
     if (item.state === "uncertain") { out.uncertain.push(item.key); continue; }
-    if (item.state !== "queued") continue;
+    if (item.state !== "queued" || item.quarantine) continue;
     if (attempted >= maxItems || now() >= deadlineAt) { out.deferred.push(item.key); continue; }
     const route = resolver.resolve(item.to);
     if (!route.ok) {
@@ -50,7 +50,10 @@ export async function relayTick({ ledger, send, resolver, maxItems = Infinity, d
     } else if (r && r.ok === false && r.sent === "no") {
       const attempts = item.attempts + 1;
       const done = attempts >= LEDGER_LIMITS.sendAttempts;
-      settle(item.key, "intent", { state: done ? "failed" : "queued", attempts, intent_at: null, last_error: codeOf(r) }, done ? out.failed : out.requeued);
+      settle(item.key, "intent", {
+        state: done ? "failed" : "queued", attempts, intent_at: null, last_error: codeOf(r),
+        ...(done ? { quarantine: { reason: "max_attempts", at: new Date().toISOString() } } : {}),
+      }, done ? out.failed : out.requeued);
     } else if (r && r.ok === false && r.sent === "yes") {
       settle(item.key, "intent", { state: "failed", attempts: item.attempts + 1, last_error: codeOf(r) }, out.failed);
     } else {
