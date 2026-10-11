@@ -69,7 +69,8 @@ every result. `cursor`, `destination` and `request_status` use the correlation l
 Flow: `send` injects `[telesession nonce=<n> reply-to=<inbox> correlation=<id>]` + newline + text into the exact
 target (`exact_target:true`, no alias fallback). The target answers from its own telepty session into
 `<inbox>` with first line `REPLY <nonce>`; a reply that is the final ACK carries `[telesession ack=final]` on
-one of its first three lines (any other verified reply is an addendum). `send` returns the immutable
+one of its first three lines (any other verified reply is an addendum). A destination must not echo the
+origin prompt (or its header region) in the first three lines of a reply. `send` returns the immutable
 `correlation_id` (32 hex) that is also on the wire header. `read_reply` returns the text only after the audit check;
 otherwise counts per reason. `receipt` is a transport observation, never a reply. A send without a
 response is `accepted: "unknown"` and is never re-sent. `daemon_restart`

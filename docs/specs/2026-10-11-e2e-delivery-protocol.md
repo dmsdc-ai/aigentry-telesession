@@ -77,6 +77,7 @@ origin agent never needs to poll leg n directly.
 | `replies` | list of reply index entries (§4.3) | ordered by `seq` |
 | `next_seq` | int ≥ 1 | monotonic, never reused |
 | `checkpoint` | null \| `{cursor, at}` | the origin agent's acknowledged read position |
+| `first_ack_seq` | int\|null | seq of the first final reply; fixed once set; decides `completed` (§5) |
 | `ack_seq` | int\|null | seq of the final reply (`[telesession ack=final]`, §5) that recorded `processing_completed`; only moves forward |
 | `unproven` | map stage→reason | destination stages seen but not authenticatable, e.g. `REMOTE_PROVENANCE_UNAVAILABLE` |
 | `late_pending` | list `{sha256, received_at}` (bounded 4) | reply bytes held after the transport TTL, awaiting verification |
@@ -106,7 +107,7 @@ Ordering is `seq` (assigned at commit time, under the single-writer lock), not f
 `status` ∈ `pending | completed | rejected | unknown | expired | not_tracked`.
 `final_ack_seq` = seq of the final reply (same value as `ack_seq`, which is kept as an alias).
 `delivered_to_origin_agent` = `checkpoint !== null && checkpoint.cursor >= ack_seq` (false while `ack_seq` is null).
-`status_reasons` lists explicit codes such as `REMOTE_PROVENANCE_UNAVAILABLE`, `DEADLINE_PASSED`, `OUTBOX_UNCERTAIN`, `AWAITING_ORIGIN_AGENT_READ`.
+`status_reasons` lists explicit codes such as `REMOTE_PROVENANCE_UNAVAILABLE`, `DEADLINE_PASSED`, `OUTBOX_UNCERTAIN`, `AWAITING_ORIGIN_AGENT_READ`, `NEWER_FINAL_ACK_UNREAD`.
 
 ## 5. State machine
 
@@ -121,7 +122,9 @@ Allowed transitions / effects:
 - Final vs interim reply: a verified destination reply is the semantic ACK (`processing_completed`) ONLY
   if its text contains the token `[telesession ack=final]` on one of its first three lines. Any other
   verified reply is stored as an addendum with NO stage effect. Authentication is unchanged (verified
-  sender); the token only classifies which verified reply is final and never authenticates. A later final
+  sender); the token only classifies which verified reply is final and never authenticates. Because the
+  classification rests on destination-controlled content, a destination must NOT echo the origin prompt
+  (including its `[telesession …]` header region) in the first three lines of a reply. A later final
   reply is a new event (its sha256 is part of the event key) and moves `ack_seq` forward; `ack_seq` never
   moves back.
   Recording that event is checked: a failure (other than the expected `REMOTE_PROVENANCE_UNAVAILABLE`
@@ -129,8 +132,12 @@ Allowed transitions / effects:
   every `request_status` / `read_reply` pass re-evaluates the stored final-tagged replies with
   `seq > ack_seq` (from the destination, or from `via` for a relayed record), so the completion is
   recovered idempotently. Stored replies were verified against the record's epoch, which is reused.
-- Status `completed` requires `origin_ack_received` AND `delivered_to_origin_agent`; with the ACK
-  recorded but not yet read by the origin agent the status is `pending` (`AWAITING_ORIGIN_AGENT_READ`).
+- Status `completed` requires `origin_ack_received` AND a checkpoint covering the FIRST final reply
+  (`first_ack_seq`; records written before that field use `ack_seq`); with the ACK recorded but not yet
+  read by the origin agent the status is `pending` (`AWAITING_ORIGIN_AGENT_READ`). Once `completed`, it
+  stays `completed`: a later final reply moves `ack_seq`/`final_ack_seq` forward, sets
+  `delivered_to_origin_agent` false and adds `NEWER_FINAL_ACK_UNREAD` to `status_reasons` until the
+  checkpoint covers it (origin agents should read the newer final reply, not wait for a status change).
 - A destination-stage event that cannot be authenticated because remote host provenance is unavailable
   (telepty #100; event `provenance_unavailable:true`) is not applied: `unproven[stage] =
   REMOTE_PROVENANCE_UNAVAILABLE` and the status carries that reason code.

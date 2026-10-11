@@ -160,6 +160,23 @@ test("correlation_id mismatch on an event or reply → CORRELATION_MISMATCH with
   assert.equal(l.status({ nonce: NONCE }).stage, "origin_ack_received");
 });
 
+// Re-review RN1: a later final ACK never flips a completed request back to pending.
+test("RN1 completed stays completed when a later final reply moves ack_seq; the newer one is flagged until read", (t) => {
+  const { l } = setup(t);
+  const r1 = l.appendReply({ nonce: NONCE, text: "final one", from: DEST, verified: true });
+  l.recordEvent(ack("processing_completed", { reply_seq: r1.seq, reply_sha256: sha("final one") }));
+  assert.equal(l.status({ nonce: NONCE }).status, "pending", "not read yet");
+  const done = l.status({ nonce: NONCE, cursor: 1 });
+  assert.deepEqual([done.status, done.delivered_to_origin_agent, done.status_reasons], ["completed", true, []]);
+  const r2 = l.appendReply({ nonce: NONCE, text: "final two", from: DEST, verified: true });
+  l.recordEvent(ack("processing_completed", { reply_seq: r2.seq, reply_sha256: sha("final two") }));
+  const s = l.status({ nonce: NONCE });
+  assert.deepEqual([s.status, s.final_ack_seq, s.delivered_to_origin_agent], ["completed", 2, false]);
+  assert.deepEqual(s.status_reasons, ["NEWER_FINAL_ACK_UNREAD"]);
+  const read = l.status({ nonce: NONCE, cursor: 2 });
+  assert.deepEqual([read.status, read.delivered_to_origin_agent, read.status_reasons], ["completed", true, []]);
+});
+
 // Review N13/G5: the event list is bounded (64); an evicted completion key must not re-apply.
 test("event-list eviction at 64 never re-applies processing_completed or moves ack_seq", (t) => {
   const { l, now } = setup(t);
