@@ -344,7 +344,8 @@ can pull again:
   (`CORRELATION_MISMATCH`). The hash binding is the envelope's `payload_sha256`, so the event uses the
   record's hash.
 - Proven provenance → destination stage `from {host: verified host, session: attested sid}`. A proven
-  `processing_completed` is first stored as a verified reply entry with deterministic text
+  `processing_completed` is first validated as an event (source, epoch, …; a refusal is counted and stores
+  nothing, review 3 B2); only then is it stored as a verified reply entry with deterministic text
   `[telesession receipt stage=processing_completed]\n<json>`, so `final_ack_seq`, the cursor and the
   checkpoint cover it → `origin_ack_received`, and `completed` after the origin agent's checkpoint.
 - Unproven → `unproven[stage] = REMOTE_PROVENANCE_UNAVAILABLE`; nothing is stored as a reply.
@@ -481,9 +482,14 @@ is POSIX-only (skipped when running as root or on win32).
 - OQ-1 (resolved for reads, slice 2): the transport TTL is unchanged; after it, `request_status` and
   `read_reply` answer from the ledger (§8 "After expiry"). Whether the transport TTL itself should follow the
   ledger for ledger-backed nonces stays open.
-- OQ-2: multi-leg e2e ACK attestation across hosts needs telepty #100 host provenance; until then a
-  remote ACK reaches the origin only as a verified addendum *from the leg-1 destination*
-  (`attestation: relayed_by_leg1_destination`) and the remote stage reads `REMOTE_PROVENANCE_UNAVAILABLE`.
+- OQ-2 (partly resolved by §9.1): a remote stage is applied only from a final daemon's own-bearer receipt
+  with proven provenance (`ProvenanceAdapter`, telepty #100 `verified_sender_host` + allowlisted
+  `sender_proof.basis`); the proven `processing_completed` becomes a verified reply entry with
+  `attestation: destination` → `origin_ack_received`. Without proven provenance (the default: empty
+  allowlist, `NO_RECEIPTS`) the remote stage reads `REMOTE_PROVENANCE_UNAVAILABLE` and a remote ACK reaches
+  the origin only as a verified addendum from the leg-1 destination (`attestation:
+  relayed_by_leg1_destination`). Still open: the telepty receipt endpoint and provenance fields do not exist
+  yet (§9.1 fakes them), and a daemon must stamp `verified_sender_host` itself and strip peer-sent copies.
 - OQ-3: whether `agent_consumed` should be fed from telepty consumption observations (#103/#104) in
   `requestStatus` (extra daemon read per status call).
 - OQ-4: outbox CLI entry naming and the operator review UX for `uncertain` items.
