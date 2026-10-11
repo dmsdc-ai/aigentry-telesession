@@ -112,3 +112,26 @@ test("unresolved route never sends and stays queued", async (t) => {
   const o = l.outbox().find((x) => x.key === key);
   assert.deepEqual([o.state, o.last_error], ["queued", "ROUTE_UNRESOLVED"]);
 });
+
+// Review N6: a receipt/transition commit that fails is reported, never as `sent`.
+test("a failed receipt commit is reported in commit_failed, not sent; reopen → uncertain, no resend", async (t) => {
+  const { l, open } = setup(t);
+  const { key } = l.enqueue(item());
+  const failing = {
+    outbox: () => l.outbox(),
+    outboxTransition: (k, from, fields) => (from === "intent" ? { ok: false, code: "LEDGER_WRITE_FAILED" } : l.outboxTransition(k, from, fields)),
+  };
+  let sends = 0;
+  const out = await relayTick({ ledger: failing, resolver, send: async () => { sends += 1; return { ok: true, transport_id: "tx-1" }; } });
+  assert.equal(sends, 1);
+  assert.deepEqual(out.sent, []);
+  assert.deepEqual(out.commit_failed, [{ key, code: "LEDGER_WRITE_FAILED" }]);
+  assert.equal(l.outbox()[0].state, "intent", "receipt not recorded");
+  l.close();
+  const l2 = open();
+  assert.equal(l2.outbox()[0].state, "uncertain");
+  const again = await relayTick({ ledger: l2, resolver, send: async () => { sends += 1; return { ok: true, transport_id: "tx-2" }; } });
+  assert.equal(sends, 1, "never resent");
+  assert.deepEqual(again.uncertain, [key]);
+  assert.deepEqual(again.commit_failed, []);
+});
