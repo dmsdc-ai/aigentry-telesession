@@ -387,7 +387,7 @@ export function openLedger(opts, seams) {
         reply_to: endpointOf(a.reply_to), generation: a.generation,
         payload_sha256: a.payload_sha256, stage: null, stages: Object.fromEntries(STAGES.map((k) => [k, null])), terminal: null,
         created_ms: t, deadline_ms: t + a.deadline_ms, retain_until_ms: t + Math.max(retainMs, a.deadline_ms),
-        replies: [], next_seq: 1, checkpoint: null, ack_seq: null, unproven: {}, late_pending: [], events: [], rejected: {},
+        replies: [], next_seq: 1, checkpoint: null, ack_seq: null, first_ack_seq: null, unproven: {}, late_pending: [], events: [], rejected: {},
       };
     });
     return r.ok ? { ok: true, deduplicated: false, correlation_id: correlationId } : r;
@@ -446,6 +446,7 @@ export function openLedger(opts, seams) {
       if (ev.stage === "processing_completed") {
         raise("origin_ack_received");
         q.ack_seq = ackSeq;
+        if (q.first_ack_seq === undefined || q.first_ack_seq === null) q.first_ack_seq = ackSeq;
         delete q.unproven.processing_completed;
       }
     });
@@ -567,13 +568,18 @@ export function openLedger(opts, seams) {
     const outbox = Object.fromEntries(OUTBOX_STATES.map((k) => [k, items.filter((o) => o.state === k).length]));
     const deadlinePassed = t > rec.deadline_ms;
     const delivered = rec.ack_seq !== null && rec.checkpoint !== null && rec.checkpoint.cursor >= rec.ack_seq;
+    // Completed once the checkpoint covered the first final reply (records before this field: ack_seq);
+    // a later final reply never flips it back, it is flagged until read.
+    const firstAck = Number.isSafeInteger(rec.first_ack_seq) ? rec.first_ack_seq : rec.ack_seq;
+    const completed = firstAck !== null && rec.checkpoint !== null && rec.checkpoint.cursor >= firstAck;
     const reasons = [];
     if (Object.values(rec.unproven).includes("REMOTE_PROVENANCE_UNAVAILABLE")) reasons.push("REMOTE_PROVENANCE_UNAVAILABLE");
     let status;
     if (rec.terminal) status = "rejected";
     else if (rec.stage === "origin_ack_received") {
-      status = delivered ? "completed" : "pending";
-      if (!delivered) reasons.push("AWAITING_ORIGIN_AGENT_READ");
+      status = completed ? "completed" : "pending";
+      if (!completed) reasons.push("AWAITING_ORIGIN_AGENT_READ");
+      else if (!delivered) reasons.push("NEWER_FINAL_ACK_UNREAD");
     } else if (outbox.uncertain > 0) { status = "unknown"; reasons.push("OUTBOX_UNCERTAIN"); }
     else if (deadlinePassed) { status = "unknown"; reasons.push("DEADLINE_PASSED"); }
     else status = "pending";
