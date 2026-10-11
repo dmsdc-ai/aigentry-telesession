@@ -429,6 +429,7 @@ export function openLedger(opts, seams) {
     if (rec.terminal) return fail("TERMINAL");
     const final = DESTINATION_STAGES.has(ev.stage);
     if (ev.authenticated !== true) {
+      if (ev.check_only === true) return fail("UNAUTHENTICATED");
       if (final && ev.provenance_unavailable === true) {
         const r = commit((d) => { d.records[rec.nonce].unproven[ev.stage] = "REMOTE_PROVENANCE_UNAVAILABLE"; });
         return r.ok ? fail("REMOTE_PROVENANCE_UNAVAILABLE") : r;
@@ -448,6 +449,8 @@ export function openLedger(opts, seams) {
     const replySha = ev.stage === "processing_completed" && typeof ev.reply_sha256 === "string" && HEX64_RE.test(ev.reply_sha256) ? `:${ev.reply_sha256}` : "";
     const key = `${rec.payload_sha256}:${hopKey(ev.from)}:${ev.stage}${replySha}`;
     if (rec.events.includes(key)) return { ok: true, applied: false, deduplicated: true, stage: rec.stage };
+    // Review 3 B2: validation only (a refusal above is counted); the caller stores the event's reply next.
+    if (ev.check_only === true) return { ok: true, applied: false, deduplicated: false, stage: rec.stage };
     const ackSeq = Number.isSafeInteger(ev.reply_seq) && ev.reply_seq >= 0 && ev.reply_seq < rec.next_seq ? ev.reply_seq : rec.next_seq - 1;
     // ack_seq only moves forward (an event key evicted from the bounded list never re-applies an older ACK).
     if (ev.stage === "processing_completed" && rec.ack_seq !== null && ackSeq <= rec.ack_seq) {

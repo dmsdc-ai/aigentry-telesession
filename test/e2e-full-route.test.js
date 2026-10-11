@@ -189,3 +189,61 @@ describe("full route: origin → leg-1 → relay → fake final daemon → final
     assert.equal(seam.receipts.size, 0);
   });
 });
+
+// Review 3 B2: a proven processing_completed receipt the ledger refuses stores no reply entry; N-c: bounded fields.
+describe("applyReceipts: a refused proven receipt stores nothing (review 3 B2, N-c)", () => {
+  const CID = "a".repeat(32);
+  const N = "1".repeat(32);
+  const prov = createProvenanceAdapter({ allowedBases: [FAKE_PROOF_BASIS] });
+  const rc = (o) => ({ correlation_id: CID, inject_id: "i1", stage: "processing_completed", role: "final", seq: 1, at: "2026-10-12T00:00:00.000Z",
+    attested_by: { host_label: FINAL.host, sid: FINAL.session, epoch: "E1" }, auth_basis: "own_bearer", verified_sender_host: FINAL.host,
+    sender_proof: { basis: FAKE_PROOF_BASIS }, ...o });
+  function mk(t) {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "telesession-b2-"));
+    const l = openLedger({ dir: path.join(base, "ledger") });
+    t.after(() => { l.close(); fs.rmSync(base, { recursive: true, force: true }); });
+    assert.equal(l.createRequest({
+      nonce: N, correlation_id: CID, request_id: null, origin: { host: "local", session: "inbox" }, destination: FINAL,
+      via: { host: "local", session: "t1" }, via_generation: "ep", reply_to: { host: "local", session: "inbox" }, generation: null,
+      payload_sha256: sha("p"), deadline_ms: 60000,
+    }).ok, true);
+    return l;
+  }
+
+  test("GENERATION_MISMATCH: no reply, reason counted, stage unchanged", (t) => {
+    const l = mk(t);
+    assert.equal(applyReceipts({ ledger: l, nonce: N, receipts: [rc({ stage: "agent_consumed" })], provenance: prov }).applied, 1);
+    const out = applyReceipts({ ledger: l, nonce: N, receipts: [rc({ seq: 2, attested_by: { sid: FINAL.session, epoch: "E2" } })], provenance: prov });
+    assert.deepEqual(out, { applied: 0, unproven: 0, deduplicated: 0, refused: { GENERATION_MISMATCH: 1 } });
+    const s = l.status({ nonce: N });
+    assert.deepEqual([s.reply_count, s.stage, s.rejected], [0, "agent_consumed", { GENERATION_MISMATCH: 1 }]);
+    assert.deepEqual(l.readReplies({ nonce: N, cursor: 0 }).replies, []);
+  });
+
+  test("SOURCE_MISMATCH: no reply, reason counted, stage unchanged", (t) => {
+    const l = mk(t);
+    const out = applyReceipts({ ledger: l, nonce: N, receipts: [rc({ verified_sender_host: "other-peer" })], provenance: prov });
+    assert.deepEqual(out, { applied: 0, unproven: 0, deduplicated: 0, refused: { SOURCE_MISMATCH: 1 } });
+    const s = l.status({ nonce: N });
+    assert.deepEqual([s.reply_count, s.stage, s.rejected], [0, "unknown", { SOURCE_MISMATCH: 1 }]);
+  });
+
+  test("accepted receipt: one verified reply + origin_ack_received; a replay dedupes to the same entry", (t) => {
+    const l = mk(t);
+    assert.deepEqual(applyReceipts({ ledger: l, nonce: N, receipts: [rc(), rc()], provenance: prov }), { applied: 1, unproven: 0, deduplicated: 1, refused: {} });
+    const s = l.status({ nonce: N });
+    assert.deepEqual([s.reply_count, s.stage, s.final_ack_seq], [1, "origin_ack_received", 1]);
+  });
+
+  test("N-c: an over-long or malformed at / host_label / inject_id / epoch is INVALID_RECEIPT, nothing stored", (t) => {
+    const l = mk(t);
+    const bad = [
+      rc({ at: "2".repeat(65) }), rc({ at: 7 }), rc({ inject_id: "i".repeat(129) }), rc({ inject_id: "i\n1" }),
+      rc({ attested_by: { host_label: "h".repeat(254), sid: FINAL.session, epoch: "E1" } }),
+      rc({ attested_by: { host_label: FINAL.host, sid: FINAL.session, epoch: "E\u00001" } }),
+    ];
+    assert.deepEqual(applyReceipts({ ledger: l, nonce: N, receipts: bad, provenance: prov }), { applied: 0, unproven: 0, deduplicated: 0, refused: { INVALID_RECEIPT: 6 } });
+    const s = l.status({ nonce: N });
+    assert.deepEqual([s.reply_count, s.stage], [0, "unknown"]);
+  });
+});

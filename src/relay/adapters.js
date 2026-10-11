@@ -9,8 +9,8 @@
  *     record is a hop fact, not the final destination's);
  *   - a receipt applies a destination stage only when it is the final daemon's own-bearer attestation
  *     (`role:"final"`, `auth_basis:"own_bearer"`) AND its provenance is proven; otherwise the stage stays
- *     unproven with REMOTE_PROVENANCE_UNAVAILABLE. A proven `processing_completed` receipt is stored as a
- *     verified reply entry first, so the origin agent's cursor/checkpoint covers it (→ origin_ack_received).
+ *     unproven with REMOTE_PROVENANCE_UNAVAILABLE. A proven `processing_completed` receipt is validated as an
+ *     event first; only an accepted (or already-applied) one is then stored as a verified reply entry, so the origin agent's cursor/checkpoint covers it (→ origin_ack_received).
  * Pure over the ledger API; no I/O of its own.
  */
 
@@ -20,6 +20,10 @@ const HEX32_RE = /^[0-9a-f]{32}$/;
 const HOST_RE = /^[A-Za-z0-9._:\[\]-]{1,253}$/;
 const SID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const BASIS_RE = /^[A-Za-z0-9._:-]{1,64}$/;
+// Review 3 N-c: receipt fields copied into the stored reply text are bounded like the other inputs.
+const INJECT_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+const AT_RE = /^[0-9A-Za-z.:+-]{1,64}$/;
+const EPOCH_RE = /^[\x21-\x7e]{1,256}$/;
 const RECEIPT_STAGES = new Set(["agent_consumed", "processing_completed", "rejected"]);
 const RECEIPTS_MAX = 64;
 
@@ -44,9 +48,12 @@ export const NO_RECEIPTS = Object.freeze({ fetch: async () => [], consumption: a
 function isReceipt(r) {
   return isPlain(r) && typeof r.correlation_id === "string" && HEX32_RE.test(r.correlation_id) && RECEIPT_STAGES.has(r.stage)
     && (r.role === "final" || r.role === "hop") && Number.isSafeInteger(r.seq) && r.seq >= 0
-    && typeof r.inject_id === "string" && r.inject_id.length <= 128 && isPlain(r.attested_by)
+    && typeof r.inject_id === "string" && INJECT_ID_RE.test(r.inject_id) && isPlain(r.attested_by)
+    && (r.at === undefined || r.at === null || (typeof r.at === "string" && AT_RE.test(r.at)))
+    && (r.attested_by.host_label === undefined || r.attested_by.host_label === null
+      || (typeof r.attested_by.host_label === "string" && HOST_RE.test(r.attested_by.host_label)))
     && typeof r.attested_by.sid === "string" && SID_RE.test(r.attested_by.sid)
-    && typeof r.attested_by.epoch === "string" && r.attested_by.epoch.length > 0 && r.attested_by.epoch.length <= 256;
+    && typeof r.attested_by.epoch === "string" && EPOCH_RE.test(r.attested_by.epoch);
 }
 
 // Receipts in the order fetched (out-of-order evidence is handled by the ledger: stages never regress).
@@ -74,6 +81,9 @@ export function applyReceipts({ ledger, nonce, receipts, provenance = DEFAULT_PR
         attested_by: { host_label: typeof r.attested_by.host_label === "string" ? r.attested_by.host_label : null, sid: r.attested_by.sid, epoch: r.attested_by.epoch },
         auth_basis: r.auth_basis, provenance: { host: prov.host, basis: prov.basis },
       })}`;
+      // Review 3 B2: the event is validated (source, epoch, …) before the reply is stored; a refusal stores nothing.
+      const c = ledger.recordEvent({ ...ev, reply_sha256: sha256hex(text), check_only: true });
+      if (!c.ok) { refuse(c.code); continue; }
       const a = ledger.appendReply({ nonce, text, from, verified: true, correlation_id: r.correlation_id });
       if (!a.ok) { refuse(a.code); continue; }
       Object.assign(ev, { reply_seq: a.seq, reply_sha256: sha256hex(text) });
