@@ -7,6 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { openLedger, LedgerError } from "../src/relay/ledger.js";
 import { createRouteResolver } from "../src/relay/route.js";
 
@@ -276,4 +277,23 @@ test("strict lock: a second open is LEDGER_LOCKED; corrupt ledger.json is LEDGER
   l.close();
   fs.writeFileSync(path.join(dir, "ledger.json"), "{", { mode: 0o600 });
   assert.throws(() => open(), (e) => e instanceof LedgerError && e.code === "LEDGER_CORRUPT");
+});
+
+// Review B3/G3: a lock left by an abrupt exit is detectable, and never reclaimed.
+test("stale lock (holder pid not alive) is LEDGER_LOCK_STALE and left in place; a live or unreadable holder stays LEDGER_LOCKED", (t) => {
+  const { dir, l, open } = setup(t);
+  l.close();
+  const lock = path.join(dir, "lock");
+  const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+  fs.writeFileSync(lock, JSON.stringify({ v: 1, owner: "f".repeat(32), pid: dead, created_at: "2026-10-11T00:00:00.000Z" }), { mode: 0o600 });
+  assert.throws(() => open(), (e) => e instanceof LedgerError && e.code === "LEDGER_LOCK_STALE");
+  assert.ok(fs.existsSync(lock), "never reclaimed automatically");
+  fs.writeFileSync(lock, JSON.stringify({ v: 1, owner: "f".repeat(32), pid: process.pid }), { mode: 0o600 });
+  assert.throws(() => open(), (e) => e instanceof LedgerError && e.code === "LEDGER_LOCKED");
+  fs.writeFileSync(lock, "not json", { mode: 0o600 });
+  assert.throws(() => open(), (e) => e instanceof LedgerError && e.code === "LEDGER_LOCKED");
+  fs.unlinkSync(lock); // the documented operator recovery path
+  const l2 = open();
+  t.after(() => l2.close());
+  assert.equal(l2.status({ nonce: NONCE }).ok, true);
 });

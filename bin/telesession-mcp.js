@@ -27,7 +27,8 @@ let transport;
 try {
   const cfg = loadConfig(process.env);
   // Durable mode only: the correlation ledger lives inside the (locked, private) state dir. A ledger that
-  // cannot open leaves every existing tool unchanged; request_status then reports LEDGER_NOT_CONFIGURED.
+  // cannot open leaves every existing tool unchanged; request_status and health then report
+  // LEDGER_UNAVAILABLE with the open code (e.g. LEDGER_LOCK_STALE after an abrupt exit).
   const ledger = cfg.stateDir === null ? undefined : () => openLedger({ dir: path.join(cfg.stateDir, "ledger") });
   transport = createTeleptyTransport(cfg, undefined, { ledger });
 } catch (err) {

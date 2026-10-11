@@ -6,6 +6,7 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { normalizeConfig, createTeleptyTransport } from "../src/index.js";
 import { openLedger } from "../src/relay/ledger.js";
 import { waitFor } from "./helpers.js";
@@ -182,6 +183,27 @@ describe("transport with correlation ledger (loopback fake telepty)", { skip: NO
     assert.equal(st.reply_count, 1);
     assert.equal(st.rejected.duplicate, undefined);
     assert.equal(st.ledger.late_dropped, 0);
+  });
+
+  // Review G3 (B3): an open failure is surfaced with its code, not reported as LEDGER_NOT_CONFIGURED.
+  test("G3 stale ledger lock → request_status and health report LEDGER_UNAVAILABLE with the open code", async (t) => {
+    const sb = makeSandbox("ts-ledger-g3-");
+    const fake = await startFakeTelepty();
+    const dir = path.join(sb.root, "ledger");
+    openLedger({ dir }).close();
+    const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+    fs.writeFileSync(path.join(dir, "lock"), JSON.stringify({ v: 1, owner: "f".repeat(32), pid: dead }), { mode: 0o600 });
+    const cfg = normalizeConfig({ teleptyUrl: fake.origin, token: fake.token, targets: ["target-1"], inboxPrefix: PREFIX, stateDir: sb.stateDir });
+    const tr = createTeleptyTransport(cfg, sb.seam(), { ledger: () => openLedger({ dir }) });
+    t.after(async () => { await tr.close(); await fake.close(); sb.remove(); });
+    const st = await tr.requestStatus({ nonce: "0".repeat(32) });
+    assert.equal(st.ok, false);
+    assert.deepEqual(st.error, { code: "LEDGER_UNAVAILABLE", ledger_code: "LEDGER_LOCK_STALE" });
+    const h = await tr.health();
+    assert.equal(h.ok, true, JSON.stringify(h));
+    assert.deepEqual(h.ledger, { state: "unavailable", code: "LEDGER_UNAVAILABLE", ledger_code: "LEDGER_LOCK_STALE" });
+    const s = await tr.send({ target: "target-1", text: "still works without the ledger" });
+    assert.equal(s.ok, true, "existing tools unchanged");
   });
 
   test("request_status without a ledger → LEDGER_NOT_CONFIGURED; bad arguments refused", async (t) => {

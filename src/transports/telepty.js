@@ -456,7 +456,12 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
   const ext = extensions || {};
   let ledger = null;
   const ownsLedger = typeof ext.ledger === "function";
-  try { ledger = ownsLedger ? ext.ledger() : ext.ledger || null; } catch { ledger = null; }
+  // An open failure (e.g. LEDGER_LOCK_STALE after an abrupt exit) keeps its code for status/health.
+  let ledgerOpenCode = null;
+  try { ledger = ownsLedger ? ext.ledger() : ext.ledger || null; } catch (err) {
+    ledger = null;
+    ledgerOpenCode = err && typeof err.code === "string" && /^[A-Z0-9_]{1,64}$/.test(err.code) ? err.code : "LEDGER_OPEN_FAILED";
+  }
   const ledgerStats = { write_failed: 0, late_dropped: 0 };
   const LOCAL = "local";
   const tracks = (nonce) => ledger !== null && ledger.has(nonce);
@@ -1049,16 +1054,23 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     return { body: meta.body, missing: REQUIRED_CAPABILITIES.filter((c) => !caps.includes(c)) };
   }
 
+  // Present only when a ledger was configured: ok (mode + counters) or unavailable with its open code.
+  function ledgerHealth() {
+    if (ledger) return { ledger: { state: "ok", mode: ledger.mode, ...ledgerStats } };
+    return ledgerOpenCode ? { ledger: { state: "unavailable", code: "LEDGER_UNAVAILABLE", ledger_code: ledgerOpenCode } } : {};
+  }
+
   const health = guarded(async () => {
     if (store) flushHeld();
     const meta = await readMeta();
-    if (meta.error) return { ...meta.error, inbox: { id: S.inbox.id, state: inbox.fatal || inbox.state }, daemon_restart: daemonRestart(), ...storeHealth() };
+    if (meta.error) return { ...meta.error, inbox: { id: S.inbox.id, state: inbox.fatal || inbox.state }, daemon_restart: daemonRestart(), ...storeHealth(), ...ledgerHealth() };
     const version = typeof meta.body.version === "string" && VERSION_RE.test(meta.body.version) ? meta.body.version : null;
     return ok({
       telepty: { version, capabilities_missing: meta.missing },
       inbox: { id: S.inbox.id, state: inbox.fatal || inbox.state },
       daemon_restart: daemonRestart(),
       ...storeHealth(),
+      ...ledgerHealth(),
     });
   });
 
@@ -1281,7 +1293,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
         || (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < 0))) {
       return fail("INVALID_ARGUMENT");
     }
-    if (!ledger) return fail("LEDGER_NOT_CONFIGURED");
+    if (!ledger) return ledgerOpenCode ? fail("LEDGER_UNAVAILABLE", { ledger_code: ledgerOpenCode }) : fail("LEDGER_NOT_CONFIGURED");
     await awaitRecovery();
     await resolveCandidates();
     const st = ledger.status({ nonce, cursor });
