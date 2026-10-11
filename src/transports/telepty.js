@@ -17,6 +17,8 @@ import http from "node:http";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { normalizeConfig } from "../config.js";
 import { openStore, StoreError, STORE_LIMITS } from "../store.js";
+import { createRouteResolver } from "../relay/route.js";
+import { createRelayRunner, transportSendPrimitive } from "../relay/runner.js";
 
 export const REQUIRED_CAPABILITIES = Object.freeze(["inject-exact-target", "register-create-only", "delete-owned-session"]);
 
@@ -322,6 +324,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     inboxPrefix: config && config.inboxPrefix,
     stateDir: config && config.stateDir,
     persistInboxCredential: config && config.persistInboxCredential,
+    relayIntervalMs: config && config.relayIntervalMs,
   });
   const client = createHttpClient(cfg);
   function newInboxId() {
@@ -465,6 +468,12 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
   const ledgerStats = { write_failed: 0, late_dropped: 0, ack_event_failed: 0 };
   const LOCAL = "local";
   const tracks = (nonce) => ledger !== null && ledger.has(nonce);
+  // SPEC 2026-10-11 §10: the relay runner lives in the process that owns the ledger lock. It sends with
+  // this transport's own send (local peer only unless a resolver is passed); no timer unless configured.
+  const relay = ledger ? createRelayRunner({
+    ledger, resolver: ext.resolver || createRouteResolver([{ peer_id: LOCAL, locators: [LOCAL] }]),
+    intervalMs: ledger.mode === "read_write" ? cfg.relayIntervalMs : 0, send: transportSendPrimitive((a) => send(a)),
+  }) : null;
 
   function putText(nonce, sha256, text, receivedAt) {
     if (!store) {
@@ -1095,8 +1104,9 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
 
   // Present only when a ledger was configured: ok (mode + counters) or unavailable with its open code.
   function ledgerHealth() {
-    if (ledger) return { ledger: { state: "ok", mode: ledger.mode, ...ledgerStats } };
-    return ledgerOpenCode ? { ledger: { state: "unavailable", code: "LEDGER_UNAVAILABLE", ledger_code: ledgerOpenCode } } : {};
+    if (ledger) return { ledger: { state: "ok", mode: ledger.mode, ...ledgerStats }, relay: relay.health() };
+    const off = cfg.relayIntervalMs > 0 ? { relay: { enabled: false, code: "LEDGER_UNAVAILABLE" } } : {};
+    return ledgerOpenCode ? { ledger: { state: "unavailable", code: "LEDGER_UNAVAILABLE", ledger_code: ledgerOpenCode }, ...off } : {};
   }
 
   const health = guarded(async () => {
@@ -1346,6 +1356,13 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     return { ...st, ...more, ledger: { mode: ledger.mode, ...ledgerStats } };
   });
 
+  // One relay tick now (the one-shot CLI; not an MCP tool). Refused while a tick runs.
+  const relayTickNow = guarded(async () => {
+    if (!relay) return ledgerOpenCode ? fail("LEDGER_UNAVAILABLE", { ledger_code: ledgerOpenCode }) : fail("LEDGER_NOT_CONFIGURED");
+    const r = await relay.tick();
+    return r.ok ? { ...r, completion_fact: null } : fail(r.code);
+  });
+
   // Graceful close only: own listener + at most one owned DELETE with the current bearer. Durable:
   // a lost lock means no DELETE at all; the store (and our lock) is closed last.
   async function closeInbox() {
@@ -1378,6 +1395,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
   function close() {
     if (closing) return closing;
     closing = (async () => {
+      if (relay) { relay.stop(); await Promise.race([relay.idle(), sleep(SHUTDOWN_REGISTER_WAIT_MS)]); }
       receiver.close();
       if (recoverPromise) await Promise.race([recoverPromise.catch(() => {}), sleep(SHUTDOWN_REGISTER_WAIT_MS)]);
       if (inbox.pending) await Promise.race([inbox.pending.catch(() => {}), sleep(SHUTDOWN_REGISTER_WAIT_MS)]);
@@ -1392,8 +1410,10 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     return closing;
   }
 
+  if (relay) relay.start();
+
   return Object.freeze({
     get inboxId() { return S.inbox.id; },
-    health, listAllowedTargets, send, receipt, readReply, requestStatus, close,
+    health, listAllowedTargets, send, receipt, readReply, requestStatus, relayTick: relayTickNow, close,
   });
 }

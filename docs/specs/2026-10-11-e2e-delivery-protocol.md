@@ -253,7 +253,7 @@ Telepty dependencies (not implemented here):
 | #103 / #104 "submitted" = queue receipt | `agent_consumed` from a consumption observation | queue receipt maps only to `transport_accepted` |
 | #102 (diagnostics) | separate queue vs parked backlog | §11 reads them separately when present, else `unknown` |
 
-## 10. Relay tick (library + CLI entry; activation gated)
+## 10. Relay tick, in-process runner and one-shot CLI
 
 Pure functions over the ledger with an injected `send(item) → {ok, transport_id} | {ok:false, sent:"no"|"yes"|"unknown", code}`:
 1. CLAIM+INTENT: `queued → intent` committed (fsync) BEFORE send; the ledger lock is the claim.
@@ -268,8 +268,32 @@ Pure functions over the ledger with an injected `send(item) → {ok, transport_i
    item stays `intent` and becomes `uncertain` on reopen).
 `sent` is hop evidence (`transport_accepted` of that leg) only.
 
-Activation gate: the library and a one-shot CLI entry may exist; running it as a process, timer or
-unit is a **separate approval**. This slice adds no loop, timer or unit.
+7. BOUNDS: one tick sends at most `maxItems` (16) items and starts no send after `maxTickMs` (5 s);
+   the rest stays `queued` and is reported in `deferred`.
+
+In-process runner (`src/relay/runner.js` `createRelayRunner`): runs inside the telesession MCP process,
+which owns the ledger lock. The transport creates it whenever a ledger is open and drives it with its
+own `send` (`transportSendPrimitive`: request_id `relay:<item key>`, so the transport's idempotency key
+also prevents a double inject). The route resolver defaults to the local peer only (`local`); other
+hosts stay `ROUTE_UNRESOLVED`. Rules:
+- Off by default. `TELESESSION_RELAY_INTERVAL_MS` (config `relayIntervalMs`; 0 or absent = off,
+  otherwise 1000–3600000, needs a state dir) starts an unref'd interval timer; a read-only ledger never
+  starts it. `close()` stops the timer and waits (bounded) for a running tick.
+- Never two ticks at once: a tick while one runs returns `RELAY_TICK_IN_PROGRESS`.
+- Restart: an `intent` left by a dead process becomes `uncertain` when the ledger opens (step 4). It is
+  counted in health and never resent.
+- `telesession_health` → `relay: {enabled, running, last_tick_at, last_result, uncertain_count,
+  queued_count, quarantined_count, oldest_quarantined_age_ms}` (`last_result` = counts per bucket). With
+  the ledger unavailable and an interval configured: `relay: {enabled:false, code:"LEDGER_UNAVAILABLE"}`.
+
+One-shot CLI `bin/telesession-relay-tick.js` (same TELESESSION_* env): it opens `<state dir>/ledger`
+BEFORE any telepty request. A lock held by a live process (`LEDGER_LOCKED`) or left by a dead one
+(`LEDGER_LOCK_STALE`) is refused with exit 3 and never reclaimed. Otherwise it runs exactly one tick and
+prints the result as one JSON line (exit 0; 1 = tick failed; 2 = config). Replies to items it relays
+only arrive while an inbox lives, so the in-process runner is the normal path.
+
+Activation: the code above is in place and off. Setting `TELESESSION_RELAY_INTERVAL_MS` in a live
+deployment (or scheduling the CLI) is a **separate approval**. This slice adds no unit or service.
 
 ## 11. Diagnostics linkage
 
