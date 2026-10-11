@@ -426,7 +426,11 @@ export function openLedger(opts, seams) {
     }
     if (final && ev.hop !== "destination") return reject(rec.nonce, "HOP_NOT_FINAL");
     if (final && !same(ev.from, rec.destination)) return reject(rec.nonce, "SOURCE_MISMATCH");
-    if (final && (rec.generation === null || ev.generation !== rec.generation)) return reject(rec.nonce, "GENERATION_MISMATCH");
+    // A relayed record has no expected remote epoch at creation (null): the first authenticated destination
+    // event (proven provenance, §9.1) may bind it; every later destination event must match it.
+    const learn = final && rec.generation === null && rec.via !== null && ev.learn_generation === true
+      && typeof ev.generation === "string" && ev.generation.length > 0 && ev.generation.length <= 256;
+    if (final && !learn && (rec.generation === null || ev.generation !== rec.generation)) return reject(rec.nonce, "GENERATION_MISMATCH");
     // A final reply is part of the completion event's identity: a later final reply is a new event.
     const replySha = ev.stage === "processing_completed" && typeof ev.reply_sha256 === "string" && HEX64_RE.test(ev.reply_sha256) ? `:${ev.reply_sha256}` : "";
     const key = `${rec.payload_sha256}:${hopKey(ev.from)}:${ev.stage}${replySha}`;
@@ -439,6 +443,7 @@ export function openLedger(opts, seams) {
     const at = iso(now());
     const r = commit((d) => {
       const q = d.records[rec.nonce];
+      if (learn) q.generation = ev.generation;
       q.events.push(key);
       while (q.events.length > LEDGER_LIMITS.eventsPerRecord) q.events.shift();
       if (ev.stage === "rejected") {

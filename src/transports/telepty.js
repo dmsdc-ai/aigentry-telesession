@@ -19,6 +19,7 @@ import { normalizeConfig } from "../config.js";
 import { openStore, StoreError, STORE_LIMITS } from "../store.js";
 import { createRouteResolver } from "../relay/route.js";
 import { createRelayRunner, transportSendPrimitive } from "../relay/runner.js";
+import { DEFAULT_PROVENANCE, NO_RECEIPTS, applyReceipts, applyConsumption } from "../relay/adapters.js";
 
 export const REQUIRED_CAPABILITIES = Object.freeze(["inject-exact-target", "register-create-only", "delete-owned-session"]);
 
@@ -468,6 +469,9 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
   const ledgerStats = { write_failed: 0, late_dropped: 0, ack_event_failed: 0 };
   const LOCAL = "local";
   const tracks = (nonce) => ledger !== null && ledger.has(nonce);
+  // SPEC §9.1 adapters; the defaults read nothing and prove nothing (today's behaviour).
+  const receiptAdapter = ext.receipts || NO_RECEIPTS;
+  const provenanceAdapter = ext.provenance || DEFAULT_PROVENANCE;
   // SPEC 2026-10-11 §10: the relay runner lives in the process that owns the ledger lock. It sends with
   // this transport's own send (local peer only unless a resolver is passed); no timer unless configured.
   const relay = ledger ? createRelayRunner({
@@ -1361,6 +1365,22 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     });
   }
 
+  // §9.1: receipts for this correlation and (direct records) the consumption observation of our inject.
+  // Adapter failures leave the record unchanged; the next status call pulls again (idempotent).
+  async function pullReceipts(nonce) {
+    if (receiptAdapter === NO_RECEIPTS) return;
+    const lr = ledger.record(nonce);
+    if (!lr || lr.terminal || !lr.correlation_id) return;
+    try {
+      const list = await receiptAdapter.fetch(lr.correlation_id);
+      if (Array.isArray(list) && list.length) applyReceipts({ ledger, nonce, receipts: list, provenance: provenanceAdapter });
+      const q = byNonce(nonce);
+      if (lr.via === null && q && q.inject_id && lr.stages.agent_consumed === null) {
+        applyConsumption({ ledger, nonce, observation: await receiptAdapter.consumption(q.inject_id) });
+      }
+    } catch { /* adapter unavailable: no evidence, no change */ }
+  }
+
   // SPEC 2026-10-11 §8: the poll/resume path, by exactly one of nonce / request_id / correlation_id; it keeps
   // answering after the transport TTL while the ledger has the record. A cursor records the checkpoint.
   const requestStatus = guarded(async ({ nonce, request_id, correlation_id, cursor }) => {
@@ -1375,7 +1395,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     await awaitRecovery();
     await resolveCandidates();
     const found = ledger.find({ nonce, request_id, correlation_id });
-    if (found) resyncFinalAck(found);
+    if (found) { await pullReceipts(found); resyncFinalAck(found); }
     const st = ledger.status({ nonce, request_id, correlation_id, cursor });
     if (!st.ok) return fail(st.code);
     if (st.lifecycle === undefined) return { ...st, ledger: { mode: ledger.mode, ...ledgerStats } };
