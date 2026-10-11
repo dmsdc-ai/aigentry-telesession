@@ -180,7 +180,7 @@ describe("startup refusals (synchronous, zero HTTP, no sockets)", () => {
     try { await client.connect(transport); } finally { fs.closeSync(fd); }
     t.after(async () => { try { await client.close(); } finally { sb.remove(); } });
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 5, "no new tools");
+    assert.equal(tools.length, 6, "only telesession_request_status added (task #2026101110)");
     const send = tools.find((x) => x.name === "telesession_send");
     assert.equal(send.inputSchema.additionalProperties, false);
     assert.ok(send.inputSchema.properties.request_id, "request_id declared");
