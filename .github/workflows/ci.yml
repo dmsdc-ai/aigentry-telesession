@@ -1,0 +1,91 @@
+# Cross-platform unit CI. Read-only token, no secrets, no publish. See docs/ci.md for what this proves.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  unit:
+    name: unit (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ["20.20.0"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Toolchain
+        shell: bash
+        run: |
+          node --version
+          npm --version
+
+      - name: Install from lockfile (no lifecycle scripts)
+        shell: bash
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      # Explicit files only (see package.json "test:unit"); no auto-discovery, no real telepty daemon.
+      - name: Unit tests
+        shell: bash
+        run: npm run --silent test:unit 2>&1 | tee unit.tap
+
+      - name: Test counts (skips are not passes)
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -s unit.tap ]; then echo "::error::no TAP output"; exit 1; fi
+          {
+            echo "### unit: $RUNNER_OS / Node $(node --version)"
+            grep -E '^# (tests|suites|pass|fail|cancelled|skipped|todo) ' unit.tap | sed 's/^# /- /'
+            echo
+            echo "Skipped (NOT counted as passed):"
+            grep -E '# SKIP' unit.tap | sed -E 's/^ +//; s/^/- /' || echo "- none"
+          } >> "$GITHUB_STEP_SUMMARY"
+          pass=$(sed -n -E 's/^# pass ([0-9]+)$/\1/p' unit.tap | tail -n 1)
+          if [ "${pass:-0}" -eq 0 ]; then echo "::error::no passing tests recorded"; exit 1; fi
+
+      - name: Upload TAP
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: unit-tap-${{ matrix.os }}-node-${{ matrix.node }}
+          path: unit.tap
+          if-no-files-found: warn
+          retention-days: 14
+
+  pack:
+    name: package dry-run
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20.20.0"
+
+      - name: npm pack --dry-run (nothing is published)
+        shell: bash
+        run: npm run --silent check:pack

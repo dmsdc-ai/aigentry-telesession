@@ -1,0 +1,63 @@
+# Release verification gate. Runs the reusable CI first; nothing below runs unless it passes.
+# It creates no release, publishes nothing to npm and deploys nothing. See docs/ci.md.
+name: Release check
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-check-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  release-gate:
+    name: release gate
+    needs: [ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20.20.0"
+
+      - name: Tag matches package.json version
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          node -e '
+            const v = JSON.parse(require("fs").readFileSync("package.json", "utf8")).version;
+            if (process.env.REF_NAME !== "v" + v) {
+              console.error("tag " + process.env.REF_NAME + " does not match package.json version v" + v);
+              process.exit(1);
+            }'
+
+      - name: npm pack --dry-run (nothing is published)
+        shell: bash
+        run: npm run --silent check:pack
+
+      - name: Ready summary
+        shell: bash
+        run: |
+          {
+            echo "### release check: verification passed"
+            echo "- CI unit matrix (ubuntu/macos/windows, Node 20.20.0): passed"
+            echo "- npm pack --dry-run: passed"
+            echo "- NOT released: no GitHub release, npm publish or deployment was performed (package is private)."
+            echo "- NOT proven here: real telepty daemon, Dot/꼬마 connection, native PTY, restart/recovery. See docs/ci.md."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -16,7 +16,9 @@
     "telesession-tunnel-child": "bin/telesession-tunnel-child.js"
   },
   "scripts": {
-    "test": "node --test test/"
+    "test": "node --test test/",
+    "test:unit": "node --test --test-reporter=tap test/config.test.js test/store.test.js test/tunnel-child.test.js test/tunnel-child-independent.test.js",
+    "check:pack": "npm pack --dry-run --ignore-scripts"
   },
   "files": [
     "bin/",

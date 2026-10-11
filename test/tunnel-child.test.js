@@ -179,9 +179,10 @@ test("exitCodeFor: numeric code passes through; signal maps to 128+n; unknown �
 
 // ── lifecycle with injected fakes ──
 
-function fakeChild({ pid = 4242 } = {}) {
+// Omitted pid defaults to 4242; an explicit `pid: undefined` stays undefined (no pid yet).
+function fakeChild(opts = {}) {
   const child = new EventEmitter();
-  child.pid = pid;
+  child.pid = "pid" in opts ? opts.pid : 4242;
   child.kills = [];
   child.kill = (sig) => { child.kills.push(sig); return true; };
   return child;
