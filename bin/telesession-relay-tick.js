@@ -4,7 +4,10 @@
  * telesession-relay-tick — ONE relay tick (SPEC 2026-10-11 §10), for an operator when no telesession MCP
  * process owns the ledger. Config from TELESESSION_* env (README.md); the ledger is <state dir>/ledger.
  * The ledger lock is taken BEFORE any telepty request: a lock held by a live process (LEDGER_LOCKED) or
- * left by a dead one (LEDGER_LOCK_STALE) is refused with exit 3 and never reclaimed. No loop, no timer.
+ * left by a dead one (LEDGER_LOCK_STALE) is refused with exit 3 and never reclaimed. No loop of its own.
+ * TELESESSION_RELAY_INTERVAL_MS is not overridden here: if it is set, the transport also starts its unref'd
+ * runner timer (review 3 N-d); that timer cannot run a tick concurrently with this one (RELAY_TICK_IN_PROGRESS)
+ * and is stopped by close() right after this tick. Leave the variable unset for exactly one tick.
  * stdout: the tick result as one JSON line. Exit 0 = tick ran, 1 = tick failed, 2 = config, 3 = ledger.
  */
 
