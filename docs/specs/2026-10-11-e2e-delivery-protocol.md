@@ -25,7 +25,8 @@ restart recovery and dedupe; a relay tick library (claim → intent → send →
 injected send primitive; a route-resolution interface; the guarantee model.
 
 Non-goals: telepty changes (alias resolution #105, host provenance #100, consumption receipts
-#103/#104, see §9); starting any process, timer or unit (§10 activation gate); a push/wake into the
+#103/#104, see §9); turning the relay runner on in a live deployment, or any unit/service (§10: code in place, off by
+default, enabling it is a separate approval); a push/wake into the
 origin agent (it has no listener — §8 documents the poll path); exactly-once side effects for arbitrary
 CLI work (never claimed); a direct origin-agent → remote-host route (UNSUPPORTED here: the tunnel
 terminates on one endpoint host only).
@@ -432,6 +433,13 @@ optional `destination {host, session}` for a relayed final destination (the targ
 The transport uses the ledger only when one is passed in (opt-in third argument); the MCP bin opens
 it at `<stateDir>/ledger` when a state dir is configured (no new env var).
 
+Slice 2 (task #2026101110):
+(e) in-process relay runner + `telesession-relay-tick` CLI (§10); (f) retention lifecycle, outbox quarantine
+and `telesession-ledger-prune --dry-run` (§6.1, §11); (g) post-expiry lookup by nonce / request_id /
+correlation_id and `read_reply` from the ledger (§8); (h) provenance/receipt adapters + full-route isolated
+E2E (§9.1); (i) required real-daemon CI gate (`.github/workflows/real-daemon.yml`, docs/ci.md); (j) review
+follow-ups N5, N11 (fail-closed reconstruction), N14, N17, S4.
+
 ## 14. Test matrix (new files under `test/`)
 
 | # | case | expected |
@@ -455,6 +463,12 @@ it at `<stateDir>/ledger` when a state dir is configured (no new env var).
 | G4 | unreferenced reply file after a crash | swept on open |
 | G5 | event-list eviction at 64 | completion not re-applied; `ack_seq` unchanged |
 | C1 | `correlation_id` | minted, persisted, returned, on the wire; mismatch → `CORRELATION_MISMATCH`; old records/replies work |
+| R1 | relay runner (`relay-runner.test.js`) | off by default; sent/failed/uncertain; no concurrent tick; bounded; restart → uncertain, no resend; health block; CLI refuses a live/stale lock (exit 3) and runs one tick |
+| R2 | retention (`relay-retention.test.js`) | lifecycle active → past_deadline → retired; quarantine by age / missing correlation / payload change / max attempts; retired record readable; no file deleted; prune is dry-run only; S4 text drop |
+| R3 | post-expiry (`transport-postexpiry.test.js`) | expired nonce → full status by nonce / request_id / correlation_id; unknown keys `not_tracked`; checkpoint after expiry; late final reply → completed after checkpoint; read_reply `source:"ledger"` |
+| R4 | full route (`e2e-full-route.test.js`) | proven → `origin_ack_received` → `completed`; unproven → `REMOTE_PROVENANCE_UNAVAILABLE`; duplicate / out-of-order receipts collapse; consumption → `agent_consumed` (direct only) |
+| R5 | reconstruction (`transport-reconcile.test.js`) | missing ledger record rebuilt fail-closed after a ledger failure and after audit recovery |
+| R6 | N5 / N14 / N17 | read-only checkpoint `LEDGER_READ_ONLY`; `REJECT_AFTER_ACK`; `origin_untrusted` |
 
 ## 15. Supported OS scope
 
