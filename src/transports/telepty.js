@@ -1256,8 +1256,10 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       const rec = byNonce(nonce);
       if (!rec || !isLive(rec, Date.now())) return fail("NONCE_EXPIRED");
       const more = tracks(nonce) ? ledgerReplies(nonce, cursor) : null;
+      // One timestamp for both checks: waiting for a newer reply implies time remains (no not_observed race).
+      const remaining = deadline - Date.now();
       // With a cursor, wait for a reply newer than it (an addendum) within wait_ms.
-      const waitNewer = more && cursor !== undefined && more.replies && more.replies.length === 0 && deadline - Date.now() > 0;
+      const waitNewer = more && cursor !== undefined && more.replies && more.replies.length === 0 && remaining > 0;
       if (rec.reply.trusted && !waitNewer) {
         if (more && cursor !== undefined) ledger.status({ nonce, cursor });
         // `answered` is already committed; the text comes from the store (durable) or memory.
@@ -1274,7 +1276,6 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
           ...(more || {}),
         });
       }
-      const remaining = deadline - Date.now();
       if (remaining <= 0) {
         return ok({
           nonce, reply: "not_observed",
