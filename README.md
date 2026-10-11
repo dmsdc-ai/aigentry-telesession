@@ -70,7 +70,10 @@ every result. `cursor`, `destination` and `request_status` use the correlation l
 `completed` but adds `NEWER_FINAL_ACK_UNREAD` to `status_reasons` until you read it.
 After the 15-min nonce TTL, `read_reply` still answers `NONCE_EXPIRED` when nothing is stored. When the ledger
 holds verified replies for that nonce, it returns them with `source: "ledger"` and `expiry: "NONCE_EXPIRED"`
-(text/received_at/verified_sender.sid from ledger seq 1; no audit `inject_id`). `request_status` (exactly one
+(text/received_at/verified_sender.sid from ledger seq 1; no audit `inject_id`). For callers written before
+this ledger read path: the post-expiry answer is a success (`ok: true`), not the `NONCE_EXPIRED` error, so branch on
+`source`/`expiry` rather than on the error; it carries no `inject_id`, and `wait_ms` is ignored (it answers at
+once from the ledger, without waiting). `request_status` (exactly one
 lookup key) keeps answering with `transport_nonce: "expired"` and `TRANSPORT_NONCE_EXPIRED`, and still records
 your cursor as the final receipt.
 
