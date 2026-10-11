@@ -63,6 +63,7 @@ origin agent never needs to poll leg n directly.
 | `request_id` | string\|null | caller idempotency key (`^[A-Za-z0-9._:-]{1,128}$`) |
 | `origin` | endpoint | immutable |
 | `destination` | endpoint | immutable; only it may produce destination stages |
+| `via` | endpoint\|null | leg-1 destination when the final destination is further away (relayed request); immutable |
 | `reply_to` | endpoint | immutable return route |
 | `generation` | string\|null | destination epoch/credential generation expected; null = unknown → destination events stay unauthenticated-for-stage (counted, not applied) |
 | `payload_sha256` | 64 hex | hash of the exact bytes sent; immutable |
@@ -73,11 +74,14 @@ origin agent never needs to poll leg n directly.
 | `replies` | list of reply index entries (§4.3) | ordered by `seq` |
 | `next_seq` | int ≥ 1 | monotonic, never reused |
 | `checkpoint` | null \| `{cursor, at}` | the origin agent's acknowledged read position |
+| `ack_seq` | int\|null | seq of the latest reply when `processing_completed` was recorded (the ACK addendum) |
+| `unproven` | map stage→reason | destination stages seen but not authenticatable, e.g. `REMOTE_PROVENANCE_UNAVAILABLE` |
+| `late_pending` | list `{sha256, received_at}` (bounded 4) | reply bytes held after the transport TTL, awaiting verification |
 | `events` | list of applied dedupe keys (bounded 64) | event dedupe |
 | `rejected` | map reason→count | refused events (wrong hash / generation / host / unauthenticated / hop-final) |
 
 ### 4.2 Event (input to `recordEvent`)
-`{nonce, stage, payload_sha256, generation, from: endpoint, authenticated: boolean, hop: "destination"|"intermediary", reason?}`.
+`{nonce, stage, payload_sha256, generation, from: endpoint, authenticated: boolean, hop: "destination"|"intermediary", provenance_unavailable?: boolean, reply_seq?, reason?}`.
 `stage` ∈ `transport_accepted, durable_received, agent_consumed, processing_completed, rejected`.
 
 ### 4.3 Reply / addendum (index entry in the record; text in a reply file)
@@ -87,14 +91,18 @@ origin agent never needs to poll leg n directly.
 | `sha256` | sha256 of the reply text; file `replies/<nonce>-<sha256>.json` (existing naming; several per nonce) |
 | `from` | endpoint of the verified sender |
 | `verified` | adapter attestation; unverified replies are never stored as text |
+| `attestation` | `destination` (verified from the destination itself) \| `relayed_by_leg1_destination` (verified from `via`; the remote destination stage stays unproven) \| `intermediary` |
+| `late_after_ttl` | true when verified after the transport's nonce TTL (§8) |
 | `received_at` | ISO |
 | `dedupe_key` | `<nonce>:<sha256>:<from canonical>` |
 
 Ordering is `seq` (assigned at commit time, under the single-writer lock), not file mtime or name.
 
 ### 4.4 Status view (`telesession_request_status` result)
-`{ok, nonce, request_id, status, stage, stages, deadline_passed, reply_count, cursor, replies?, next_cursor, checkpoint, outbox, rejected, completion_fact:null}`;
+`{ok, nonce, request_id, status, status_reasons, stage, stages, unproven, deadline_passed, reply_count, late_after_ttl_count, cursor, ack_seq, delivered_to_origin_agent, checkpoint, outbox, rejected, completion_fact:null}`;
 `status` ∈ `pending | completed | rejected | unknown | expired | not_tracked`.
+`delivered_to_origin_agent` = `checkpoint !== null && checkpoint.cursor >= ack_seq` (false while `ack_seq` is null).
+`status_reasons` lists explicit codes such as `REMOTE_PROVENANCE_UNAVAILABLE`, `DEADLINE_PASSED`, `OUTBOX_UNCERTAIN`, `AWAITING_ORIGIN_AGENT_READ`.
 
 ## 5. State machine
 
@@ -105,7 +113,12 @@ Allowed transitions / effects:
   kept: skipped lower stages stay null (= no evidence, reported as `unknown` for that stage).
 - A regressing event (k < stage) only fills a null timestamp; the stage never moves back.
 - `processing_completed` recorded at the origin also sets `origin_ack_received` (the origin has now
-  received and durably recorded the authenticated final ACK). Nothing else sets it.
+  received and durably recorded the authenticated final ACK) and `ack_seq`. Nothing else sets it.
+- Status `completed` requires `origin_ack_received` AND `delivered_to_origin_agent`; with the ACK
+  recorded but not yet read by the origin agent the status is `pending` (`AWAITING_ORIGIN_AGENT_READ`).
+- A destination-stage event that cannot be authenticated because remote host provenance is unavailable
+  (telepty #100; event `provenance_unavailable:true`) is not applied: `unproven[stage] =
+  REMOTE_PROVENANCE_UNAVAILABLE` and the status carries that reason code.
 - `rejected`: only by an authenticated destination event; terminal for stages; later replies are still
   stored as addenda (they are data).
 - Derived `unknown`: (a) `deadline_at` passed without `origin_ack_received`; (b) the outbox shows
@@ -134,7 +147,8 @@ Every write: tmp (O_EXCL, 0600) → write → fsync → close → rename → dir
 Reply text file is written and fsynced BEFORE the commit that references it (a crash leaves at most an
 unreferenced file, swept on open). Bounds: records 1024, replies per nonce 32, outbox 256, ledger file
 4 MiB, reply text 64 KiB, events per record 64, retired 256. Restart: reload `ledger.json`, validate,
-re-enter idempotently (§7, §10). The ledger never stores prompt text, tokens or bearer values.
+re-enter idempotently (§7, §10). The ledger never stores the origin prompt text, tokens or bearer values; an outbox item keeps its relay
+payload only until its receipt is recorded.
 
 Read-only / permission-limited directory: open does not crash. If the lock cannot be created
 (`EACCES`/`EROFS`/`EPERM`) and `ledger.json` is readable, the ledger opens `read_only`: reads work,
@@ -168,8 +182,11 @@ Poll/resume path and limits (no push exists): the origin agent polls `telesessio
 (or `read_reply` with its last `next_cursor`) at its own turns. A stored reply is NOT a wake of the
 parent turn; nothing interrupts the agent. Requests with an initial reply stay listed until
 `checkpoint ≥ last seq` AND `origin_ack_received` or `rejected`; until then status is `pending`/`unknown`,
-so they are never forgotten. Limits: addenda are accepted only while the transport still holds the nonce
-live (15 min TTL in this slice, §13 OQ-1); beyond that the late reply is counted `expired_nonce`.
+so they are never forgotten. Late replies: a verified reply is never dropped because the transport's 15-min nonce TTL passed.
+For ledger-backed nonces the receiver holds the bytes (`late_pending`), verifies them against the
+telepty audit with the ledger record's destination + generation (window up to `retain_until`) and stores
+them as an addendum with `late_after_ttl: true`, counted in status (`late_after_ttl_count`). Unverified
+late bytes are dropped and counted. The transport's own expiry semantics stay unchanged (OQ-1).
 
 ## 9. Route resolution and the telepty dependency boundary
 
@@ -247,6 +264,9 @@ it at `<stateDir>/ledger` when a state dir is configured (no new env var).
 | T5 | crash between intent and receipt | reopen → `uncertain`; tick does not call send |
 | T6 | wrong hash / wrong generation / wrong host / unauthenticated / intermediary-final | rejected with reason, no state change |
 | T7 | deadline passed without ACK | status `unknown`, never `not_delivered` |
+| T11 | verified reply after the transport TTL | stored as addendum `late_after_ttl:true`; status counts it |
+| T12 | remote destination stage without provenance | `REMOTE_PROVENANCE_UNAVAILABLE`; addendum `relayed_by_leg1_destination` |
+| T13 | ACK recorded, not yet read by the origin agent | `pending`; `completed` only after checkpoint ≥ `ack_seq` |
 | T8 | route resolution with two locator forms of one peer | same canonical peer; unknown form unresolved |
 | T9 | read-only ledger directory | no crash; reads work; writes `LEDGER_READ_ONLY` |
 | T10 | MCP: six strict tools; `request_status` schema | existing refusals unchanged |
@@ -259,10 +279,11 @@ is POSIX-only (skipped when running as root or on win32).
 
 ## 16. Open questions
 
-- OQ-1: addenda after the transport's 15-min nonce TTL — extend live tracking for ledger-backed nonces
-  up to `retain_until` (needs a reviewed change of the transport's expiry semantics).
+- OQ-1: whether the transport's own nonce TTL/expiry semantics should change for ledger-backed nonces
+  (late replies are already kept via §8 `late_after_ttl`; this is about `read_reply` NONCE_EXPIRED).
 - OQ-2: multi-leg e2e ACK attestation across hosts needs telepty #100 host provenance; until then a
-  remote ACK reaches the origin only as a verified addendum *from the leg-1 destination*.
+  remote ACK reaches the origin only as a verified addendum *from the leg-1 destination*
+  (`attestation: relayed_by_leg1_destination`) and the remote stage reads `REMOTE_PROVENANCE_UNAVAILABLE`.
 - OQ-3: whether `agent_consumed` should be fed from telepty consumption observations (#103/#104) in
   `requestStatus` (extra daemon read per status call).
 - OQ-4: outbox CLI entry naming and the operator review UX for `uncertain` items.
