@@ -148,7 +148,9 @@ Allowed transitions / effects:
   (telepty #100; event `provenance_unavailable:true`) is not applied: `unproven[stage] =
   REMOTE_PROVENANCE_UNAVAILABLE` and the status carries that reason code.
 - `rejected`: only by an authenticated destination event; terminal for stages; later replies are still
-  stored as addenda (they are data).
+  stored as addenda (they are data). It cannot follow `origin_ack_received`: a recorded, authenticated
+  final ACK is not undone by a later refusal. Such an event is refused with `REJECT_AFTER_ACK` (counted
+  in `rejected`, no state change), and a `completed` request stays `completed` (review N14).
 - Derived `unknown`: (a) `deadline_ms` passed without `origin_ack_received`; (b) the outbox shows
   `uncertain`. (A former case (c), "no evidence beyond `transport_accepted`", was dropped: within the
   deadline that state is `pending`, after it (a) applies.) A timeout NEVER yields `not_delivered`.

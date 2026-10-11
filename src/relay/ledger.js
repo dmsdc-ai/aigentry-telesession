@@ -434,6 +434,8 @@ export function openLedger(opts, seams) {
     const learn = final && rec.generation === null && rec.via !== null && ev.learn_generation === true
       && typeof ev.generation === "string" && ev.generation.length > 0 && ev.generation.length <= 256;
     if (final && !learn && (rec.generation === null || ev.generation !== rec.generation)) return reject(rec.nonce, "GENERATION_MISMATCH");
+    // Review N14: a recorded final ACK is not undone by a later refusal (counted, not applied).
+    if (ev.stage === "rejected" && rec.stages.origin_ack_received !== null) return reject(rec.nonce, "REJECT_AFTER_ACK");
     // A final reply is part of the completion event's identity: a later final reply is a new event.
     const replySha = ev.stage === "processing_completed" && typeof ev.reply_sha256 === "string" && HEX64_RE.test(ev.reply_sha256) ? `:${ev.reply_sha256}` : "";
     const key = `${rec.payload_sha256}:${hopKey(ev.from)}:${ev.stage}${replySha}`;
