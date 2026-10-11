@@ -462,7 +462,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     ledger = null;
     ledgerOpenCode = err && typeof err.code === "string" && /^[A-Z0-9_]{1,64}$/.test(err.code) ? err.code : "LEDGER_OPEN_FAILED";
   }
-  const ledgerStats = { write_failed: 0, late_dropped: 0 };
+  const ledgerStats = { write_failed: 0, late_dropped: 0, ack_event_failed: 0 };
   const LOCAL = "local";
   const tracks = (nonce) => ledger !== null && ledger.has(nonce);
 
@@ -917,15 +917,39 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     if (!a.ok) { ledgerStats.write_failed += 1; return false; }
     const lr = ledger.record(nonce);
     // Only a reply marked final is the semantic ACK; any other verified reply is an addendum, no stage.
-    if (lr && isFinalAck(t.text)) {
-      const relayed = lr.via !== null;
-      ledger.recordEvent({
-        nonce, stage: "processing_completed", payload_sha256: lr.payload_sha256, from, hop: "destination",
-        generation: row.verified_sender_epoch, authenticated: !relayed, provenance_unavailable: relayed,
-        reply_seq: a.seq, reply_sha256: sha256,
-      });
-    }
+    if (lr && isFinalAck(t.text)) recordFinalAck(lr, a.seq, sha256, from, row.verified_sender_epoch);
     return true;
+  }
+
+  // The completion event for a stored final reply. A failure is counted; the reply stays above ack_seq,
+  // so resyncFinalAck re-evaluates it on the next status/read pass (idempotent: the event key dedupes).
+  function recordFinalAck(lr, seq, sha256, from, generation) {
+    const relayed = lr.via !== null;
+    const e = ledger.recordEvent({
+      nonce: lr.nonce, stage: "processing_completed", payload_sha256: lr.payload_sha256, from, hop: "destination",
+      generation, authenticated: !relayed, provenance_unavailable: relayed, reply_seq: seq, reply_sha256: sha256,
+    });
+    if (!e.ok && e.code !== "REMOTE_PROVENANCE_UNAVAILABLE" && e.code !== "TERMINAL") {
+      ledgerStats.write_failed += 1;
+      ledgerStats.ack_event_failed += 1;
+    }
+  }
+
+  // Re-review RB1: stored final-tagged replies with seq > ack_seq whose completion was not recorded.
+  // Verified replies were bound to the record's epoch (via_generation for a relayed record).
+  function resyncFinalAck(nonce) {
+    if (!tracks(nonce)) return;
+    const lr = ledger.record(nonce);
+    if (!lr || lr.terminal || lr.next_seq - 1 <= (lr.ack_seq ?? 0)) return;
+    if (lr.via !== null && lr.unproven.processing_completed) return;
+    const r = ledger.readReplies({ nonce, cursor: lr.ack_seq ?? 0 });
+    if (!r.ok) return;
+    const want = lr.via !== null ? "relayed_by_leg1_destination" : "destination";
+    for (const x of r.replies) {
+      if (x.attestation === want && typeof x.text === "string" && isFinalAck(x.text)) {
+        recordFinalAck(ledger.record(nonce), x.seq, x.sha256, x.from, lr.via !== null ? lr.via_generation : lr.generation);
+      }
+    }
   }
 
   // A first-reply ledger write that failed (counted in write_failed) is retried until the ledger has seq 1,
@@ -1269,6 +1293,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       await resolveCandidates();
       const rec = byNonce(nonce);
       if (!rec || !isLive(rec, Date.now())) return fail("NONCE_EXPIRED");
+      resyncFinalAck(nonce);
       const more = tracks(nonce) ? ledgerReplies(nonce, cursor) : null;
       // One timestamp for both checks: waiting for a newer reply implies time remains (no not_observed race).
       const remaining = deadline - Date.now();
@@ -1314,6 +1339,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     if (!ledger) return ledgerOpenCode ? fail("LEDGER_UNAVAILABLE", { ledger_code: ledgerOpenCode }) : fail("LEDGER_NOT_CONFIGURED");
     await awaitRecovery();
     await resolveCandidates();
+    resyncFinalAck(nonce);
     const st = ledger.status({ nonce, cursor });
     if (!st.ok) return fail(st.code);
     const more = st.status === "expired" || st.status === "not_tracked" ? {} : ledgerReplies(nonce, cursor);

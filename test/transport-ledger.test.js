@@ -236,6 +236,48 @@ describe("transport with correlation ledger (loopback fake telepty)", { skip: NO
     assert.equal(all.text, all.replies[0].text, "ledger seq 1 is read_reply's text");
   });
 
+  // Re-review RB1, after the reviewer's scratch/ack-event-fail.test.mjs R4.
+  test("RB1 a transient failure recording the final-ACK event is counted and recovered on the next status/read pass", async (t) => {
+    const sb = makeSandbox("ts-ledger-rb1-");
+    const fake = await startFakeTelepty();
+    const real = openLedger({ dir: path.join(sb.root, "ledger") });
+    let failOnce = true;
+    const ledger = { ...real, get mode() { return real.mode; }, recordEvent(e) {
+      if (e.stage === "processing_completed" && failOnce) { failOnce = false; return { ok: false, code: "LEDGER_WRITE_FAILED" }; }
+      return real.recordEvent(e);
+    } };
+    const cfg = normalizeConfig({ teleptyUrl: fake.origin, token: fake.token, targets: ["target-1"], inboxPrefix: PREFIX, stateDir: sb.stateDir });
+    const tr = createTeleptyTransport(cfg, sb.seam(), { ledger });
+    t.after(async () => { await tr.close(); real.close(); await fake.close(); sb.remove(); });
+    const s = await tr.send({ target: "target-1", text: "job" });
+    assert.equal(s.ok, true, JSON.stringify(s));
+    fake.replyFrom("target-1", s.reply_to, `REPLY ${s.nonce} ${ACK_FINAL} done`);
+    const r = await tr.readReply({ nonce: s.nonce, wait_ms: 8000 });
+    assert.equal(r.reply, "trusted", JSON.stringify(r));
+    assert.equal(failOnce, false, "the injected failure fired");
+    const st = await tr.requestStatus({ nonce: s.nonce, cursor: 1 });
+    assert.equal(st.stage, "origin_ack_received", JSON.stringify(st));
+    assert.equal(st.final_ack_seq, 1);
+    assert.equal(st.status, "completed");
+    assert.equal(st.reply_count, 1);
+    assert.equal(st.ledger.write_failed, 1, "counted");
+    assert.equal(st.ledger.ack_event_failed, 1, "counted specifically");
+    assert.equal((await tr.health()).ledger.ack_event_failed, 1);
+    const again = await tr.requestStatus({ nonce: s.nonce });
+    assert.deepEqual([again.final_ack_seq, again.ledger.write_failed], [1, 1], "idempotent: no re-apply, no recount");
+  });
+
+  test("RB1 relayed final reply: REMOTE_PROVENANCE_UNAVAILABLE is expected, not counted as a failure", async (t) => {
+    const { fake, make } = await setup(t);
+    const tr = make();
+    const s = await tr.send({ target: "target-1", text: "relay", destination: REMOTE });
+    fake.replyFrom("target-1", s.reply_to, `REPLY ${s.nonce} ${ACK_FINAL} remote ACK`);
+    assert.equal((await tr.readReply({ nonce: s.nonce, wait_ms: 8000 })).reply, "trusted");
+    const st = await tr.requestStatus({ nonce: s.nonce, cursor: 1 });
+    assert.deepEqual(st.unproven, { processing_completed: "REMOTE_PROVENANCE_UNAVAILABLE" });
+    assert.deepEqual([st.ledger.write_failed, st.ledger.ack_event_failed], [0, 0]);
+  });
+
   // Review G3 (B3): an open failure is surfaced with its code, not reported as LEDGER_NOT_CONFIGURED.
   test("G3 stale ledger lock → request_status and health report LEDGER_UNAVAILABLE with the open code", async (t) => {
     const sb = makeSandbox("ts-ledger-g3-");
