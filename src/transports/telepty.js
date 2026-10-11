@@ -230,6 +230,13 @@ export function parseReplyNonce(text) {
   return m ? m[1] : null;
 }
 
+// SPEC 2026-10-11 §5: a verified reply is the final ACK only with this token on one of its first three
+// lines. It classifies an already verified reply; it never authenticates anything.
+export const ACK_FINAL_TOKEN = "[telesession ack=final]";
+export function isFinalAck(text) {
+  return String(text).split("\n", 3).some((line) => line.includes(ACK_FINAL_TOKEN));
+}
+
 // rows: audit rows (GET /api/injects shape). candidate: {sha256}. issued: the nonce entry.
 // ctx: {inboxId, boundInjectIds:Set, complete:boolean}. Returns {pending:true, reason} when no row
 // matches yet (audit lag), else a final verdict.
@@ -900,11 +907,13 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       : ledger.appendReply({ nonce, text: t.text, from, verified: true, received_at: receivedAt });
     if (!a.ok) { ledgerStats.write_failed += 1; return false; }
     const lr = ledger.record(nonce);
-    if (lr) {
+    // Only a reply marked final is the semantic ACK; any other verified reply is an addendum, no stage.
+    if (lr && isFinalAck(t.text)) {
       const relayed = lr.via !== null;
       ledger.recordEvent({
         nonce, stage: "processing_completed", payload_sha256: lr.payload_sha256, from, hop: "destination",
-        generation: row.verified_sender_epoch, authenticated: !relayed, provenance_unavailable: relayed, reply_seq: a.seq,
+        generation: row.verified_sender_epoch, authenticated: !relayed, provenance_unavailable: relayed,
+        reply_seq: a.seq, reply_sha256: sha256,
       });
     }
     return true;
