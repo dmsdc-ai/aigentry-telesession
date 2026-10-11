@@ -428,10 +428,14 @@ export function openLedger(opts, seams) {
     return fail(reason);
   }
 
+  // Review 3 N-b (§6.1): a retired record (marker or past retain_until) accepts reads and checkpoints only.
+  const isRetired = (rec) => Boolean(rec.retired_at) || now() > rec.retain_until_ms;
+
   function recordEvent(ev = {}) {
     if (mode !== "read_write") return fail("LEDGER_READ_ONLY");
     const rec = state.records[ev.nonce];
     if (!rec) return fail("UNKNOWN_CORRELATION");
+    if (isRetired(rec)) return reject(rec.nonce, "RETIRED");
     if (!EVENT_STAGES.has(ev.stage) || !isEndpoint(ev.from)) return fail("INVALID_ARGUMENT");
     if (correlationMismatch(rec, ev.correlation_id)) return fail("CORRELATION_MISMATCH");
     if (ev.payload_sha256 !== rec.payload_sha256) return reject(rec.nonce, "HASH_MISMATCH");
@@ -513,6 +517,7 @@ export function openLedger(opts, seams) {
     if (mode !== "read_write") return fail("LEDGER_READ_ONLY");
     const rec = state.records[nonce];
     if (!rec) return fail("UNKNOWN_CORRELATION");
+    if (isRetired(rec)) return reject(rec.nonce, "RETIRED");
     if (typeof text !== "string" || !isEndpoint(from)) return fail("INVALID_ARGUMENT");
     if (correlationMismatch(rec, correlation_id)) return fail("CORRELATION_MISMATCH");
     if (verified !== true) return fail("UNAUTHENTICATED");

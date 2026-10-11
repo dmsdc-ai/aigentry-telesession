@@ -265,3 +265,20 @@ test("prune --dry-run leaves ledger.json and the directory byte-identical (pendi
   assert.throws(() => openLedger({ dir: path.join(base, "absent"), readOnly: true }), { code: "LEDGER_NOT_FOUND" });
   assert.equal(fs.existsSync(path.join(base, "absent")), false);
 });
+
+// Review 3 N-b (§6.1): a retired record accepts reads and checkpoints only; events and replies are refused (counted).
+test("retired record refuses recordEvent and appendReply with RETIRED (counted); reads and checkpoints still work", (t) => {
+  const { l, now, open } = setup(t);
+  assert.equal(l.appendReply({ nonce: NONCE, text: "before", from: DEST, verified: true }).ok, true);
+  now.advance(700000);
+  const ev = { nonce: NONCE, stage: "processing_completed", payload_sha256: sha("p"), from: DEST, hop: "destination", generation: "g1", authenticated: true };
+  assert.equal(l.recordEvent(ev).code, "RETIRED", "derived retirement (before the marker)");
+  l.close();
+  const l2 = open();
+  assert.match(l2.record(NONCE).retired_at, /^\d{4}-/);
+  assert.equal(l2.recordEvent(ev).code, "RETIRED");
+  assert.equal(l2.appendReply({ nonce: NONCE, text: "after", from: DEST, verified: true }).code, "RETIRED");
+  const s = l2.status({ nonce: NONCE, cursor: 1 });
+  assert.deepEqual([s.reply_count, s.stage, s.rejected.RETIRED, s.checkpoint.cursor], [1, "unknown", 3, 1]);
+  assert.equal(l2.readReplies({ nonce: NONCE, cursor: 0 }).replies[0].text, "before");
+});
