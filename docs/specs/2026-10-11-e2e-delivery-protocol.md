@@ -251,9 +251,26 @@ Callers that ignore the new fields see exactly the old behaviour. Ledger seq 1 i
 (trusted) reply: if its ledger write fails (counted in `ledger.write_failed`), it is retried on later
 passes while the nonce is live, and no addendum is stored before it.
 
-New tool `telesession_request_status` — input `{nonce, cursor?}` (strict); read-only except that a
-`cursor` argument records the caller's checkpoint (`checkpoint = max(old, cursor)`): the origin
-agent's final receipt. Output: §4.4.
+New tool `telesession_request_status` — input exactly one of `nonce`, `request_id`, `correlation_id`
+plus optional `cursor` (strict schema; "exactly one" is checked by the transport → `INVALID_ARGUMENT`,
+because a refined zod schema would be listed without its properties). `request_id` selects the newest
+ledger record with that id. An unknown `request_id`/`correlation_id` returns only `{ok, <the key>,
+status:"not_tracked"}` and the ledger counters, never another record. Read-only, except that a `cursor`
+argument records the caller's checkpoint (`checkpoint = max(old, cursor)`): the origin agent's final
+receipt. Output: §4.4, plus `transport_nonce: "live"|"expired"`.
+
+After expiry (OQ-1, resolved for reads): the transport's own TTL semantics are unchanged (`read_reply`
+still answers `NONCE_EXPIRED`/`NONCE_NOT_ISSUED` when nothing is stored), but while the ledger holds the
+record:
+- `request_status` answers with the full view (stages, replies via cursor, `final_ack_seq`,
+  `first_ack_seq`, `lifecycle`, `status_reasons` incl. `TRANSPORT_NONCE_EXPIRED`, `DEADLINE_PASSED`,
+  `LATE_AFTER_TTL`, `RETIRED`) and records the checkpoint;
+- `read_reply` returns the ledger's verified replies with `source:"ledger"` and `expiry:<transport code>`.
+  `text`/`received_at`/`verified_sender.sid` come from ledger seq 1 (the audit `inject_id` is not kept
+  there), and `replies`/`next_cursor` work as before; a `cursor` is recorded as the checkpoint.
+A late final reply verified after expiry (§8 late path) is therefore visible and completes the request once
+the checkpoint covers it. Trust boundary unchanged: these are read paths on the origin's own MCP server
+over its own ledger; no new network surface.
 
 Poll/resume path and limits (no push exists): the origin agent polls `telesession_request_status`
 (or `read_reply` with its last `next_cursor`) at its own turns. A stored reply is NOT a wake of the
@@ -402,8 +419,9 @@ is POSIX-only (skipped when running as root or on win32).
 
 ## 16. Open questions
 
-- OQ-1: whether the transport's own nonce TTL/expiry semantics should change for ledger-backed nonces
-  (late replies are already kept via §8 `late_after_ttl`; this is about `read_reply` NONCE_EXPIRED).
+- OQ-1 (resolved for reads, slice 2): the transport TTL is unchanged; after it, `request_status` and
+  `read_reply` answer from the ledger (§8 "After expiry"). Whether the transport TTL itself should follow the
+  ledger for ledger-backed nonces stays open.
 - OQ-2: multi-leg e2e ACK attestation across hosts needs telepty #100 host provenance; until then a
   remote ACK reaches the origin only as a verified addendum *from the leg-1 destination*
   (`attestation: relayed_by_leg1_destination`) and the remote stage reads `REMOTE_PROVENANCE_UNAVAILABLE`.

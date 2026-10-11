@@ -595,6 +595,7 @@ export function openLedger(opts, seams) {
     // Tracking ended: an open outcome reads `expired` (unknown, not "not delivered"); a known one stays.
     if (retired && status !== "completed" && status !== "rejected") status = "expired";
     if (retired) reasons.push("RETIRED");
+    if (rec.replies.some((x) => x.late_after_ttl)) reasons.push("LATE_AFTER_TTL");
     outbox.quarantined = quarantined.length;
     return {
       ok: true, nonce: rec.nonce, correlation_id: rec.correlation_id ?? null, request_id: rec.request_id, status, status_reasons: reasons,
@@ -611,10 +612,30 @@ export function openLedger(opts, seams) {
     };
   }
 
+  // Exactly one of nonce / request_id (newest record with it) / correlation_id → the record's nonce, or
+  // null when nothing matches; undefined = invalid lookup.
+  function find(key = {}) {
+    const given = ["nonce", "request_id", "correlation_id"].filter((k) => key[k] !== undefined);
+    if (given.length !== 1) return undefined;
+    const [k] = given;
+    const v = key[k];
+    if (typeof v !== "string" || !(k === "request_id" ? REQUEST_ID_RE : HEX32_RE).test(v)) return undefined;
+    if (k === "nonce") return state.records[v] ? v : null;
+    let best = null;
+    for (const r of Object.values(state.records)) if (r[k] === v && (best === null || r.created_ms > best.created_ms)) best = r;
+    return best ? best.nonce : null;
+  }
+
   // A cursor records the origin agent's checkpoint (monotonic). Without one, status is read-only.
-  function status({ nonce, cursor } = {}) {
-    if (typeof nonce !== "string" || !HEX32_RE.test(nonce)) return fail("INVALID_ARGUMENT");
+  // Lookup by exactly one of nonce / request_id / correlation_id; a miss on the latter two is not_tracked.
+  function status({ nonce: byNonce, request_id, correlation_id, cursor } = {}) {
+    const found = find({ nonce: byNonce, request_id, correlation_id });
+    if (found === undefined) return fail("INVALID_ARGUMENT");
     if (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < 0)) return fail("INVALID_ARGUMENT");
+    if (found === null && byNonce === undefined) {
+      return { ok: true, ...(request_id !== undefined ? { request_id } : { correlation_id }), status: "not_tracked", completion_fact: null };
+    }
+    const nonce = found ?? byNonce;
     let rec = state.records[nonce];
     // A retired record stays readable (view: lifecycle retired); only a nonce whose record is gone is a stub.
     if (!rec) return { ok: true, nonce, status: state.retired.includes(nonce) ? "expired" : "not_tracked", completion_fact: null };
@@ -722,7 +743,7 @@ export function openLedger(opts, seams) {
 
   return Object.freeze({
     get mode() { return mode; },
-    createRequest, recordEvent, appendReply, readReplies, status, has, record,
+    createRequest, recordEvent, appendReply, readReplies, status, find, has, record,
     holdLate, latePending, readLateText, promoteLate, dropLate,
     enqueue, outbox, outboxTransition, sweepOutbox, prunable,
     close() {

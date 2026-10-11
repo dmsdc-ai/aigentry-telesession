@@ -147,6 +147,10 @@ test("exactly six strict tools over real stdio; schema/allowlist refusals need n
     assert.equal(nn.error.code, "NONCE_NOT_ISSUED");
     const rs = record(await mcp.client.callTool({ name: "telesession_request_status", arguments: { nonce: "0".repeat(32) } }));
     assert.equal(rs.error.code, "LEDGER_NOT_CONFIGURED", "memory-only config has no ledger");
+    const rsTool = tools.find((x) => x.name === "telesession_request_status");
+    assert.deepEqual(Object.keys(rsTool.inputSchema.properties).sort(), ["correlation_id", "cursor", "nonce", "request_id"]);
+    const none = record(await mcp.client.callTool({ name: "telesession_request_status", arguments: {} }));
+    assert.equal(none.error.code, "INVALID_ARGUMENT", "exactly one lookup key (checked by the transport)");
     assert.ok(kinds.every((k) => k === kinds[0]), `consistent refusal style: ${kinds}`);
   } finally {
     stderr = await mcp.close();

@@ -63,11 +63,16 @@ Example MCP client entry (placeholders only; never put a token value here):
 ## MCP tools
 `telesession_health`, `telesession_list_targets`, `telesession_send {target, text, request_id?, destination?}`,
 `telesession_receipt {inject_id}`, `telesession_read_reply {nonce, wait_ms, cursor?}`,
-`telesession_request_status {nonce, cursor?}` — strict schemas, JSON results, `completion_fact: null` on
+`telesession_request_status {nonce | request_id | correlation_id, cursor?}` — strict schemas, JSON results, `completion_fact: null` on
 every result. `cursor`, `destination` and `request_status` use the correlation ledger (durable mode only,
 `<state dir>/ledger`); see `docs/specs/2026-10-11-e2e-delivery-protocol.md`. `request_status` turns
 `completed` once your cursor covers the first final reply (`first_ack_seq`); a later final reply keeps it
 `completed` but adds `NEWER_FINAL_ACK_UNREAD` to `status_reasons` until you read it.
+After the 15-min nonce TTL, `read_reply` still answers `NONCE_EXPIRED` when nothing is stored. When the ledger
+holds verified replies for that nonce, it returns them with `source: "ledger"` and `expiry: "NONCE_EXPIRED"`
+(text/received_at/verified_sender.sid from ledger seq 1; no audit `inject_id`). `request_status` (exactly one
+lookup key) keeps answering with `transport_nonce: "expired"` and `TRANSPORT_NONCE_EXPIRED`, and still records
+your cursor as the final receipt.
 
 Flow: `send` injects `[telesession nonce=<n> reply-to=<inbox> correlation=<id>]` + newline + text into the exact
 target (`exact_target:true`, no alias fallback). The target answers from its own telepty session into
