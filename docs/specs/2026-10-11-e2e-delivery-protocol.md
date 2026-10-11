@@ -183,7 +183,10 @@ non-symlink directory). Bounds: records 1024, replies per nonce 32, outbox 256, 
 4 MiB, reply text 64 KiB (reply file ≤ 6 × 64 KiB + 4 KiB, the worst-case JSON escaping; a larger file is
 refused with `LEDGER_FULL` before it is written), events per record 64, retired 256. Restart: reload `ledger.json`, validate,
 re-enter idempotently (§7, §10). The ledger never stores the origin prompt text, tokens or bearer values; an outbox item keeps its relay
-payload only until its receipt is recorded.
+text only while it may still be sent (`queued`/`intent`). On `sent` the text is dropped. On `failed`,
+`uncertain` (incl. the restart conversion) or a quarantine, the item keeps `payload_sha256` plus `excerpt`,
+the first 200 code points of the text, for operator review (review S4). An `uncertain` item is never resent
+automatically, so it needs no full text.
 
 Lock holder: the lock file records the holder pid. If it exists and that pid is not alive (`ESRCH`),
 open fails with `LEDGER_LOCK_STALE`; a live, unreadable or unparseable holder is `LEDGER_LOCKED`. The lock
