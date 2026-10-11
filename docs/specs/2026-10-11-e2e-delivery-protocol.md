@@ -470,3 +470,17 @@ is POSIX-only (skipped when running as root or on win32).
 - OQ-3: whether `agent_consumed` should be fed from telepty consumption observations (#103/#104) in
   `requestStatus` (extra daemon read per status call).
 - OQ-4: outbox CLI entry naming and the operator review UX for `uncertain` items.
+
+## 17. Decided follow-ups (not implemented in slice 2)
+
+- **Ledger record before the inject (orchestrator decision 2026-10-12, review N11 bullets 2–3).** Today the
+  ledger record is created after the daemon accepted the inject. A crash or ledger failure in between, or an
+  uncertain send later recovered from the audit, is covered only by the fail-closed reconstruction (§4.1
+  `reconstructed`). It never completes without an authenticated final receipt.
+  Target design (option b): the transport creates the ledger record BEFORE the inject, with an initial
+  stage (`created`/`sending`, before `transport_accepted`). It binds the destination epoch when it reserves
+  the target (before the write), and it records new terminal states `never_sent` / `transport_refused`
+  for requests the transport refuses. This removes the crash window and matches the intent-before-send
+  rule of the relay state machine (§10).
+  Option (a), migrating the store state schema (v1 is exact-key and keeps neither `destination` nor
+  `correlation_id`) so a lost record can be rebuilt exactly, was **rejected** in favour of (b).
