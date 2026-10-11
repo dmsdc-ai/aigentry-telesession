@@ -16,6 +16,8 @@ const TOKEN_RE = /^[\x21-\x7E]{1,4096}$/;
 const TOKEN_FILE_MAX = 64 * 1024;
 const MAX_TARGETS = 8;
 const STATE_DIR_MAX = 512;
+const RELAY_INTERVAL_MIN_MS = 1000;
+const RELAY_INTERVAL_MAX_MS = 3600000;
 
 export class ConfigError extends Error {
   constructor(code) {
@@ -53,8 +55,9 @@ function normalizeStateDir(raw) {
 // Pure: typed inputs in, frozen normalized config out (or ConfigError). The token is a
 // non-enumerable property so it never appears in JSON.stringify / Object.keys of the config.
 // stateDir/persistInboxCredential are enumerable only when a state dir is set, so the memory-only
-// config keeps exactly the 0.1.0 shape.
-export function normalizeConfig({ teleptyUrl, token, targets, inboxPrefix, stateDir, persistInboxCredential } = {}) {
+// config keeps exactly the 0.1.0 shape. relayIntervalMs (0 = relay runner off, the default) is
+// enumerable only when enabled; enabling it needs a state dir (the ledger lives there).
+export function normalizeConfig({ teleptyUrl, token, targets, inboxPrefix, stateDir, persistInboxCredential, relayIntervalMs } = {}) {
   if (!Array.isArray(targets)) throw new ConfigError("CONFIG_TARGETS_INVALID");
   const unique = [...new Set(targets)];
   if (unique.length < 1 || unique.length > MAX_TARGETS || unique.length !== targets.length
@@ -68,9 +71,15 @@ export function normalizeConfig({ teleptyUrl, token, targets, inboxPrefix, state
   if (persistInboxCredential !== undefined && typeof persistInboxCredential !== "boolean") throw new ConfigError("CONFIG_PERSIST_INVALID");
   const persist = persistInboxCredential === true;
   if (persist && dir === null) throw new ConfigError("CONFIG_STATE_DIR_REQUIRED");
+  const relay = relayIntervalMs === undefined || relayIntervalMs === null ? 0 : relayIntervalMs;
+  if (!(relay === 0 || (Number.isSafeInteger(relay) && relay >= RELAY_INTERVAL_MIN_MS && relay <= RELAY_INTERVAL_MAX_MS))) {
+    throw new ConfigError("CONFIG_RELAY_INTERVAL_INVALID");
+  }
+  if (relay > 0 && dir === null) throw new ConfigError("CONFIG_STATE_DIR_REQUIRED");
   const cfg = { targets: Object.freeze(unique), inboxPrefix, teleptyOrigin };
   Object.defineProperty(cfg, "stateDir", { value: dir, enumerable: dir !== null });
   Object.defineProperty(cfg, "persistInboxCredential", { value: persist, enumerable: dir !== null });
+  Object.defineProperty(cfg, "relayIntervalMs", { value: relay, enumerable: relay > 0 });
   Object.defineProperty(cfg, "token", { value: token, enumerable: false });
   return Object.freeze(cfg);
 }
@@ -121,5 +130,7 @@ export function loadConfig(env, { readTokenFile = defaultReadTokenFile } = {}) {
   const rawPersist = e.TELESESSION_PERSIST_INBOX_CREDENTIAL;
   const persistInboxCredential = rawPersist === undefined || rawPersist === "" || rawPersist === "0" ? false
     : rawPersist === "1" ? true : String(rawPersist);
-  return normalizeConfig({ teleptyUrl, token, targets, inboxPrefix, stateDir, persistInboxCredential });
+  const rawRelay = e.TELESESSION_RELAY_INTERVAL_MS;
+  const relayIntervalMs = rawRelay === undefined || rawRelay === "" ? 0 : /^\d{1,7}$/.test(String(rawRelay)) ? Number(rawRelay) : String(rawRelay);
+  return normalizeConfig({ teleptyUrl, token, targets, inboxPrefix, stateDir, persistInboxCredential, relayIntervalMs });
 }

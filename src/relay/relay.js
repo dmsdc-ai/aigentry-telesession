@@ -15,8 +15,11 @@ const TRANSPORT_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 
 const codeOf = (r) => (r && typeof r.code === "string" && CODE_RE.test(r.code) ? r.code : "SEND_FAILED");
 
-export async function relayTick({ ledger, send, resolver }) {
-  const out = { sent: [], requeued: [], failed: [], uncertain: [], unresolved: [], skipped: [], commit_failed: [] };
+// Bounded: at most `maxItems` sends and no new send once `now() >= deadlineAt`; the rest stays
+// `queued` and is reported in `deferred` (picked up by a later tick).
+export async function relayTick({ ledger, send, resolver, maxItems = Infinity, deadlineAt = Infinity, now = Date.now }) {
+  const out = { sent: [], requeued: [], failed: [], uncertain: [], unresolved: [], skipped: [], deferred: [], commit_failed: [] };
+  let attempted = 0;
   // A transition whose commit failed is reported as {key, code} instead of its outcome bucket.
   const settle = (key, from, fields, bucket) => {
     const c = ledger.outboxTransition(key, from, fields);
@@ -26,6 +29,7 @@ export async function relayTick({ ledger, send, resolver }) {
   for (const item of ledger.outbox()) {
     if (item.state === "uncertain") { out.uncertain.push(item.key); continue; }
     if (item.state !== "queued") continue;
+    if (attempted >= maxItems || now() >= deadlineAt) { out.deferred.push(item.key); continue; }
     const route = resolver.resolve(item.to);
     if (!route.ok) {
       settle(item.key, "queued", { last_error: route.code }, out.unresolved);
@@ -34,6 +38,7 @@ export async function relayTick({ ledger, send, resolver }) {
     // CLAIM + INTENT: durable before the send; the ledger lock is the claim.
     const intent = ledger.outboxTransition(item.key, "queued", { state: "intent", intent_at: new Date().toISOString() });
     if (!intent.ok) { out.skipped.push(item.key); continue; }
+    attempted += 1;
     let r;
     try {
       r = await send({ key: item.key, nonce: item.nonce, kind: item.kind, peer_id: route.peer_id, locator: route.locator, session: route.session, text: item.text });
