@@ -193,8 +193,9 @@ parent turn; nothing interrupts the agent. Requests with an initial reply stay l
 so they are never forgotten. Late replies: a verified reply is never dropped because the transport's 15-min nonce TTL passed.
 For ledger-backed nonces the receiver holds the bytes (`late_pending`), verifies them against the
 telepty audit with the ledger record's destination + generation (window up to `retain_until`) and stores
-them as an addendum with `late_after_ttl: true`, counted in status (`late_after_ttl_count`). Unverified
-late bytes are dropped and counted. The transport's own expiry semantics stay unchanged (OQ-1).
+them as an addendum with `late_after_ttl: true`, counted in status (`late_after_ttl_count`). The ledger
+write comes before the audit `inject_id` is bound, so a transient ledger failure leaves the bytes pending
+and the next pass verifies them again (never `duplicate`). Unverified late bytes are dropped and counted. The transport's own expiry semantics stay unchanged (OQ-1).
 
 ## 9. Route resolution and the telepty dependency boundary
 

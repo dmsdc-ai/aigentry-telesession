@@ -948,9 +948,12 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
         continue;
       }
       if (verdict.trusted) {
-        if (!persist((d) => { pushBounded(d.bound_inject_ids, verdict.row.inject_id, BOUND_MAX); }).ok) continue;
+        // Ledger first (as the live path): a failed promotion stays pending with its inject_id unbound,
+        // so the next pass verifies it again instead of classifying it as a duplicate.
+        if (!ledgerReply(x.nonce, x.sha256, verdict.row, x.received_at, true)) continue;
+        persistOrHold((d) => { pushBounded(d.bound_inject_ids, verdict.row.inject_id, BOUND_MAX); });
         bound.add(verdict.row.inject_id);
-        if (ledgerReply(x.nonce, x.sha256, verdict.row, x.received_at, true)) pace.delete(k);
+        pace.delete(k);
       } else {
         ledger.dropLate({ nonce: x.nonce, sha256: x.sha256, reason: verdict.reason });
         ledgerStats.late_dropped += 1;
