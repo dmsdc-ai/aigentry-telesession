@@ -37,6 +37,7 @@ async function setup(t) {
 }
 
 const REMOTE = { host: "remote-peer", session: "remote-orchestrator" };
+const ACK_FINAL = "[telesession ack=final]";
 
 describe("transport with correlation ledger (loopback fake telepty)", { skip: NO_LOOPBACK }, () => {
   test("T1 late ACK after a terminal initial reply → addendum seq 2 via read_reply cursor; existing fields unchanged", async (t) => {
@@ -51,11 +52,11 @@ describe("transport with correlation ledger (loopback fake telepty)", { skip: NO
     assert.deepEqual(r1.replies.map((x) => x.seq), [1]);
     assert.equal(r1.next_cursor, 1);
 
-    fake.replyFrom("target-1", s.reply_to, `REPLY ${s.nonce} ACK: done`);
+    fake.replyFrom("target-1", s.reply_to, `REPLY ${s.nonce} ${ACK_FINAL} ACK: done`);
     const r2 = await tr.readReply({ nonce: s.nonce, wait_ms: 8000, cursor: 1 });
     assert.equal(r2.reply, "trusted");
     assert.equal(r2.text, `REPLY ${s.nonce} no ACK within the window`, "first reply fields unchanged");
-    assert.deepEqual(r2.replies.map((x) => [x.seq, x.text, x.attestation]), [[2, `REPLY ${s.nonce} ACK: done`, "destination"]]);
+    assert.deepEqual(r2.replies.map((x) => [x.seq, x.text, x.attestation]), [[2, `REPLY ${s.nonce} ${ACK_FINAL} ACK: done`, "destination"]]);
     assert.equal(r2.next_cursor, 2);
     assert.ok(!(r2.quarantined && r2.quarantined.duplicate), "addendum is not quarantined as duplicate");
 
@@ -67,12 +68,37 @@ describe("transport with correlation ledger (loopback fake telepty)", { skip: NO
     assert.equal(st.reply_count, 2);
   });
 
+  // Review G1 (B1), after the reviewer's scratch/interim-completes.test.mjs R1.
+  test("G1 an interim verified reply is an addendum only; only the [telesession ack=final] reply is the ACK", async (t) => {
+    const { fake, make } = await setup(t);
+    const tr = make();
+    const s = await tr.send({ target: "target-1", text: "please ACK", request_id: "job-g1" });
+    assert.equal(s.ok, true, JSON.stringify(s));
+    fake.replyFrom("target-1", s.reply_to, `REPLY ${s.nonce} no ACK within the window`);
+    assert.equal((await tr.readReply({ nonce: s.nonce, wait_ms: 8000 })).reply, "trusted");
+    const st1 = await tr.requestStatus({ nonce: s.nonce, cursor: 1 });
+    assert.equal(st1.status, "pending", JSON.stringify(st1));
+    assert.notEqual(st1.stage, "origin_ack_received");
+    assert.equal(st1.ack_seq, null);
+    assert.equal(st1.final_ack_seq, null);
+
+    fake.replyFrom("target-1", s.reply_to, `REPLY ${s.nonce}\n${ACK_FINAL}\nACK: done`);
+    const r2 = await tr.readReply({ nonce: s.nonce, wait_ms: 8000, cursor: 1 });
+    assert.deepEqual(r2.replies.map((x) => x.seq), [2], JSON.stringify(r2));
+    const st2 = await tr.requestStatus({ nonce: s.nonce });
+    assert.equal(st2.stage, "origin_ack_received");
+    assert.equal(st2.ack_seq, 2);
+    assert.equal(st2.final_ack_seq, 2);
+    assert.equal(st2.status, "pending", "checkpoint 1 does not cover the final reply");
+    assert.equal((await tr.requestStatus({ nonce: s.nonce, cursor: 2 })).status, "completed");
+  });
+
   test("T12 relayed final destination: target replies are relayed_by_leg1_destination; remote stage unproven", async (t) => {
     const { fake, make } = await setup(t);
     const tr = make();
     const s = await tr.send({ target: "target-1", text: "relay to remote", destination: REMOTE });
     assert.equal(s.ok, true, JSON.stringify(s));
-    fake.replyFrom("target-1", s.reply_to, `REPLY ${s.nonce} remote ACK received`);
+    fake.replyFrom("target-1", s.reply_to, `REPLY ${s.nonce} ${ACK_FINAL} remote ACK received`);
     const r = await tr.readReply({ nonce: s.nonce, wait_ms: 8000 });
     assert.equal(r.reply, "trusted", JSON.stringify(r));
     assert.equal(r.replies[0].attestation, "relayed_by_leg1_destination");
@@ -103,7 +129,7 @@ describe("transport with correlation ledger (loopback fake telepty)", { skip: NO
     assert.equal(other.ok, true, JSON.stringify(other));
     assert.equal((await b.readReply({ nonce: s.nonce })).error.code, "NONCE_EXPIRED", "transport TTL semantics unchanged (OQ-1)");
 
-    const late = `REPLY ${s.nonce} ACK after the TTL`;
+    const late = `REPLY ${s.nonce} ${ACK_FINAL} ACK after the TTL`;
     fake.replyFrom("target-1", other.reply_to, late);
     const st = await waitFor(async () => {
       const x = await b.requestStatus({ nonce: s.nonce });

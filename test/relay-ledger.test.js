@@ -94,6 +94,21 @@ test("T2 the same ACK twice collapses to one reply and one applied event", (t) =
   assert.equal(l.status({ nonce: NONCE }).reply_count, 1);
 });
 
+test("B1 processing_completed identity includes the reply sha: a later final reply moves ack_seq/final_ack_seq forward", (t) => {
+  const { l } = setup(t);
+  const a = l.appendReply({ nonce: NONCE, text: "ACK one", from: DEST, verified: true });
+  const e1 = l.recordEvent(ack("processing_completed", { reply_seq: a.seq, reply_sha256: sha("ACK one") }));
+  assert.deepEqual([e1.applied, l.status({ nonce: NONCE }).final_ack_seq], [true, 1]);
+  const b = l.appendReply({ nonce: NONCE, text: "ACK two", from: DEST, verified: true });
+  const e2 = l.recordEvent(ack("processing_completed", { reply_seq: b.seq, reply_sha256: sha("ACK two") }));
+  assert.deepEqual([e2.applied, e2.deduplicated], [true, false], "not deduplicated against the first final reply");
+  const s = l.status({ nonce: NONCE });
+  assert.deepEqual([s.ack_seq, s.final_ack_seq], [2, 2]);
+  const again = l.recordEvent(ack("processing_completed", { reply_seq: a.seq, reply_sha256: sha("ACK one") }));
+  assert.equal(again.applied, false);
+  assert.equal(l.status({ nonce: NONCE }).ack_seq, 2, "ack_seq never moves back");
+});
+
 test("T3 out-of-order ACKs: completed before consumed; stage never regresses, timestamp filled later", (t) => {
   const { l, now } = setup(t);
   l.recordEvent(ack("transport_accepted", { from: HOP, hop: "intermediary" }));

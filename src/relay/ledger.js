@@ -380,8 +380,15 @@ export function openLedger(opts, seams) {
     if (final && ev.hop !== "destination") return reject(rec.nonce, "HOP_NOT_FINAL");
     if (final && !same(ev.from, rec.destination)) return reject(rec.nonce, "SOURCE_MISMATCH");
     if (final && (rec.generation === null || ev.generation !== rec.generation)) return reject(rec.nonce, "GENERATION_MISMATCH");
-    const key = `${rec.payload_sha256}:${hopKey(ev.from)}:${ev.stage}`;
+    // A final reply is part of the completion event's identity: a later final reply is a new event.
+    const replySha = ev.stage === "processing_completed" && typeof ev.reply_sha256 === "string" && HEX64_RE.test(ev.reply_sha256) ? `:${ev.reply_sha256}` : "";
+    const key = `${rec.payload_sha256}:${hopKey(ev.from)}:${ev.stage}${replySha}`;
     if (rec.events.includes(key)) return { ok: true, applied: false, deduplicated: true, stage: rec.stage };
+    const ackSeq = Number.isSafeInteger(ev.reply_seq) && ev.reply_seq >= 0 && ev.reply_seq < rec.next_seq ? ev.reply_seq : rec.next_seq - 1;
+    // ack_seq only moves forward (an event key evicted from the bounded list never re-applies an older ACK).
+    if (ev.stage === "processing_completed" && rec.ack_seq !== null && ackSeq <= rec.ack_seq) {
+      return { ok: true, applied: false, deduplicated: true, stage: rec.stage };
+    }
     const at = iso(now());
     const r = commit((d) => {
       const q = d.records[rec.nonce];
@@ -398,7 +405,7 @@ export function openLedger(opts, seams) {
       raise(ev.stage);
       if (ev.stage === "processing_completed") {
         raise("origin_ack_received");
-        q.ack_seq = Number.isSafeInteger(ev.reply_seq) && ev.reply_seq >= 0 && ev.reply_seq < q.next_seq ? ev.reply_seq : q.next_seq - 1;
+        q.ack_seq = ackSeq;
         delete q.unproven.processing_completed;
       }
     });
@@ -536,7 +543,7 @@ export function openLedger(opts, seams) {
       unproven: { ...rec.unproven }, terminal: rec.terminal ? { ...rec.terminal } : null,
       deadline_passed: deadlinePassed, reply_count: rec.replies.length,
       late_after_ttl_count: rec.replies.filter((x) => x.late_after_ttl).length, late_pending: rec.late_pending.length,
-      cursor: rec.next_seq - 1, ack_seq: rec.ack_seq, delivered_to_origin_agent: delivered,
+      cursor: rec.next_seq - 1, ack_seq: rec.ack_seq, final_ack_seq: rec.ack_seq, delivered_to_origin_agent: delivered,
       checkpoint: rec.checkpoint ? { ...rec.checkpoint } : null, outbox, rejected: { ...rec.rejected }, completion_fact: null,
     };
   }

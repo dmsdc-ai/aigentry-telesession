@@ -75,14 +75,14 @@ origin agent never needs to poll leg n directly.
 | `replies` | list of reply index entries (§4.3) | ordered by `seq` |
 | `next_seq` | int ≥ 1 | monotonic, never reused |
 | `checkpoint` | null \| `{cursor, at}` | the origin agent's acknowledged read position |
-| `ack_seq` | int\|null | seq of the latest reply when `processing_completed` was recorded (the ACK addendum) |
+| `ack_seq` | int\|null | seq of the final reply (`[telesession ack=final]`, §5) that recorded `processing_completed`; only moves forward |
 | `unproven` | map stage→reason | destination stages seen but not authenticatable, e.g. `REMOTE_PROVENANCE_UNAVAILABLE` |
 | `late_pending` | list `{sha256, received_at}` (bounded 4) | reply bytes held after the transport TTL, awaiting verification |
 | `events` | list of applied dedupe keys (bounded 64) | event dedupe |
 | `rejected` | map reason→count | refused events (wrong hash / generation / host / unauthenticated / hop-final) |
 
 ### 4.2 Event (input to `recordEvent`)
-`{nonce, stage, payload_sha256, generation, from: endpoint, authenticated: boolean, hop: "destination"|"intermediary", provenance_unavailable?: boolean, reply_seq?, reason?}`.
+`{nonce, stage, payload_sha256, generation, from: endpoint, authenticated: boolean, hop: "destination"|"intermediary", provenance_unavailable?: boolean, reply_seq?, reply_sha256?, reason?}`.
 `stage` ∈ `transport_accepted, durable_received, agent_consumed, processing_completed, rejected`.
 
 ### 4.3 Reply / addendum (index entry in the record; text in a reply file)
@@ -100,8 +100,9 @@ origin agent never needs to poll leg n directly.
 Ordering is `seq` (assigned at commit time, under the single-writer lock), not file mtime or name.
 
 ### 4.4 Status view (`telesession_request_status` result)
-`{ok, nonce, request_id, status, status_reasons, replies, next_cursor, ledger:{mode, write_failed, late_dropped}, stage, stages, unproven, deadline_passed, reply_count, late_after_ttl_count, cursor, ack_seq, delivered_to_origin_agent, checkpoint, outbox, rejected, completion_fact:null}`;
+`{ok, nonce, request_id, status, status_reasons, replies, next_cursor, ledger:{mode, write_failed, late_dropped}, stage, stages, unproven, deadline_passed, reply_count, late_after_ttl_count, cursor, ack_seq, final_ack_seq, delivered_to_origin_agent, checkpoint, outbox, rejected, completion_fact:null}`;
 `status` ∈ `pending | completed | rejected | unknown | expired | not_tracked`.
+`final_ack_seq` = seq of the final reply (same value as `ack_seq`, which is kept as an alias).
 `delivered_to_origin_agent` = `checkpoint !== null && checkpoint.cursor >= ack_seq` (false while `ack_seq` is null).
 `status_reasons` lists explicit codes such as `REMOTE_PROVENANCE_UNAVAILABLE`, `DEADLINE_PASSED`, `OUTBOX_UNCERTAIN`, `AWAITING_ORIGIN_AGENT_READ`.
 
@@ -115,6 +116,12 @@ Allowed transitions / effects:
 - A regressing event (k < stage) only fills a null timestamp; the stage never moves back.
 - `processing_completed` recorded at the origin also sets `origin_ack_received` (the origin has now
   received and durably recorded the authenticated final ACK) and `ack_seq`. Nothing else sets it.
+- Final vs interim reply: a verified destination reply is the semantic ACK (`processing_completed`) ONLY
+  if its text contains the token `[telesession ack=final]` on one of its first three lines. Any other
+  verified reply is stored as an addendum with NO stage effect. Authentication is unchanged (verified
+  sender); the token only classifies which verified reply is final and never authenticates. A later final
+  reply is a new event (its sha256 is part of the event key) and moves `ack_seq` forward; `ack_seq` never
+  moves back.
 - Status `completed` requires `origin_ack_received` AND `delivered_to_origin_agent`; with the ACK
   recorded but not yet read by the origin agent the status is `pending` (`AWAITING_ORIGIN_AGENT_READ`).
 - A destination-stage event that cannot be authenticated because remote host provenance is unavailable
@@ -160,7 +167,7 @@ every mutation returns `{ok:false, code:"LEDGER_READ_ONLY"}`. Otherwise `LedgerE
 | object | key | duplicate effect |
 |---|---|---|
 | request | `nonce` (+ `request_id` → existing record, existing transport rule) | returns the existing record |
-| event | `<nonce>:<payload_sha256>:<hop canonical>:<stage>` | no-op, `deduplicated:true` |
+| event | `<nonce>:<payload_sha256>:<hop canonical>:<stage>` (+ `:<reply sha256>` for `processing_completed` from a final reply) | no-op, `deduplicated:true` |
 | reply | `<nonce>:<reply sha256>:<from canonical>` | no-op, same `seq` returned |
 | outbox item | `<nonce>:<payload_sha256>:<to canonical>:<kind>` | enqueued once; never re-sent after a receipt |
 
@@ -260,6 +267,7 @@ it at `<stateDir>/ledger` when a state dir is configured (no new env var).
 | # | case | expected |
 |---|---|---|
 | T1 | late ACK after a terminal (initial) reply | stored as addendum seq 2; stage → `origin_ack_received` |
+| G1 | interim reply, then final reply (transport) | interim: `pending`; final: `origin_ack_received`, `ack_seq` = final seq; `completed` after checkpoint |
 | T2 | duplicate ACK, same content twice | one reply, one seq; second call `deduplicated` |
 | T3 | out-of-order ACKs (completed before consumed) | stage 5; consumed timestamp filled later; no regression |
 | T4 | restart: reopen ledger mid-flow | records/seq/cursor identical; next seq continues |
