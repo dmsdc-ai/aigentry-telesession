@@ -469,3 +469,19 @@ test("N5 read-only ledger: a checkpoint cursor returns LEDGER_READ_ONLY; a plain
   assert.deepEqual(ro.status({ nonce: NONCE, cursor: 1 }), { ok: false, code: "LEDGER_READ_ONLY" });
   assert.equal(ro.status({ nonce: NONCE }).checkpoint, null);
 });
+
+// Review N14: a recorded final ACK is not undone by a later refusal; the refusal is counted, not applied.
+test("N14 rejected after origin_ack_received → REJECT_AFTER_ACK, counted, status stays completed", (t) => {
+  const { l } = setup(t);
+  l.appendReply({ nonce: NONCE, text: "[telesession ack=final] done", from: DEST, verified: true });
+  assert.equal(l.recordEvent(ack("processing_completed", { reply_seq: 1 })).ok, true);
+  assert.equal(l.status({ nonce: NONCE, cursor: 1 }).status, "completed");
+  const r = l.recordEvent(ack("rejected", { reason: "late_refusal" }));
+  assert.deepEqual(r, { ok: false, code: "REJECT_AFTER_ACK" });
+  const s = l.status({ nonce: NONCE });
+  assert.deepEqual([s.status, s.terminal, s.rejected.REJECT_AFTER_ACK], ["completed", null, 1]);
+  // Before an ACK a refusal is still terminal (unchanged).
+  const { l: l2 } = setup(t);
+  assert.equal(l2.recordEvent(ack("rejected", { reason: "busy" })).ok, true);
+  assert.equal(l2.status({ nonce: NONCE }).status, "rejected");
+});
