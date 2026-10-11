@@ -81,6 +81,7 @@ function isRecord(key, r) {
     && isEndpoint(r.origin) && isEndpoint(r.destination) && isEndpoint(r.reply_to) && (r.via === null || isEndpoint(r.via))
     && (r.correlation_id === undefined || r.correlation_id === null || HEX32_RE.test(r.correlation_id))
     && (r.retired_at === undefined || r.retired_at === null || typeof r.retired_at === "string")
+    && (r.reconstructed === undefined || typeof r.reconstructed === "boolean")
     && isPlain(r.stages) && Array.isArray(r.replies) && r.replies.every(isReplyEntry) && Number.isSafeInteger(r.next_seq) && r.next_seq >= 1
     && Array.isArray(r.events) && Array.isArray(r.late_pending) && r.late_pending.every(isLateEntry) && isPlain(r.rejected) && isPlain(r.unproven)
     && Number.isSafeInteger(r.created_ms) && Number.isSafeInteger(r.deadline_ms) && Number.isSafeInteger(r.retain_until_ms);
@@ -369,7 +370,7 @@ export function openLedger(opts, seams) {
         || !(a.via === undefined || a.via === null || isEndpoint(a.via))
         || !(a.generation === null || (typeof a.generation === "string" && a.generation.length > 0 && a.generation.length <= 256))
         || !HEX64_RE.test(a.payload_sha256 || "") || !Number.isSafeInteger(a.deadline_ms) || a.deadline_ms < 0
-        || !(a.correlation_id === undefined || HEX32_RE.test(a.correlation_id))) {
+        || !(a.correlation_id === undefined || a.correlation_id === null || HEX32_RE.test(a.correlation_id))) {
       return fail("INVALID_ARGUMENT");
     }
     const prior = state.records[a.nonce];
@@ -379,8 +380,9 @@ export function openLedger(opts, seams) {
     if (state.retired.includes(a.nonce)) return fail("NONCE_RETIRED");
     const t = now();
     const retainMs = Number.isSafeInteger(a.retain_ms) && a.retain_ms > 0 ? a.retain_ms : LEDGER_LIMITS.retainMs;
-    // Minted once at creation (the origin); immutable, never derived from request_id or nonce.
-    const correlationId = a.correlation_id ?? randomBytes(16).toString("hex");
+    // Minted once at creation (the origin); immutable, never derived from request_id or nonce. null = unknown
+    // (a record reconstructed after a crash: the wire id was not persisted).
+    const correlationId = a.correlation_id === null ? null : a.correlation_id ?? randomBytes(16).toString("hex");
     const r = commit((d) => {
       if (Object.keys(d.records).length >= LEDGER_LIMITS.records) {
         const due = Object.values(d.records).filter((x) => t > x.retain_until_ms).map((x) => x.nonce);
@@ -395,6 +397,7 @@ export function openLedger(opts, seams) {
         payload_sha256: a.payload_sha256, stage: null, stages: Object.fromEntries(STAGES.map((k) => [k, null])), terminal: null,
         created_ms: t, deadline_ms: t + a.deadline_ms, retain_until_ms: t + Math.max(retainMs, a.deadline_ms),
         replies: [], next_seq: 1, checkpoint: null, ack_seq: null, first_ack_seq: null, unproven: {}, late_pending: [], events: [], rejected: {},
+        ...(a.reconstructed === true ? { reconstructed: true } : {}),
       };
     });
     return r.ok ? { ok: true, deduplicated: false, correlation_id: correlationId } : r;
@@ -601,6 +604,7 @@ export function openLedger(opts, seams) {
     if (retired && status !== "completed" && status !== "rejected") status = "expired";
     if (retired) reasons.push("RETIRED");
     if (rec.replies.some((x) => x.late_after_ttl)) reasons.push("LATE_AFTER_TTL");
+    if (rec.reconstructed) reasons.push("RECONSTRUCTED");
     outbox.quarantined = quarantined.length;
     return {
       ok: true, nonce: rec.nonce, correlation_id: rec.correlation_id ?? null, request_id: rec.request_id, status, status_reasons: reasons,

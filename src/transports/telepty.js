@@ -769,6 +769,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
         if (epoch !== null) q.target_epoch = epoch;
       });
     }
+    reconcileLedger();
   }
 
   async function recover() {
@@ -1159,6 +1160,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       if (prior) {
         if (prior.target !== target) return fail("REQUEST_ID_CONFLICT", { conflict: "target" });
         if (prior.body_sha256 !== bodySha) return fail("REQUEST_ID_CONFLICT", { conflict: "body" });
+        reconcileLedger();
         return ok(recordView(prior));
       }
       inflight.add(key);
@@ -1255,6 +1257,29 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       target_epoch_known: rec.target_epoch !== null, reply: "not_observed",
       durability: durability(), daemon_restart: daemonRestart(), ...addedFields(rec, false),
     });
+  }
+
+  // Review N11: an accepted inject without a ledger record (crash or ledger failure between the store commit
+  // and the ledger create; an uncertain send recovered from the audit) gets one. The store keeps neither
+  // destination nor correlation_id, so it is fail-closed: destination unknown, the target as `via` (its
+  // replies are kept, a completion stays REMOTE_PROVENANCE_UNAVAILABLE), status reason RECONSTRUCTED.
+  function reconcileLedger() {
+    if (!ledger || ledger.mode !== "read_write") return;
+    for (const q of records()) {
+      if (q.inject_id === null || (q.state !== "accepted" && q.state !== "answered") || ledger.record(q.nonce)) continue;
+      const leg1 = { host: LOCAL, session: q.target };
+      const c = ledger.createRequest({
+        nonce: q.nonce, correlation_id: null, reconstructed: true, request_id: q.request_id, origin: { host: LOCAL, session: q.reply_to },
+        destination: { host: "unknown", session: q.target }, via: leg1, via_generation: q.target_epoch,
+        reply_to: { host: LOCAL, session: q.reply_to }, generation: null, payload_sha256: q.payload_sha256,
+        deadline_ms: Math.max(0, q.expires_at - Date.now()),
+      });
+      if (!c.ok) { if (c.code !== "NONCE_RETIRED") ledgerStats.write_failed += 1; continue; }
+      ledger.recordEvent({
+        nonce: q.nonce, stage: "transport_accepted", payload_sha256: q.payload_sha256,
+        from: { host: LOCAL, session: "telepty-daemon" }, hop: "intermediary", generation: null, authenticated: true,
+      });
+    }
   }
 
   // Correlation record for an accepted inject: daemon acceptance is hop evidence (transport_accepted) only.
@@ -1461,6 +1486,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     return closing;
   }
 
+  reconcileLedger();
   if (relay) relay.start();
 
   return Object.freeze({
