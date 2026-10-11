@@ -1,0 +1,15 @@
+node_modules/
+.env
+.env.*
+*.pem
+*.key
+credential.json
+credentials*.json
+.telesession-state/
+state/
+*.log
+logs/
+.cache/
+.npm/
+coverage/
+.DS_Store

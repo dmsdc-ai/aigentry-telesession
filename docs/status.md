@@ -1,0 +1,60 @@
+# telesession — snapshot status (2026-10-11)
+
+This repository is the initial private source snapshot of a **work-in-progress candidate**. It is not a
+release. `package.json` stays `"private": true`, nothing is published to npm, and pushing this snapshot
+does not complete task 1215 or the actual remote-connection goal. Work is tracked under task 1215 for
+the next aigentry release.
+
+## What the snapshot contains
+- Local transport: config gate, exact-target sends, owned inbox lifecycle, audit-verified replies,
+  `request_id` dedupe, stdio MCP adapter (`bin/telesession-mcp.js`).
+- Opt-in durable store (`TELESESSION_STATE_DIR`): request records, stored replies, inbox
+  reattach/rotation, conservative restart recovery. Abrupt-crash unlock is not provided.
+- Portable clean-environment MCP child launcher candidate (`bin/telesession-tunnel-child.js`).
+- Unit/fixture tests, plus newly authored real-daemon restart regression tests
+  (`test/real-daemon-restart.test.js` and additive helpers in `test/helpers.js`).
+
+## Verification status
+| Area | Status |
+|---|---|
+| Synthetic Linux VM run (fake telepty) | Historical: 22 isolation checks; 36 passed / 0 failed / 13 excluded. This was a fake-telepty suite. It is **not** evidence for an installed package or a live product, and the 13 excluded tests were not run. |
+| Launcher unit tests (`test/tunnel-child.test.js`), original suite | Independent run: **12 passed / 6 cancelled**. The cancellations come from the test harness: the fake child has no default pid. A product code defect was not demonstrated. The test file in this snapshot is that original, uncorrected suite. |
+| Launcher unit tests, independently corrected fake suite | 10/10 passed in an independent run. The corrected suite is **not** part of this snapshot; a harness correction is pending separately. |
+| Launcher independent pure verification and security triage | Ongoing at snapshot time. |
+| Real-daemon restart regression tests (RC5, `test/real-daemon-restart.test.js`) | Authored and syntax-checked only. Never run. |
+| Existing real-daemon tests (`transport-telepty.test.js`, `mcp.test.js`) | Not run against a candidate telepty daemon. |
+| Snyk / security scan of the product candidate | **Pending (security owed).** Not run for this snapshot; not waived. |
+| Real Dot roundtrip | NOTRUN |
+| Tunnel launch (tunnel client + launcher) | NOTRUN |
+| Real telepty daemon activation and restart | NOTRUN |
+| Native macOS / Windows / Linux acceptance | NOTRUN |
+| Hosted CI | None configured. Cross-platform release CI is planned separately. |
+
+No test result in this table was produced by creating this snapshot. No tests, builds or installs were
+run to create it.
+
+## telepty prerequisite
+telesession requires three opt-in telepty daemon capabilities in `GET /api/meta`:
+`inject-exact-target`, `register-create-only`, `delete-owned-session`. The existing telepty 0.8.5
+baseline lacks all three, so the stock npm telepty package does **not** connect successfully with this
+candidate. A telepty build with the candidate daemon change is required and has not been released.
+
+## Integration and testing prerequisites (before any acceptance claim)
+1. A telepty tree whose daemon carries the three capabilities; for the real-daemon tests, point
+   `TELESESSION_TEST_TELEPTY_DIR` at it (or place it as a sibling `../telepty`).
+2. Installed dependencies for both projects (telesession: `@modelcontextprotocol/sdk`, `zod`; telepty:
+   its own dependencies including the native `node-pty` for the target platform).
+3. An isolated environment: temporary HOME, ephemeral loopback ports, no live daemon, no real credentials.
+4. Corrected launcher test harness, then the launcher's independent verification steps in
+   `docs/tunnel-child.md`.
+5. A Snyk Code scan of the first-party JavaScript, with fixes and a rescan.
+6. Only then: operator-approved live daemon activation, tunnel launch and a real Dot roundtrip whose
+   reply is audit-verified as `trusted`.
+
+## Safety limits
+- Loopback-only telepty URL; token only from env or an absolute token file; never in tool args, results,
+  logs or the state dir.
+- The launcher filters the child env but is not an OS sandbox; the child runs as the same user.
+- After an abrupt crash the durable store stays locked (`STORE_LOCKED`) until a reviewed repair exists.
+- Replies can be lost while the inbox is down; loss is reported, never replayed. Never exactly-once.
+- telesession never changes telepty's peer policy and never starts, stops or restarts daemons.
