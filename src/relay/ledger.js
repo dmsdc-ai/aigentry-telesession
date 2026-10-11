@@ -346,7 +346,9 @@ export function openLedger(opts, seams) {
       }
       d.records[a.nonce] = {
         nonce: a.nonce, request_id: a.request_id ?? null, origin: endpointOf(a.origin), destination: endpointOf(a.destination),
-        via: a.via ? endpointOf(a.via) : null, reply_to: endpointOf(a.reply_to), generation: a.generation,
+        via: a.via ? endpointOf(a.via) : null,
+        via_generation: a.via && typeof a.via_generation === "string" && a.via_generation.length <= 256 ? a.via_generation : null,
+        reply_to: endpointOf(a.reply_to), generation: a.generation,
         payload_sha256: a.payload_sha256, stage: null, stages: Object.fromEntries(STAGES.map((k) => [k, null])), terminal: null,
         created_ms: t, deadline_ms: t + a.deadline_ms, retain_until_ms: t + Math.max(retainMs, a.deadline_ms),
         replies: [], next_seq: 1, checkpoint: null, ack_seq: null, unproven: {}, late_pending: [], events: [], rejected: {},
@@ -462,6 +464,7 @@ export function openLedger(opts, seams) {
       for (const x of rec.late_pending) {
         out.push({
           nonce: rec.nonce, sha256: x.sha256, received_at: x.received_at, destination: { ...rec.destination },
+          via: rec.via ? { ...rec.via } : null, via_generation: rec.via_generation ?? null,
           generation: rec.generation, created_ms: rec.created_ms, retain_until_ms: rec.retain_until_ms,
         });
       }
@@ -557,6 +560,17 @@ export function openLedger(opts, seams) {
     return view(rec);
   }
 
+  function record(nonce) {
+    const rec = state.records[nonce];
+    return rec ? structuredClone(rec) : null;
+  }
+
+  function readLateText(nonce, sha256) {
+    const rec = state.records[nonce];
+    if (!rec || !rec.late_pending.some((x) => x.sha256 === sha256)) return fail("REPLY_MISSING");
+    return readReplyFile(nonce, sha256);
+  }
+
   function has(nonce) {
     const rec = state.records[nonce];
     return Boolean(rec) && now() <= rec.retain_until_ms;
@@ -601,8 +615,8 @@ export function openLedger(opts, seams) {
 
   return Object.freeze({
     get mode() { return mode; },
-    createRequest, recordEvent, appendReply, readReplies, status, has,
-    holdLate, latePending, promoteLate, dropLate,
+    createRequest, recordEvent, appendReply, readReplies, status, has, record,
+    holdLate, latePending, readLateText, promoteLate, dropLate,
     enqueue, outbox, outboxTransition,
     close() {
       if (closed) return;
