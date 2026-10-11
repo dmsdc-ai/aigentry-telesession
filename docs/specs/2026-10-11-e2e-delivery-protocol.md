@@ -64,6 +64,7 @@ origin agent never needs to poll leg n directly.
 | `origin` | endpoint | immutable |
 | `destination` | endpoint | immutable; only it may produce destination stages |
 | `via` | endpoint\|null | leg-1 destination when the final destination is further away (relayed request); immutable |
+| `via_generation` | string\|null | leg-1 destination epoch (used to verify relayed replies) |
 | `reply_to` | endpoint | immutable return route |
 | `generation` | string\|null | destination epoch/credential generation expected; null = unknown → destination events stay unauthenticated-for-stage (counted, not applied) |
 | `payload_sha256` | 64 hex | hash of the exact bytes sent; immutable |
@@ -99,7 +100,7 @@ origin agent never needs to poll leg n directly.
 Ordering is `seq` (assigned at commit time, under the single-writer lock), not file mtime or name.
 
 ### 4.4 Status view (`telesession_request_status` result)
-`{ok, nonce, request_id, status, status_reasons, stage, stages, unproven, deadline_passed, reply_count, late_after_ttl_count, cursor, ack_seq, delivered_to_origin_agent, checkpoint, outbox, rejected, completion_fact:null}`;
+`{ok, nonce, request_id, status, status_reasons, replies, next_cursor, ledger:{mode, write_failed, late_dropped}, stage, stages, unproven, deadline_passed, reply_count, late_after_ttl_count, cursor, ack_seq, delivered_to_origin_agent, checkpoint, outbox, rejected, completion_fact:null}`;
 `status` ∈ `pending | completed | rejected | unknown | expired | not_tracked`.
 `delivered_to_origin_agent` = `checkpoint !== null && checkpoint.cursor >= ack_seq` (false while `ack_seq` is null).
 `status_reasons` lists explicit codes such as `REMOTE_PROVENANCE_UNAVAILABLE`, `DEADLINE_PASSED`, `OUTBOX_UNCERTAIN`, `AWAITING_ORIGIN_AGENT_READ`.
@@ -248,7 +249,8 @@ deletes data or restarts a live service is a **separate approval**.
 (a) `src/relay/ledger.js` — records, stages, validation, atomic writes, restart, read-only open.
 (b) addenda: transport keeps verified replies after the first as ordered addenda in the ledger;
 `read_reply` returns `replies` + `next_cursor`.
-(c) `telesession_request_status` tool (MCP) + `transport.requestStatus`.
+(c) `telesession_request_status` tool (MCP) + `transport.requestStatus`; `telesession_send` gains an
+optional `destination {host, session}` for a relayed final destination (the target becomes `via`).
 (d) `src/relay/relay.js` — outbox tick with injected send; `src/relay/route.js` — resolver.
 The transport uses the ledger only when one is passed in (opt-in third argument); the MCP bin opens
 it at `<stateDir>/ledger` when a state dir is configured (no new env var).
