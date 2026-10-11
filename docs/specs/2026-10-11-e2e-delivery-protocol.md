@@ -156,7 +156,9 @@ peer compare equal and an unknown form is a mismatch.
 ```
 Every write: tmp (O_EXCL, 0600) → write → fsync → close → rename → dir fsync (store convention).
 Reply text file is written and fsynced BEFORE the commit that references it (a crash leaves at most an
-unreferenced file, swept on open). Bounds: records 1024, replies per nonce 32, outbox 256, ledger file
+unreferenced file, swept on open: a `replies/<nonce>-<sha256>.json` not referenced by any record's
+`replies`/`late_pending` is removed when a writable ledger opens; the replies dir must be a private
+non-symlink directory). Bounds: records 1024, replies per nonce 32, outbox 256, ledger file
 4 MiB, reply text 64 KiB, events per record 64, retired 256. Restart: reload `ledger.json`, validate,
 re-enter idempotently (§7, §10). The ledger never stores the origin prompt text, tokens or bearer values; an outbox item keeps its relay
 payload only until its receipt is recorded.

@@ -198,6 +198,27 @@ test("T4 restart recovery: reopening mid-flow reloads records, seq and checkpoin
   }).deduplicated, true);
 });
 
+// Review N3/G4: a crash between the reply-file write and the commit leaves an unreferenced file.
+test("open sweeps unreferenced replies/*.json; referenced reply and late-held files stay", (t) => {
+  const { l, open, dir } = setup(t);
+  l.appendReply({ nonce: NONCE, text: "kept", from: DEST, verified: true });
+  l.holdLate({ nonce: NONCE, sha256: sha("held"), text: "held" });
+  l.close();
+  const replies = path.join(dir, "replies");
+  const stray = path.join(replies, `${NONCE}-${sha("never committed")}.json`);
+  const foreign = path.join(replies, `${"d".repeat(32)}-${sha("x")}.json`);
+  for (const f of [stray, foreign]) fs.writeFileSync(f, "{}", { mode: 0o600 });
+  const other = path.join(replies, "README");
+  fs.writeFileSync(other, "not a reply file", { mode: 0o600 });
+  const l2 = open();
+  t.after(() => l2.close());
+  assert.equal(fs.existsSync(stray), false);
+  assert.equal(fs.existsSync(foreign), false);
+  assert.equal(fs.existsSync(other), true, "only reply-file names are swept");
+  assert.equal(l2.readReplies({ nonce: NONCE }).replies[0].text, "kept");
+  assert.equal(l2.readLateText(NONCE, sha("held")).text, "held");
+});
+
 test("T6 wrong hash / generation / host / unauthenticated / intermediary-final events are rejected without state advance", (t) => {
   const { l } = setup(t);
   const base = l.status({ nonce: NONCE });
