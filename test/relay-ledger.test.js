@@ -454,3 +454,18 @@ test("stale lock (holder pid not alive) is LEDGER_LOCK_STALE and left in place; 
   t.after(() => l2.close());
   assert.equal(l2.status({ nonce: NONCE }).ok, true);
 });
+
+// Review N5/S6: a checkpoint on a read-only ledger is refused with a code, not silently ignored.
+test("N5 read-only ledger: a checkpoint cursor returns LEDGER_READ_ONLY; a plain status read still works", { skip: process.platform === "win32" || (process.getuid && process.getuid() === 0) }, (t) => {
+  const { dir, l, open } = setup(t);
+  l.appendReply({ nonce: NONCE, text: "r1", from: DEST, verified: true });
+  l.close();
+  fs.chmodSync(dir, 0o500);
+  t.after(() => { try { fs.chmodSync(dir, 0o700); } catch { /* removed */ } });
+  const ro = open();
+  t.after(() => ro.close());
+  assert.equal(ro.mode, "read_only");
+  assert.equal(ro.status({ nonce: NONCE }).reply_count, 1);
+  assert.deepEqual(ro.status({ nonce: NONCE, cursor: 1 }), { ok: false, code: "LEDGER_READ_ONLY" });
+  assert.equal(ro.status({ nonce: NONCE }).checkpoint, null);
+});
