@@ -29,6 +29,13 @@ const DESTINATION_STAGES = new Set(["agent_consumed", "processing_completed", "r
 const OUTBOX_STATES = ["queued", "intent", "sent", "uncertain", "failed"];
 // A quarantine is a review marker on an outbox item (never replayed automatically, never deleted here).
 const QUARANTINE_REASONS = new Set(["no_live_correlation", "past_deadline", "payload_changed", "max_attempts"]);
+// Review S4: relay text is kept only while the item may still be sent (queued/intent). Afterwards only the
+// payload hash and this many code points of excerpt stay (failed / uncertain / quarantined; sent: none).
+const OUTBOX_EXCERPT_CHARS = 200;
+const dropText = (o) => {
+  if (typeof o.text === "string") o.excerpt = Array.from(o.text).slice(0, OUTBOX_EXCERPT_CHARS).join("");
+  o.text = null;
+};
 const HEX32_RE = /^[0-9a-f]{32}$/;
 const HEX64_RE = /^[0-9a-f]{64}$/;
 const REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -74,7 +81,8 @@ const isLateEntry = (x) => isPlain(x) && HEX64_RE.test(x.sha256);
 const isOutboxItem = (k, o) => isPlain(o) && o.key === k && HEX32_RE.test(k) && OUTBOX_STATES.includes(o.state) && HEX32_RE.test(o.nonce)
   && isEndpoint(o.to) && typeof o.kind === "string" && KIND_RE.test(o.kind) && HEX64_RE.test(o.payload_sha256)
   && (o.quarantine === undefined || o.quarantine === null
-    || (isPlain(o.quarantine) && QUARANTINE_REASONS.has(o.quarantine.reason) && typeof o.quarantine.at === "string"));
+    || (isPlain(o.quarantine) && QUARANTINE_REASONS.has(o.quarantine.reason) && typeof o.quarantine.at === "string"))
+  && (o.excerpt === undefined || (typeof o.excerpt === "string" && o.excerpt.length <= 2 * OUTBOX_EXCERPT_CHARS));
 
 function isRecord(key, r) {
   return isPlain(r) && r.nonce === key && HEX32_RE.test(r.nonce) && HEX64_RE.test(r.payload_sha256)
@@ -344,7 +352,7 @@ export function openLedger(opts, seams) {
     const old = Object.values(state.records).filter((r) => t > r.retain_until_ms && !r.retired_at);
     if (stuck || old.length) {
       const r = commit((d) => {
-        for (const o of Object.values(d.outbox)) if (o.state === "intent") { o.state = "uncertain"; o.last_error = "PROCESS_RESTART"; }
+        for (const o of Object.values(d.outbox)) if (o.state === "intent") { o.state = "uncertain"; o.last_error = "PROCESS_RESTART"; dropText(o); }
         retire(d, old.map((x) => x.nonce));
       });
       if (!r.ok) { releaseLock(); throw new LedgerError(r.code, r.errno); }
@@ -697,7 +705,7 @@ export function openLedger(opts, seams) {
       && o.state === "queued" && !o.quarantine).map((o) => o.key);
     const at = iso(now());
     const r = commit((d) => {
-      for (const k of changed) d.outbox[k].quarantine = { reason: "payload_changed", at };
+      for (const k of changed) { d.outbox[k].quarantine = { reason: "payload_changed", at }; dropText(d.outbox[k]); }
       d.outbox[key] = {
         key, nonce, kind, to: endpointOf(to), payload_sha256: payload, text, state: "queued", attempts: 0,
         created_at: at, intent_at: null, receipt: null, last_error: null, quarantine: null,
@@ -717,6 +725,7 @@ export function openLedger(opts, seams) {
       if (!o || o.state !== from) return fail("OUTBOX_STATE_CHANGED");
       Object.assign(o, fields);
       if (fields.state === "sent") o.text = null;
+      else if (fields.state === "failed" || fields.state === "uncertain" || o.quarantine) dropText(o);
     });
     return r.ok ? { ok: true } : r;
   }
@@ -735,7 +744,7 @@ export function openLedger(opts, seams) {
     }
     if (due.length === 0) return { ok: true, quarantined: [] };
     const at = iso(t);
-    const r = commit((d) => { for (const [k, reason] of due) d.outbox[k].quarantine = { reason, at }; });
+    const r = commit((d) => { for (const [k, reason] of due) { d.outbox[k].quarantine = { reason, at }; dropText(d.outbox[k]); } });
     return r.ok ? { ok: true, quarantined: due.map(([k]) => k) } : r;
   }
 

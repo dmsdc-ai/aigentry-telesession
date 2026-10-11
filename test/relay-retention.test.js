@@ -167,3 +167,53 @@ test("prunable listing (dry run): retired records and quarantined items are list
   assert.match(real.stderr, /PRUNE_DRY_RUN_ONLY/);
   assert.deepEqual(files(dir), before, "the CLI deleted nothing");
 });
+
+// Review S4: relay text is kept only while it may still be sent; failed / uncertain / quarantined items
+// keep the payload hash and a bounded excerpt (200 code points).
+test("S4 failed, uncertain and quarantined items drop the relay text (hash + bounded excerpt kept); a requeued item keeps it", async (t) => {
+  const { l, now } = setup(t);
+  const long = "x".repeat(150) + "가".repeat(100);
+  const keys = {};
+  for (const k of ["yes", "unk", "no", "late"]) keys[k] = l.enqueue(item({ kind: k, text: `${k}:${long}` })).key;
+  const send = async (x) => (x.kind === "yes" ? { ok: false, sent: "yes", code: "REFUSED" }
+    : x.kind === "unk" ? { ok: false, sent: "unknown", code: "DAEMON_TIMEOUT" }
+      : x.kind === "no" ? { ok: false, sent: "no", code: "DAEMON_UNREACHABLE" } : { ok: true, transport_id: "t" });
+  const only = (k) => ({ ...l, outbox: () => l.outbox().filter((o) => o.kind === k) });
+  for (const k of ["yes", "unk", "no"]) await relayTick({ ledger: only(k), resolver, send });
+  const by = () => Object.fromEntries(l.outbox().map((o) => [o.kind, o]));
+  assert.equal(by().no.state, "queued");
+  assert.equal(by().no.text, `no:${long}`, "requeued: the text is still needed");
+  for (const k of ["yes", "unk"]) {
+    const o = by()[k];
+    assert.equal(o.text, null, k);
+    assert.equal(Array.from(o.excerpt).length, 200, k);
+    assert.ok(`${k}:${long}`.startsWith(o.excerpt), k);
+    assert.match(o.payload_sha256, /^[0-9a-f]{64}$/);
+  }
+  for (let i = 0; i < 2; i += 1) await relayTick({ ledger: only("no"), resolver, send });
+  assert.deepEqual([by().no.state, by().no.text, by().no.quarantine.reason], ["failed", null, "max_attempts"]);
+  // Quarantine (past deadline) drops it too; a payload change drops the old one's.
+  const v1 = l.enqueue(item({ kind: "chg", text: "v1 text" })).key;
+  l.enqueue(item({ kind: "chg", text: "v2 text" }));
+  assert.deepEqual([l.outbox().find((o) => o.key === v1).text, l.outbox().find((o) => o.key === v1).excerpt], [null, "v1 text"]);
+  now.advance(60001);
+  l.sweepOutbox();
+  assert.equal(by().late.text, null);
+  assert.equal(by().late.excerpt, `late:${long}`.slice(0, 200));
+});
+
+test("S4 an intent left by a dead process becomes uncertain on reopen and drops its text", async (t) => {
+  const { dir, l, open } = setup(t);
+  const { key } = l.enqueue(item({ text: "secretless but long relay text" }));
+  let release;
+  const hung = new Promise((res) => { release = res; });
+  let entered = 0;
+  const tick = relayTick({ ledger: l, resolver, send: async () => { entered += 1; await hung; return { ok: true, transport_id: "x" }; } });
+  while (entered === 0) await new Promise((res) => setImmediate(res));
+  fs.unlinkSync(path.join(dir, "lock"));
+  const l2 = open();
+  const o = l2.outbox().find((x) => x.key === key);
+  assert.deepEqual([o.state, o.text, o.excerpt], ["uncertain", null, "secretless but long relay text"]);
+  release();
+  await tick;
+});
