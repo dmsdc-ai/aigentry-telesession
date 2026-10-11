@@ -36,6 +36,7 @@ const KIND_RE = /^[a-z][a-z0-9_]{0,31}$/;
 const CODE_RE = /^[A-Za-z0-9_]{1,64}$/;
 const ERRNO_RE = /^E[A-Z0-9]{1,31}$/;
 const TMP_RE = /^\.(?:ledger\.json|[0-9a-f]{32}-[0-9a-f]{64}\.json)\.[0-9a-f]{16}\.tmp$/;
+const REPLY_FILE_RE = /^([0-9a-f]{32})-([0-9a-f]{64})\.json$/;
 const LOCK_BYTES = 4096;
 const READ_ONLY_CODES = new Set(["EACCES", "EROFS", "EPERM"]);
 const DIR_FSYNC_IGNORED = new Set(["EISDIR", "EPERM", "EINVAL", "EBADF"]);
@@ -309,7 +310,16 @@ export function openLedger(opts, seams) {
   if (mode === "read_write") {
     try {
       for (const name of fsx.readdirSync(dir)) if (TMP_RE.test(name)) { try { fsx.unlinkSync(path.join(dir, name)); } catch { /* best effort */ } }
-      try { for (const name of fsx.readdirSync(repliesPath)) if (TMP_RE.test(name)) { try { fsx.unlinkSync(path.join(repliesPath, name)); } catch { /* best effort */ } } } catch { /* no replies dir yet */ }
+      // A crash between a reply-file write and its commit leaves an unreferenced file (§6): swept here.
+      const referenced = new Set();
+      for (const rec of Object.values(state.records)) for (const x of [...rec.replies, ...rec.late_pending]) referenced.add(`${rec.nonce}-${x.sha256}.json`);
+      try {
+        const rst = fsx.lstatSync(repliesPath);
+        if (rst.isSymbolicLink() || !rst.isDirectory() || !privateOk(rst)) throw new Error("not swept");
+        for (const name of fsx.readdirSync(repliesPath)) {
+          if (TMP_RE.test(name) || (REPLY_FILE_RE.test(name) && !referenced.has(name))) { try { fsx.unlinkSync(path.join(repliesPath, name)); } catch { /* best effort */ } }
+        }
+      } catch { /* no replies dir yet */ }
     } catch { /* best effort sweep */ }
     const stuck = Object.values(state.outbox).some((o) => o.state === "intent");
     const t = now();
