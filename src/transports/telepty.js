@@ -1008,6 +1008,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
   function recordView(rec) {
     return {
       inject_id: rec.inject_id, target: rec.target, nonce: rec.nonce, reply_to: rec.reply_to,
+      correlation_id: (tracks(rec.nonce) && ledger.record(rec.nonce).correlation_id) || null,
       accepted: rec.state === "refused" ? false : rec.inject_id !== null ? true : "unknown",
       delivery: "unknown", target_epoch_known: rec.target_epoch !== null,
       reply: rec.state === "answered" ? "trusted" : "not_observed",
@@ -1144,9 +1145,11 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
 
     // Sender identity is captured together with the bearer that will authenticate the inject.
     const nonce = randomBytes(16).toString("hex");
+    // SPEC 2026-10-11 §4.1: minted here (the origin), immutable; additive on the wire header.
+    const correlationId = randomBytes(16).toString("hex");
     const inboxId = S.inbox.id;
     const bearer = inbox.bearer;
-    const wire = `[telesession nonce=${nonce} reply-to=${inboxId}]\n` + text;
+    const wire = `[telesession nonce=${nonce} reply-to=${inboxId} correlation=${correlationId}]\n` + text;
     const sentAt = Date.now();
     const rkey = key === null ? `n:${nonce}` : key;
     const fresh = () => ({
@@ -1176,7 +1179,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       // No usable response: the bytes may or may not have been accepted. Never re-sent.
       settle({ state: "uncertain", uncertain_reason: "no_response", error_code: r.code });
       return ok({
-        accepted: "unknown", inject_id: null, target, nonce, delivery: "unknown", reason: r.code, reply: "not_observed",
+        accepted: "unknown", inject_id: null, target, nonce, correlation_id: correlationId, delivery: "unknown", reason: r.code, reply: "not_observed",
         durability: durability(), daemon_restart: daemonRestart(), ...addedFields(S.requests[rkey], false),
       });
     }
@@ -1193,9 +1196,9 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       settle({ target_epoch: obs.body.session_epoch });
     }
     const rec = S.requests[rkey];
-    if (ledger) openLedgerRecord(rec, destination);
+    if (ledger) openLedgerRecord(rec, destination, correlationId);
     return ok({
-      inject_id: b.inject_id, target, nonce, reply_to: inboxId, accepted: true,
+      inject_id: b.inject_id, target, nonce, correlation_id: correlationId, reply_to: inboxId, accepted: true,
       delivery: b.bootstrap_queued === true ? "queued" : "unknown",
       target_epoch_known: rec.target_epoch !== null, reply: "not_observed",
       durability: durability(), daemon_restart: daemonRestart(), ...addedFields(rec, false),
@@ -1203,11 +1206,11 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
   }
 
   // Correlation record for an accepted inject: daemon acceptance is hop evidence (transport_accepted) only.
-  function openLedgerRecord(rec, destination) {
+  function openLedgerRecord(rec, destination, correlationId) {
     const leg1 = { host: LOCAL, session: rec.target };
     const relayed = destination !== undefined;
     const c = ledger.createRequest({
-      nonce: rec.nonce, request_id: rec.request_id, origin: { host: LOCAL, session: rec.reply_to },
+      nonce: rec.nonce, correlation_id: correlationId, request_id: rec.request_id, origin: { host: LOCAL, session: rec.reply_to },
       destination: relayed ? { host: destination.host, session: destination.session } : leg1,
       via: relayed ? leg1 : null, via_generation: relayed ? rec.target_epoch : null,
       reply_to: { host: LOCAL, session: rec.reply_to }, generation: relayed ? null : rec.target_epoch,

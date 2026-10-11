@@ -11,7 +11,7 @@ import { normalizeConfig, createTeleptyTransport } from "../src/index.js";
 import { openLedger } from "../src/relay/ledger.js";
 import { waitFor } from "./helpers.js";
 import { makeSandbox, readJson, writeStateDir } from "./helpers/fault-fs.js";
-import { startFakeTelepty } from "./helpers/fake-telepty.js";
+import { startFakeTelepty, parseWire } from "./helpers/fake-telepty.js";
 
 const PREFIX = "tsl";
 const NO_LOOPBACK = process.env.TELESESSION_TEST_NO_LOOPBACK === "1"
@@ -67,6 +67,28 @@ describe("transport with correlation ledger (loopback fake telepty)", { skip: NO
     assert.equal(st.delivered_to_origin_agent, true);
     assert.equal(st.status, "completed");
     assert.equal(st.reply_count, 2);
+  });
+
+  test("correlation_id: returned by send, on the wire header, in the ledger record and status; dedupe returns the same", async (t) => {
+    const { fake, ledger, make } = await setup(t);
+    const tr = make();
+    const s = await tr.send({ target: "target-1", text: "correlate me", request_id: "corr-1" });
+    assert.equal(s.ok, true, JSON.stringify(s));
+    assert.match(s.correlation_id, /^[0-9a-f]{32}$/);
+    const delivered = fake.sessions.get("target-1").delivered.at(-1).prompt;
+    assert.ok(delivered.startsWith(`[telesession nonce=${s.nonce} reply-to=${s.reply_to} correlation=${s.correlation_id}]\n`), delivered);
+    assert.equal(parseWire(delivered).text, "correlate me");
+    assert.equal(ledger.record(s.nonce).correlation_id, s.correlation_id);
+    assert.equal(ledger.record(s.nonce).request_id, "corr-1", "request_id unchanged");
+    const st = await tr.requestStatus({ nonce: s.nonce });
+    assert.equal(st.correlation_id, s.correlation_id);
+    assert.equal(st.nonce, s.nonce);
+    const again = await tr.send({ target: "target-1", text: "correlate me", request_id: "corr-1" });
+    assert.deepEqual([again.deduplicated, again.correlation_id], [true, s.correlation_id]);
+    // A reply that carries no correlation id (today's reply format) still works.
+    fake.replyFrom("target-1", s.reply_to, `REPLY ${s.nonce} ${ACK_FINAL} done`);
+    assert.equal((await tr.readReply({ nonce: s.nonce, wait_ms: 8000 })).reply, "trusted");
+    assert.equal((await tr.requestStatus({ nonce: s.nonce, cursor: 1 })).status, "completed");
   });
 
   // Review G1 (B1), after the reviewer's scratch/interim-completes.test.mjs R1.
