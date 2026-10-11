@@ -142,6 +142,48 @@ describe("transport with correlation ledger (loopback fake telepty)", { skip: NO
     assert.equal((await b.requestStatus({ nonce: s.nonce, cursor: 1 })).status, "completed");
   });
 
+  // Review G2 (B2), after the reviewer's scratch/late-drop.test.mjs R3.
+  test("G2 one transient promoteLate failure keeps the verified late reply (resumable, not duplicate)", async (t) => {
+    const sb = makeSandbox("ts-ledger-g2-");
+    const fake = await startFakeTelepty();
+    const real = openLedger({ dir: path.join(sb.root, "ledger") });
+    let failOnce = true;
+    const ledger = { ...real, get mode() { return real.mode; }, promoteLate(a) {
+      if (failOnce) { failOnce = false; return { ok: false, code: "LEDGER_WRITE_FAILED" }; }
+      return real.promoteLate(a);
+    } };
+    const trs = [];
+    t.after(async () => { for (const x of trs) { try { await x.close(); } catch { /* closed */ } } real.close(); await fake.close(); sb.remove(); });
+    const make = () => {
+      const cfg = normalizeConfig({ teleptyUrl: fake.origin, token: fake.token, targets: ["target-1"], inboxPrefix: PREFIX, stateDir: sb.stateDir });
+      const tr = createTeleptyTransport(cfg, sb.seam(), { ledger });
+      trs.push(tr);
+      return tr;
+    };
+    const a = make();
+    const s = await a.send({ target: "target-1", text: "slow job", request_id: "slow-g2" });
+    assert.equal(s.ok, true, JSON.stringify(s));
+    await a.close();
+    const state = readJson(path.join(sb.stateDir, "state.json"));
+    const q = state.requests["r:slow-g2"];
+    for (const k of ["created_at", "sent_at", "expires_at", "retain_until"]) q[k] -= 16 * 60 * 1000;
+    fs.unlinkSync(path.join(sb.stateDir, "state.json"));
+    writeStateDir(sb.stateDir, state);
+    const b = make();
+    const other = await b.send({ target: "target-1", text: "fresh job", request_id: "fresh-g2" });
+    assert.equal(other.ok, true, JSON.stringify(other));
+    fake.replyFrom("target-1", other.reply_to, `REPLY ${s.nonce} ${ACK_FINAL} ACK after the TTL`);
+    const st = await waitFor(async () => {
+      const x = await b.requestStatus({ nonce: s.nonce });
+      return x.ok && (x.late_after_ttl_count === 1 || x.ledger.late_dropped > 0) ? x : null;
+    }, { timeoutMs: 15000, description: "late reply settled" });
+    assert.equal(failOnce, false, "the injected failure fired");
+    assert.equal(st.late_after_ttl_count, 1, JSON.stringify(st));
+    assert.equal(st.reply_count, 1);
+    assert.equal(st.rejected.duplicate, undefined);
+    assert.equal(st.ledger.late_dropped, 0);
+  });
+
   test("request_status without a ledger → LEDGER_NOT_CONFIGURED; bad arguments refused", async (t) => {
     const { fake, make } = await setup(t);
     const cfg = normalizeConfig({ teleptyUrl: fake.origin, token: fake.token, targets: ["target-1"], inboxPrefix: PREFIX });
