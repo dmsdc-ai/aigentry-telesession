@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { normalizeConfig, createTeleptyTransport } from "../src/index.js";
+import { normalizeConfig, createTeleptyTransport, classifyAuditRows } from "../src/index.js";
 import { openLedger } from "../src/relay/ledger.js";
 import { waitFor } from "./helpers.js";
 import { makeSandbox, readJson, writeStateDir } from "./helpers/fault-fs.js";
@@ -38,6 +38,21 @@ async function setup(t) {
 }
 
 const REMOTE = { host: "remote-peer", session: "remote-orchestrator" };
+
+// Review N17/S5 (defence in depth): only a row the local daemon stamped `origin: "trusted-local"` can be trusted.
+test("N17 classifyAuditRows trusts only origin trusted-local rows; any other or missing origin is origin_untrusted", () => {
+  const sha = "a".repeat(64);
+  const issued = { target: "target-1", target_epoch: "ep-1", sent_at: 1000, expires_at: 9e15, answered: false };
+  const ctx = { inboxId: "inbox-1", boundInjectIds: new Set(), complete: true };
+  const row = (o = {}) => ({
+    payload_sha256: sha, to: "inbox-1", to_alias: null, delivery_result: "success", ts: new Date(2000).toISOString(), inject_id: "i-1",
+    verified_sender_sid: "target-1", spoof_suspected: false, verified_sender_epoch: "ep-1", origin: "trusted-local", ...o,
+  });
+  assert.equal(classifyAuditRows([row()], { sha256: sha }, issued, ctx).trusted, true);
+  for (const origin of ["peer", "remote", null, undefined]) {
+    assert.deepEqual(classifyAuditRows([row({ origin })], { sha256: sha }, issued, ctx), { trusted: false, reason: "origin_untrusted" }, String(origin));
+  }
+});
 const ACK_FINAL = "[telesession ack=final]";
 
 describe("transport with correlation ledger (loopback fake telepty)", { skip: NO_LOOPBACK }, () => {
