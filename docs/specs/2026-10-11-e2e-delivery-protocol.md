@@ -310,6 +310,44 @@ Telepty dependencies (not implemented here):
 | #103 / #104 "submitted" = queue receipt | `agent_consumed` from a consumption observation | queue receipt maps only to `transport_accepted` |
 | #102 (diagnostics) | separate queue vs parked backlog | §11 reads them separately when present, else `unknown` |
 
+### 9.1 Provenance and receipt adapters (`src/relay/adapters.js`)
+
+Interfaces (injected into the transport as `extensions.provenance` / `extensions.receipts`):
+```
+ProvenanceAdapter.verify(row)          → {authenticated, host, basis}
+ReceiptAdapter.fetch(correlation_id)   → Promise<receipt[]>                 (proposed GET /api/requests/:correlation_id/receipts)
+ReceiptAdapter.consumption(inject_id)  → Promise<{status, session_epoch?}>  (GET /api/inject-observations/:inject_id)
+```
+`createProvenanceAdapter({allowedBases})`: `authenticated` only when the row carries a
+`verified_sender_host` (telepty #100) AND a `sender_proof.basis` from the allowlist. Markers (`claimed_from`,
+`origin_host`, text) never count. Defaults are today's behaviour: `DEFAULT_PROVENANCE` (empty allowlist →
+nothing remote is ever proven) and `NO_RECEIPTS` (no reads at all).
+
+Receipt seam as read here (the agreed, not yet implemented telepty shape):
+`{correlation_id, inject_id, stage, role:"final"|"hop", seq, at, consumption, attested_by:{host_label, sid,
+epoch}, auth_basis}`, plus the carrying telepty's `verified_sender_host`/`sender_proof`. Mapping
+(`applyReceipts`, `applyConsumption`), run by `request_status` before the view; idempotent, so every poll
+can pull again:
+- `consumption.status = "observed"` for the inject this origin issued → `agent_consumed`, for a direct record
+  only and only with the record's epoch. For a relayed record the leg-1 consumption is a hop fact
+  (`HOP_FACT_ONLY`, not applied). Never a completion.
+- A receipt counts only if `role:"final"` and `auth_basis:"own_bearer"` (the final session attested with its
+  own bearer); otherwise `HOP_FACT_ONLY` / `NOT_OWN_BEARER`. Its `correlation_id` must equal the record's
+  (`CORRELATION_MISMATCH`). The hash binding is the envelope's `payload_sha256`, so the event uses the
+  record's hash.
+- Proven provenance → destination stage `from {host: verified host, session: attested sid}`. A proven
+  `processing_completed` is first stored as a verified reply entry with deterministic text
+  `[telesession receipt stage=processing_completed]\n<json>`, so `final_ack_seq`, the cursor and the
+  checkpoint cover it → `origin_ack_received`, and `completed` after the origin agent's checkpoint.
+- Unproven → `unproven[stage] = REMOTE_PROVENANCE_UNAVAILABLE`; nothing is stored as a reply.
+- Remote epoch: a relayed record is created with `generation: null`. The first authenticated destination
+  event may bind it (`learn_generation`, relayed records only); later events must match
+  (`GENERATION_MISMATCH`).
+- Duplicate / out-of-order receipts collapse through the reply and event dedupe keys (§7) and the
+  monotonic stages (§5).
+Isolated proof: `test/e2e-full-route.test.js` (fakes in `test/helpers/fake-receipts.js`). It is not evidence
+that the telepty APIs exist.
+
 ## 10. Relay tick, in-process runner and one-shot CLI
 
 Pure functions over the ledger with an injected `send(item) → {ok, transport_id} | {ok:false, sent:"no"|"yes"|"unknown", code}`:
