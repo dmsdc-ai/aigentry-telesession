@@ -73,7 +73,7 @@ origin agent never needs to poll leg n directly.
 | `stage` | enum §5 | highest stage reached (monotonic) |
 | `stages` | map stage→ISO\|null | first-evidence time per stage; null = no evidence |
 | `terminal` | null \| `{state:"rejected", at, reason}` | only an authenticated destination refusal sets it |
-| `created_at`, `deadline_at`, `retain_until` | ISO | `deadline_at` ends the *observation window*, not the record |
+| `created_ms`, `deadline_ms`, `retain_until_ms` | int (epoch ms) | `deadline_ms` ends the *observation window*, not the record. Stored as integers; only the status view renders times (`stages`, `checkpoint.at`, `terminal.at`) as ISO |
 | `replies` | list of reply index entries (§4.3) | ordered by `seq` |
 | `next_seq` | int ≥ 1 | monotonic, never reused |
 | `checkpoint` | null \| `{cursor, at}` | the origin agent's acknowledged read position |
@@ -131,10 +131,10 @@ Allowed transitions / effects:
   REMOTE_PROVENANCE_UNAVAILABLE` and the status carries that reason code.
 - `rejected`: only by an authenticated destination event; terminal for stages; later replies are still
   stored as addenda (they are data).
-- Derived `unknown`: (a) `deadline_at` passed without `origin_ack_received`; (b) the outbox shows
-  `uncertain`; (c) the record has no evidence beyond `transport_accepted` and the transport could not
-  observe more. A timeout NEVER yields `not_delivered`.
-- Derived `expired`: tracking ended (record retired after `retain_until`, or nonce in the retired list).
+- Derived `unknown`: (a) `deadline_ms` passed without `origin_ack_received`; (b) the outbox shows
+  `uncertain`. (A former case (c), "no evidence beyond `transport_accepted`", was dropped: within the
+  deadline that state is `pending`, after it (a) applies.) A timeout NEVER yields `not_delivered`.
+- Derived `expired`: tracking ended (record retired after `retain_until_ms`, or nonce in the retired list).
   It means "outcome unknown, no longer tracked", not "not delivered".
 
 Event validation, in order, with no state change on failure (counted in `rejected[reason]`):
@@ -208,10 +208,17 @@ parent turn; nothing interrupts the agent. Requests with an initial reply stay l
 `checkpoint ≥ last seq` AND `origin_ack_received` or `rejected`; until then status is `pending`/`unknown`,
 so they are never forgotten. Late replies: a verified reply is never dropped because the transport's 15-min nonce TTL passed.
 For ledger-backed nonces the receiver holds the bytes (`late_pending`), verifies them against the
-telepty audit with the ledger record's destination + generation (window up to `retain_until`) and stores
+telepty audit with the ledger record's destination + generation (window up to `retain_until_ms`) and stores
 them as an addendum with `late_after_ttl: true`, counted in status (`late_after_ttl_count`). The ledger
 write comes before the audit `inject_id` is bound, so a transient ledger failure leaves the bytes pending
 and the next pass verifies them again (never `duplicate`). Unverified late bytes are dropped and counted. The transport's own expiry semantics stay unchanged (OQ-1).
+
+Counter change in durable mode (the MCP bin opens the ledger whenever a state dir is set): a later
+verified reply for a ledger-tracked nonce is stored as an addendum and is no longer counted in
+`read_reply`'s `quarantined.duplicate`. That counter now only counts replays (an already bound audit
+`inject_id`) and later replies for nonces the ledger does not track (memory mode, ledger unavailable).
+Callers that alerted on `quarantined.duplicate` as "a second reply arrived" should read `replies` /
+`reply_count` instead.
 
 ## 9. Route resolution and the telepty dependency boundary
 
@@ -302,6 +309,11 @@ it at `<stateDir>/ledger` when a state dir is configured (no new env var).
 | T8 | route resolution with two locator forms of one peer | same canonical peer; unknown form unresolved |
 | T9 | read-only ledger directory | no crash; reads work; writes `LEDGER_READ_ONLY` |
 | T10 | MCP: six strict tools; `request_status` schema | existing refusals unchanged |
+| G2 | transient ledger failure while promoting a verified late reply | kept: `late_after_ttl_count` 1, no `duplicate` |
+| G3 | stale ledger lock (holder pid dead) | `LEDGER_LOCK_STALE`; status/health `LEDGER_UNAVAILABLE` + `ledger_code` |
+| G4 | unreferenced reply file after a crash | swept on open |
+| G5 | event-list eviction at 64 | completion not re-applied; `ack_seq` unchanged |
+| C1 | `correlation_id` | minted, persisted, returned, on the wire; mismatch → `CORRELATION_MISMATCH`; old records/replies work |
 
 ## 15. Supported OS scope
 
