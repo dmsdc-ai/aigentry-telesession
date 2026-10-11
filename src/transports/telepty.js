@@ -249,6 +249,9 @@ export function classifyAuditRows(rows, candidate, issued, ctx) {
   if (same.length > 1) return { trusted: false, reason: "audit_ambiguous" };
   const row = same[0];
   if (row.to_alias !== null || row.delivery_result !== "success") return { trusted: false, reason: "audit_unmatched" };
+  // Defence in depth (review N17): only a row the local daemon stamped as a local inject; a forwarded
+  // remote inject must never verify as the local target (host provenance is telepty #100).
+  if (row.origin !== "trusted-local") return { trusted: false, reason: "origin_untrusted" };
   const ts = Date.parse(row.ts);
   if (!(ts >= issued.sent_at)) return { trusted: false, reason: "audit_unmatched" };
   if (ts > issued.expires_at) return { trusted: false, reason: "expired" };
