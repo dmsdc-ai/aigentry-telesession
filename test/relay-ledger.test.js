@@ -168,10 +168,11 @@ test("RN1 completed stays completed when a later final reply moves ack_seq; the 
   assert.equal(l.status({ nonce: NONCE }).status, "pending", "not read yet");
   const done = l.status({ nonce: NONCE, cursor: 1 });
   assert.deepEqual([done.status, done.delivered_to_origin_agent, done.status_reasons], ["completed", true, []]);
+  assert.equal(done.first_ack_seq, 1);
   const r2 = l.appendReply({ nonce: NONCE, text: "final two", from: DEST, verified: true });
   l.recordEvent(ack("processing_completed", { reply_seq: r2.seq, reply_sha256: sha("final two") }));
   const s = l.status({ nonce: NONCE });
-  assert.deepEqual([s.status, s.final_ack_seq, s.delivered_to_origin_agent], ["completed", 2, false]);
+  assert.deepEqual([s.status, s.final_ack_seq, s.first_ack_seq, s.delivered_to_origin_agent], ["completed", 2, 1, false]);
   assert.deepEqual(s.status_reasons, ["NEWER_FINAL_ACK_UNREAD"]);
   const read = l.status({ nonce: NONCE, cursor: 2 });
   assert.deepEqual([read.status, read.delivered_to_origin_agent, read.status_reasons], ["completed", true, []]);

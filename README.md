@@ -64,7 +64,9 @@ Example MCP client entry (placeholders only; never put a token value here):
 `telesession_receipt {inject_id}`, `telesession_read_reply {nonce, wait_ms, cursor?}`,
 `telesession_request_status {nonce, cursor?}` — strict schemas, JSON results, `completion_fact: null` on
 every result. `cursor`, `destination` and `request_status` use the correlation ledger (durable mode only,
-`<state dir>/ledger`); see `docs/specs/2026-10-11-e2e-delivery-protocol.md`.
+`<state dir>/ledger`); see `docs/specs/2026-10-11-e2e-delivery-protocol.md`. `request_status` turns
+`completed` once your cursor covers the first final reply (`first_ack_seq`); a later final reply keeps it
+`completed` but adds `NEWER_FINAL_ACK_UNREAD` to `status_reasons` until you read it.
 
 Flow: `send` injects `[telesession nonce=<n> reply-to=<inbox> correlation=<id>]` + newline + text into the exact
 target (`exact_target:true`, no alias fallback). The target answers from its own telepty session into
