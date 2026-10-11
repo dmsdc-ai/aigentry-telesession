@@ -392,7 +392,7 @@ describe("durable transport vectors (loopback fake telepty)", { skip: NO_LOOPBAC
       ["two verified rows", (ctx) => [ctx.row(), ctx.row()], { state: "uncertain", recovery: "ambiguous" }],
       ["audit unavailable", (ctx) => { ctx.fake.flags.auditAvailable = false; return [ctx.row()]; }, { state: "uncertain", recovery: "audit_unavailable" }],
       ["claimed from only (no verified sender)", (ctx) => [ctx.row({ verified_sender_sid: null, verified_sender_epoch: null, verified_sender_generation: null })], { state: "uncertain", recovery: "unverified" }],
-      ["TV23 forged by another token holder", (ctx) => { ctx.fake.injectAs(ctx.fake.sessions.get("target-2").bearer, "target-1", ctx.wire, ctx.sender.id); return []; }, { state: "uncertain", recovery: "unverified" }],
+      ["TV23 forged by another token holder", (ctx) => { ctx.fake.injectAs(ctx.fake.sessions.get("target-2").bearer, "target-1", ctx.wire, ctx.sender.id, { ts: new Date(ctx.rec.created_at + 500).toISOString() }); return []; }, { state: "uncertain", recovery: "unverified" }],
       ["verified epoch differs", (ctx) => [ctx.row({ verified_sender_epoch: "epoch-other" })], { state: "uncertain" }],
       ["verified generation differs", (ctx) => [ctx.row({ verified_sender_generation: ctx.sender.generation + 1 })], { state: "uncertain" }],
       ["spoof_suspected", (ctx) => [ctx.row({ spoof_suspected: true })], { state: "uncertain" }],
