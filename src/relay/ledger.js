@@ -648,7 +648,8 @@ export function openLedger(opts, seams) {
     let rec = state.records[nonce];
     // A retired record stays readable (view: lifecycle retired); only a nonce whose record is gone is a stub.
     if (!rec) return { ok: true, nonce, status: state.retired.includes(nonce) ? "expired" : "not_tracked", completion_fact: null };
-    if (cursor !== undefined && mode === "read_write") {
+    if (cursor !== undefined) {
+      if (mode !== "read_write") return fail("LEDGER_READ_ONLY");
       const c = Math.min(cursor, rec.next_seq - 1);
       if (rec.checkpoint === null || c > rec.checkpoint.cursor) {
         const r = commit((d) => { d.records[nonce].checkpoint = { cursor: c, at: iso(now()) }; });

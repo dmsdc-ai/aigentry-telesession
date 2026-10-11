@@ -193,7 +193,8 @@ is unavailable, `telesession_request_status` returns `LEDGER_UNAVAILABLE` with `
 
 Read-only / permission-limited directory: open does not crash. If the lock cannot be created
 (`EACCES`/`EROFS`/`EPERM`) and `ledger.json` is readable, the ledger opens `read_only`: reads work,
-every mutation returns `{ok:false, code:"LEDGER_READ_ONLY"}`. Otherwise `LedgerError` with a code.
+every mutation returns `{ok:false, code:"LEDGER_READ_ONLY"}`, including a status call with a checkpoint
+`cursor` (it is refused, not silently ignored; the same call without a cursor works). Otherwise `LedgerError` with a code.
 
 ### 6.1 Retention, expiry, uncertain and late events (no deletion)
 
