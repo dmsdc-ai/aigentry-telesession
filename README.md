@@ -60,9 +60,11 @@ Example MCP client entry (placeholders only; never put a token value here):
 ```
 
 ## MCP tools
-`telesession_health`, `telesession_list_targets`, `telesession_send {target, text, request_id?}`,
-`telesession_receipt {inject_id}`, `telesession_read_reply {nonce, wait_ms}` — strict schemas,
-JSON results, `completion_fact: null` on every result.
+`telesession_health`, `telesession_list_targets`, `telesession_send {target, text, request_id?, destination?}`,
+`telesession_receipt {inject_id}`, `telesession_read_reply {nonce, wait_ms, cursor?}`,
+`telesession_request_status {nonce, cursor?}` — strict schemas, JSON results, `completion_fact: null` on
+every result. `cursor`, `destination` and `request_status` use the correlation ledger (durable mode only,
+`<state dir>/ledger`); see `docs/specs/2026-10-11-e2e-delivery-protocol.md`.
 
 Flow: `send` injects `[telesession nonce=<n> reply-to=<inbox>]` + newline + text into the exact
 target (`exact_target:true`, no alias fallback). The target answers from its own telepty session into
