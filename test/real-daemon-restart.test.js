@@ -132,7 +132,7 @@ test("RC5 telesession across a real daemon restart: wrapped target replies with 
   assert.equal(exact.body.exact_target, true, "exact_target:true echoed by the candidate");
   assert.equal(exact.body.session_id, TARGET);
 
-  await until(() => bridge.readLog().includes(`[telesession nonce=${s.nonce} reply-to=${inboxId}]`),
+  await until(() => bridge.readLog().includes(`[telesession nonce=${s.nonce} reply-to=${inboxId} correlation=${s.correlation_id}]`),
     { timeoutMs: 15000, description: "the telesession prompt reached the wrapped target's PTY" });
   assert.ok((await listSessionIds(d)).includes(inboxId), "the aterm inbox exists before the restart");
 

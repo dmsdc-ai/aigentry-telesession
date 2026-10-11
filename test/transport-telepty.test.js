@@ -453,7 +453,7 @@ describe("against a real telepty daemon (fixture)", { skip: HAS_TELEPTY ? false 
       await waitFor(() => deliveredTo(target, s.nonce), { description: "delivery to target endpoint" });
       const got = deliveredTo(target, s.nonce).body;
       assert.equal(got.session_id, "ts-orch");
-      assert.equal(got.text, `[telesession nonce=${s.nonce} reply-to=${tr.inboxId}]\n${text}`);
+      assert.equal(got.text, `[telesession nonce=${s.nonce} reply-to=${tr.inboxId} correlation=${s.correlation_id}]\n${text}`);
 
       const obs = (await d.request(`/api/inject-observations/${s.inject_id}`)).body;
       assert.equal(obs.session_id, "ts-orch");

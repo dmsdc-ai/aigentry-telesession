@@ -9,7 +9,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import fs from "node:fs";
+import path from "node:path";
 import { loadConfig, createTeleptyTransport } from "../src/index.js";
+import { openLedger } from "../src/relay/ledger.js";
 import { registerMcpTools } from "../src/adapters/mcp.js";
 
 const PKG_VERSION = (() => {
@@ -23,7 +25,12 @@ const PKG_VERSION = (() => {
 // state dir path). ConfigError and StoreError (e.g. STORE_LOCKED after an abrupt crash) take this path.
 let transport;
 try {
-  transport = createTeleptyTransport(loadConfig(process.env));
+  const cfg = loadConfig(process.env);
+  // Durable mode only: the correlation ledger lives inside the (locked, private) state dir. A ledger that
+  // cannot open leaves every existing tool unchanged; request_status and health then report
+  // LEDGER_UNAVAILABLE with the open code (e.g. LEDGER_LOCK_STALE after an abrupt exit).
+  const ledger = cfg.stateDir === null ? undefined : () => openLedger({ dir: path.join(cfg.stateDir, "ledger") });
+  transport = createTeleptyTransport(cfg, undefined, { ledger });
 } catch (err) {
   process.stderr.write(`telesession-mcp refused: ${(err && err.code) || "CONFIG_INVALID"}\n`);
   process.exit(2);

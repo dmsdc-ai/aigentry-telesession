@@ -188,7 +188,7 @@ export async function listSessionIds(daemon) {
 }
 
 export function nonceFromPrompt(text) {
-  const m = /^\[telesession nonce=([0-9a-f]{32}) reply-to=([A-Za-z0-9._-]+)\]\n/.exec(String(text));
+  const m = /^\[telesession nonce=([0-9a-f]{32}) reply-to=([A-Za-z0-9._-]+)(?: correlation=[0-9a-f]{32})?\]\n/.exec(String(text));
   return m ? { nonce: m[1], replyTo: m[2] } : null;
 }
 

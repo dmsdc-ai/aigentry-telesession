@@ -1,0 +1,101 @@
+# Real-daemon release gate (task #2026101110 S2-5, review N2). REQUIRED for release: release-check.yml
+# needs this job. Runs, against a telepty checkout at a PINNED ref:
+#   - RC5 (test/real-daemon-restart.test.js), incl. its wire-header assertion (:135);
+#   - "against a real telepty daemon (fixture)" (test/transport-telepty.test.js), incl. the wire-header
+#     assertion (:456);
+#   - "MCP end-to-end against a real telepty daemon (fixture)" (test/mcp.test.js).
+# Nothing is skipped or weakened: a NOTRUN skip of either real-daemon describe FAILS this job.
+# RC5 is EXPECTED RED until telepty#107 (wrapped child never parses the RCREPLY line) is fixed. The job
+# summary says so; it is not skipped. Read-only token, no secrets, no publish.
+name: Real daemon
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  # No telepty ref is recorded in package.json/docs, so this is the literal tag v0.8.5 (dispatch rule).
+  # NOTE: the RC5 fixture child (test-support/restart-credential-child-1215.js) and the candidate daemon
+  # capabilities are NOT in v0.8.5; they are at e86f414 (wip/task-1215-telesession-daemon, v0.8.5-2).
+  # Change this one value when the orchestrator pins the candidate ref.
+  TELEPTY_REPO: dmsdc-ai/aigentry-telepty
+  TELEPTY_REF: v0.8.5
+
+jobs:
+  real-daemon:
+    name: real daemon (${{ matrix.os }}, Node 20.20.0)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      # A private telepty repo would need a read-only token here (separate approval); none is configured.
+      - name: Checkout telepty at the pinned ref
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ env.TELEPTY_REPO }}
+          ref: ${{ env.TELEPTY_REF }}
+          path: telepty-src
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20.20.0"
+
+      - name: Install telesession from lockfile (no lifecycle scripts)
+        shell: bash
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      # telepty's native PTY dependency needs its install scripts.
+      - name: Install telepty (pinned ref)
+        shell: bash
+        working-directory: telepty-src
+        run: |
+          git rev-parse HEAD
+          npm ci --no-audit --no-fund
+
+      - name: Real-daemon tests (RC5, two real-daemon describes, two wire-header assertions)
+        shell: bash
+        env:
+          TELESESSION_TEST_TELEPTY_DIR: ${{ github.workspace }}/telepty-src
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap test/real-daemon-restart.test.js test/transport-telepty.test.js test/mcp.test.js 2>&1 | tee real-daemon.tap
+
+      - name: Summary (skips are failures here; RC5 → telepty#107)
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -s real-daemon.tap ]; then echo "::error::no TAP output"; exit 1; fi
+          rc5=$(grep -m1 -E '^(not )?ok [0-9]+ - RC5 ' real-daemon.tap | sed -E 's/^(not ok|ok) .*/\1/' || true)
+          {
+            echo "### real daemon: $RUNNER_OS, telepty ${TELEPTY_REPO}@${TELEPTY_REF} ($(git -C telepty-src rev-parse --short HEAD))"
+            grep -E '^# (tests|suites|pass|fail|cancelled|skipped|todo) ' real-daemon.tap | sed 's/^# /- /'
+            echo "- RC5: ${rc5:-not found}"
+            if [ "$rc5" = "not ok" ]; then
+              echo "- RC5 is EXPECTED RED until telepty#107 is fixed (the wrapped child never parses the RCREPLY line). Not skipped, not weakened."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if grep -E '# SKIP NOTRUN: telepty source not found' real-daemon.tap; then
+            echo "::error::a real-daemon describe was skipped (telepty tree not found): this gate has no exemption"; exit 1
+          fi
+          if [ -z "$rc5" ]; then echo "::error::RC5 did not run"; exit 1; fi
+          if [ "$rc5" = "not ok" ]; then echo "::error title=RC5 (telepty#107)::RC5 failed; expected until telepty#107 is fixed"; fi
+
+      - name: Upload TAP
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: real-daemon-tap-${{ matrix.os }}
+          path: real-daemon.tap
+          if-no-files-found: warn
+          retention-days: 14

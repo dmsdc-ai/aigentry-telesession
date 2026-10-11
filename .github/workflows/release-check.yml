@@ -1,4 +1,6 @@
-# Release verification gate. Runs the reusable CI first; nothing below runs unless it passes.
+# Release verification gate. Runs the reusable CI and the REQUIRED real-daemon gate (real-daemon.yml: RC5,
+# both real-daemon describes, both wire-header assertions against a pinned telepty ref) first; nothing
+# below runs unless both pass. RC5 stays red until telepty#107 is fixed, so this gate is red until then.
 # It creates no release, publishes nothing to npm and deploys nothing. See docs/ci.md.
 name: Release check
 
@@ -20,9 +22,14 @@ jobs:
     permissions:
       contents: read
 
+  real-daemon:
+    uses: ./.github/workflows/real-daemon.yml
+    permissions:
+      contents: read
+
   release-gate:
     name: release gate
-    needs: [ci]
+    needs: [ci, real-daemon]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -58,6 +65,7 @@ jobs:
             echo "### release check: verification passed"
             echo "- CI unit matrix (ubuntu/macos/windows, Node 20.20.0): passed"
             echo "- npm pack --dry-run: passed"
+            echo "- Real-daemon gate (RC5 + real-daemon describes, pinned telepty ref, ubuntu/macos): passed"
             echo "- NOT released: no GitHub release, npm publish or deployment was performed (package is private)."
-            echo "- NOT proven here: real telepty daemon, Dot/꼬마 connection, native PTY, restart/recovery. See docs/ci.md."
+            echo "- NOT proven here: Dot/꼬마 connection, a live deployment. See docs/ci.md."
           } >> "$GITHUB_STEP_SUMMARY"

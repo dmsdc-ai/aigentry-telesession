@@ -42,6 +42,7 @@ There is no one-command install. To try the candidate locally you need:
 | `TELESESSION_TELEPTY_TOKEN` **or** `TELESESSION_TELEPTY_TOKEN_FILE` | exactly one. The file must be an absolute path to a regular file ≤ 64 KiB holding either the bare token or a telepty `config.json` (`{"authToken": "..."}`) | `CONFIG_TOKEN_SOURCE_CONFLICT`, `CONFIG_TOKEN_MISSING`, `CONFIG_TOKEN_FILE_INVALID`, `CONFIG_TOKEN_INVALID` |
 | `TELESESSION_STATE_DIR` (optional) | absolute, normalized, 1–512 chars, no control chars, no trailing separator (win32: no UNC/device/drive-relative). Private app state, e.g. `~/.local/state/telesession`; never home/cwd itself, a project dir or telepty's own state | `CONFIG_STATE_DIR_INVALID`; at open `STORE_PATH_FORBIDDEN`, `STORE_PERMISSIONS_INVALID`, `STORE_LOCKED`, `STORE_CORRUPT`, … |
 | `TELESESSION_PERSIST_INBOX_CREDENTIAL` (optional) | unset/`0` or `1`; `1` requires a state dir and verified POSIX permissions (refused on Windows) | `CONFIG_PERSIST_INVALID`, `CONFIG_STATE_DIR_REQUIRED`, `STORE_CREDENTIAL_PLATFORM_UNSUPPORTED` |
+| `TELESESSION_RELAY_INTERVAL_MS` (optional) | unset/`0` = relay runner off (default); otherwise an integer 1000–3600000 ms, requires a state dir. Turning it on in a live deployment is a separate approval (spec §10). One tick on demand: `telesession-relay-tick` (refuses a held ledger lock, exit 3) | `CONFIG_RELAY_INTERVAL_INVALID`, `CONFIG_STATE_DIR_REQUIRED` |
 
 No defaults, no `~/.telepty` lookup, no credential minting. The token never appears in tool
 arguments, results, logs or the state dir. telepty's own peer-lane guard still applies and is not
@@ -60,13 +61,25 @@ Example MCP client entry (placeholders only; never put a token value here):
 ```
 
 ## MCP tools
-`telesession_health`, `telesession_list_targets`, `telesession_send {target, text, request_id?}`,
-`telesession_receipt {inject_id}`, `telesession_read_reply {nonce, wait_ms}` — strict schemas,
-JSON results, `completion_fact: null` on every result.
+`telesession_health`, `telesession_list_targets`, `telesession_send {target, text, request_id?, destination?}`,
+`telesession_receipt {inject_id}`, `telesession_read_reply {nonce, wait_ms, cursor?}`,
+`telesession_request_status {nonce | request_id | correlation_id, cursor?}` — strict schemas, JSON results, `completion_fact: null` on
+every result. `cursor`, `destination` and `request_status` use the correlation ledger (durable mode only,
+`<state dir>/ledger`); see `docs/specs/2026-10-11-e2e-delivery-protocol.md`. `request_status` turns
+`completed` once your cursor covers the first final reply (`first_ack_seq`); a later final reply keeps it
+`completed` but adds `NEWER_FINAL_ACK_UNREAD` to `status_reasons` until you read it.
+After the 15-min nonce TTL, `read_reply` still answers `NONCE_EXPIRED` when nothing is stored. When the ledger
+holds verified replies for that nonce, it returns them with `source: "ledger"` and `expiry: "NONCE_EXPIRED"`
+(text/received_at/verified_sender.sid from ledger seq 1; no audit `inject_id`). `request_status` (exactly one
+lookup key) keeps answering with `transport_nonce: "expired"` and `TRANSPORT_NONCE_EXPIRED`, and still records
+your cursor as the final receipt.
 
-Flow: `send` injects `[telesession nonce=<n> reply-to=<inbox>]` + newline + text into the exact
+Flow: `send` injects `[telesession nonce=<n> reply-to=<inbox> correlation=<id>]` + newline + text into the exact
 target (`exact_target:true`, no alias fallback). The target answers from its own telepty session into
-`<inbox>` with first line `REPLY <nonce>`. `read_reply` returns the text only after the audit check;
+`<inbox>` with first line `REPLY <nonce>`; a reply that is the final ACK carries `[telesession ack=final]` on
+one of its first three lines (any other verified reply is an addendum). A destination must not echo the
+origin prompt (or its header region) in the first three lines of a reply. `send` returns the immutable
+`correlation_id` (32 hex) that is also on the wire header. `read_reply` returns the text only after the audit check;
 otherwise counts per reason. `receipt` is a transport observation, never a reply. A send without a
 response is `accepted: "unknown"` and is never re-sent. `daemon_restart`
 (`observed`/`not_observed`/`unknown`) is a pid comparison, reported only.

@@ -97,11 +97,35 @@ Node lines are not claimed until they are added to the matrix and pass.
 Triggers: `workflow_dispatch` and pushes of tags matching `v*`.
 
 1. `ci` calls `ci.yml` (the full matrix plus pack).
-2. `release-gate` runs only after `ci` succeeds (`needs: [ci]`). On tag pushes it checks that the tag equals
+2. `real-daemon` calls `real-daemon.yml` (below). It is **required for release**.
+3. `release-gate` runs only after both succeed (`needs: [ci, real-daemon]`). On tag pushes it checks that the tag equals
    `v` + `package.json` `version`. It then runs `npm pack --dry-run --ignore-scripts` and writes a ready summary.
 
 It creates no GitHub release, runs no `npm publish` and performs no deployment. `package.json` keeps
 `"private": true`, so npm would refuse a publish anyway.
+
+## `real-daemon.yml` — real telepty daemon gate (required for release)
+
+Triggers: `workflow_dispatch` and `workflow_call` (from the release check). On ubuntu-latest and
+macos-latest (Node 20.20.0) it checks out `dmsdc-ai/aigentry-telepty` at the pinned `TELEPTY_REF` into
+`telepty-src/` and installs it (its native PTY dependency needs install scripts). With
+`TELESESSION_TEST_TELEPTY_DIR` set, it runs:
+- `test/real-daemon-restart.test.js` (RC5, incl. the wire-header assertion at :135);
+- `test/transport-telepty.test.js` ("against a real telepty daemon (fixture)", incl. the wire-header
+  assertion at :456);
+- `test/mcp.test.js` ("MCP end-to-end against a real telepty daemon (fixture)").
+Nothing is exempt: a `NOTRUN: telepty source not found` skip fails the job, and so does a missing RC5.
+
+- Pinned ref: no telepty ref is recorded in `package.json` or these docs, so the workflow pins the literal
+  tag `v0.8.5`. That tag does **not** contain the RC5 fixture child
+  (`test-support/restart-credential-child-1215.js`) or the candidate daemon capabilities; those are at
+  `e86f414` (`v0.8.5-2`, branch `wip/task-1215-telesession-daemon`). Until `TELEPTY_REF` names a ref with
+  them, the gate fails on that precondition.
+- Expected red: RC5 fails deterministically against the candidate tree at the child-reply step (telepty#107,
+  telepty side). The job summary names the issue; the test is not skipped or weakened.
+- Measured locally (Linux, candidate tree `e86f414`, 2026-10-12): the transport real-daemon describe passed
+  9/9 including its header assertion; RC5 failed 3/3 (telepty#107). The MCP real-daemon describe and macOS
+  were not run locally.
 
 ## Configured versus actually run
 
