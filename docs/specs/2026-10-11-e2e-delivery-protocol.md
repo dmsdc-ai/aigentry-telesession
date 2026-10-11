@@ -73,6 +73,7 @@ origin agent never needs to poll leg n directly.
 | `stage` | enum §5 | highest stage reached (monotonic) |
 | `stages` | map stage→ISO\|null | first-evidence time per stage; null = no evidence |
 | `terminal` | null \| `{state:"rejected", at, reason}` | only an authenticated destination refusal sets it |
+| `retired_at` | ISO\|null | retirement marker (§6.1); the record and its reply files stay |
 | `created_ms`, `deadline_ms`, `retain_until_ms` | int (epoch ms) | `deadline_ms` ends the *observation window*, not the record. Stored as integers; only the status view renders times (`stages`, `checkpoint.at`, `terminal.at`) as ISO |
 | `replies` | list of reply index entries (§4.3) | ordered by `seq` |
 | `next_seq` | int ≥ 1 | monotonic, never reused |
@@ -105,6 +106,9 @@ Ordering is `seq` (assigned at commit time, under the single-writer lock), not f
 ### 4.4 Status view (`telesession_request_status` result)
 `{ok, nonce, correlation_id, request_id, status, status_reasons, replies, next_cursor, ledger:{mode, write_failed, late_dropped, ack_event_failed}, stage, stages, unproven, deadline_passed, reply_count, late_after_ttl_count, cursor, ack_seq, final_ack_seq, first_ack_seq, delivered_to_origin_agent, checkpoint, outbox, rejected, completion_fact:null}`;
 `status` ∈ `pending | completed | rejected | unknown | expired | not_tracked`.
+Retention fields (§6.1): `lifecycle` ∈ `active | past_deadline | retired`, `retired_at`, `quarantined:
+[{key, kind, state, reason, at}]` (this nonce's quarantined outbox items) and `outbox.quarantined` (count;
+a quarantined item is also counted under its state).
 `final_ack_seq` = seq of the final reply (same value as `ack_seq`, which is kept as an alias).
 `first_ack_seq` = seq of the first final reply (decides `completed`, §5; null until a final reply).
 `delivered_to_origin_agent` = `checkpoint !== null && checkpoint.cursor >= ack_seq` (false while `ack_seq` is null).
@@ -147,8 +151,9 @@ Allowed transitions / effects:
 - Derived `unknown`: (a) `deadline_ms` passed without `origin_ack_received`; (b) the outbox shows
   `uncertain`. (A former case (c), "no evidence beyond `transport_accepted`", was dropped: within the
   deadline that state is `pending`, after it (a) applies.) A timeout NEVER yields `not_delivered`.
-- Derived `expired`: tracking ended (record retired after `retain_until_ms`, or nonce in the retired list).
-  It means "outcome unknown, no longer tracked", not "not delivered".
+- Derived `expired`: tracking ended (record retired after `retain_until_ms`, or nonce in the retired list)
+  while the outcome was still open. It means "outcome unknown, no longer tracked", not "not delivered".
+  A retired record that was already `completed` or `rejected` keeps that status (reason `RETIRED`).
 
 Event validation, in order, with no state change on failure (counted in `rejected[reason]`):
 unknown nonce → `UNKNOWN_CORRELATION`; a `correlation_id` present and ≠ record → `CORRELATION_MISMATCH`
@@ -188,6 +193,41 @@ is unavailable, `telesession_request_status` returns `LEDGER_UNAVAILABLE` with `
 Read-only / permission-limited directory: open does not crash. If the lock cannot be created
 (`EACCES`/`EROFS`/`EPERM`) and `ledger.json` is readable, the ledger opens `read_only`: reads work,
 every mutation returns `{ok:false, code:"LEDGER_READ_ONLY"}`. Otherwise `LedgerError` with a code.
+
+### 6.1 Retention, expiry, uncertain and late events (no deletion)
+
+Clocks, per record: `deadline_ms` (observation window, = the transport nonce TTL for a direct send) and
+`retain_until_ms` (default 7 days, never shorter than the deadline). The TTL is never extended
+unconditionally; instead each stage of a record's life has an explicit meaning:
+
+| lifecycle | when | meaning | still accepted |
+|---|---|---|---|
+| `active` | now ≤ `deadline_ms` | within the window | everything |
+| `past_deadline` | deadline < now ≤ `retain_until_ms` | still tracked; an open outcome reads `unknown` (`DEADLINE_PASSED`), never "not delivered" | verified late replies (§8 `late_after_ttl`), events, receipts, checkpoints |
+| `retired` | now > `retain_until_ms` (marker `retired_at` written on the next writable open) | tracking ended; an open outcome reads `expired` (`RETIRED`) | reads and checkpoints only; new late bytes are refused (`NONCE_EXPIRED`) |
+
+Retiring is a marker: the record, its reply files and its outbox items stay, and `request_status` /
+`readReplies` keep working (§8). `NONCE_RETIRED`/`NONCE_CONFLICT` still protect the nonce. Retired
+records count toward the record and byte bounds, so a long-running ledger eventually returns
+`LEDGER_FULL` (fail closed, with a code) until an operator prunes it.
+
+Outbox items: `state` is the transport fact (`queued → intent → sent | failed | uncertain`, §10) and
+`quarantine: null | {reason, at}` is a review marker. Reasons:
+- `no_live_correlation`: the item's record is retired or missing;
+- `past_deadline`: a `queued`/`uncertain` item whose record's deadline passed;
+- `payload_changed`: a newer enqueue for the same nonce, destination and kind with another payload (that
+  one is a new key, §7);
+- `max_attempts`: three definite non-sends (`failed`).
+The sweep runs on every writable open and before every relay tick. A quarantined item is never relayed
+automatically. It is listed in `request_status` for its nonce and summarised in health (`relay.
+quarantined_count`, `oldest_quarantined_age_ms`). `uncertain` items stay `uncertain` (never resent) and are
+quarantined only by the rules above.
+
+Deletion is an operator action and a **separate approval**. This slice ships only the listing:
+`telesession-ledger-prune --dry-run` (TELESESSION_STATE_DIR; takes the ledger lock, refuses a held one
+with exit 3) prints the retired records (with their reply-file counts) and the quarantined items. Without
+`--dry-run` it refuses with `PRUNE_DRY_RUN_ONLY`. Nothing in telesession deletes a record, a reply file
+or an outbox item. (The unreferenced reply-file sweep above only removes files that no record references.)
 
 ## 7. Dedupe keys and idempotency
 
@@ -300,8 +340,10 @@ deployment (or scheduling the CLI) is a **separate approval**. This slice adds n
 Reading telepty state must report, separately: daemon queue depth vs bridge parked backlog;
 heartbeat-ok vs data-path-ok; `lastActivity` vs `lastOutput`. Missing evidence → `unknown`.
 Stale parked directives are never flushed/replayed unconditionally: items older than the record
-deadline or without a matching live correlation go to a quarantine list for review. Any step that
-deletes data or restarts a live service is a **separate approval**.
+deadline or without a matching live correlation go to a quarantine list for review. For the
+telesession outbox this is implemented by the quarantine sweep in §6.1. Daemon queue / bridge parked
+backlog reads are still telepty-side (#102). Any step that deletes data or restarts a live service is a
+**separate approval**.
 
 ## 12. Guarantee model
 
