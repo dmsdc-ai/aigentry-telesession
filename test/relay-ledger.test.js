@@ -198,6 +198,21 @@ test("T4 restart recovery: reopening mid-flow reloads records, seq and checkpoin
   }).deduplicated, true);
 });
 
+// Review N9/S3 (reviewer's scratch/interim-completes.test.mjs R2): what is stored must be readable.
+test("reply text within 64 KiB stays readable at its worst-case JSON escaping; an oversized file is refused, not stored", (t) => {
+  const { l } = setup(t);
+  for (const text of ["\n".repeat(60000), "\u0001".repeat(65536)]) {
+    const a = l.appendReply({ nonce: NONCE, text, from: DEST, verified: true });
+    assert.equal(a.ok, true, JSON.stringify(a));
+    const r = l.readReplies({ nonce: NONCE, cursor: a.seq - 1 }).replies[0];
+    assert.equal(r.error, undefined, `seq ${a.seq} readable`);
+    assert.equal(r.text, text);
+  }
+  const big = l.appendReply({ nonce: NONCE, text: "\u0001".repeat(65536 - 1) + "x", from: DEST, verified: true, received_at: "t".repeat(8192) });
+  assert.deepEqual([big.ok, big.code], [false, "LEDGER_FULL"]);
+  assert.equal(l.status({ nonce: NONCE }).reply_count, 2);
+});
+
 // Review N8/S2: a tampered ledger.json must not steer reply-file paths out of the replies dir.
 test("tampered nested reply / late / outbox entries make ledger.json LEDGER_CORRUPT", (t) => {
   const { l, open, dir } = setup(t);

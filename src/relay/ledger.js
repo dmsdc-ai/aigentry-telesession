@@ -19,7 +19,7 @@ export const LEDGER_SCHEMA = "telesession-ledger";
 export const LEDGER_VERSION = 1;
 export const LEDGER_LIMITS = Object.freeze({
   records: 1024, repliesPerRecord: 32, outbox: 256, ledgerBytes: 4 * 1024 * 1024, replyTextBytes: 65536,
-  replyFileBytes: 98304, eventsPerRecord: 64, retired: 256, latePending: 4, outboxTextChars: 8000,
+  replyFileBytes: 6 * 65536 + 4096, eventsPerRecord: 64, retired: 256, latePending: 4, outboxTextChars: 8000,
   retainMs: 7 * 86400000, sendAttempts: 3,
 });
 export const STAGES = Object.freeze(["transport_accepted", "durable_received", "agent_consumed", "processing_completed", "origin_ack_received"]);
@@ -290,7 +290,11 @@ export function openLedger(opts, seams) {
     } catch (err) {
       return fail("LEDGER_WRITE_FAILED", errnoName(err));
     }
-    return atomicWrite(replyFile(nonce, sha), Buffer.from(JSON.stringify({ v: 1, nonce, sha256: sha, received_at: receivedAt, text }), "utf8"));
+    // Bounded by the escaped size: worst case 6 bytes per text byte (\u00XX) fits replyFileBytes; anything
+    // larger is refused here instead of being stored and then unreadable.
+    const bytes = Buffer.from(JSON.stringify({ v: 1, nonce, sha256: sha, received_at: receivedAt, text }), "utf8");
+    if (bytes.length > LEDGER_LIMITS.replyFileBytes) return fail("LEDGER_FULL");
+    return atomicWrite(replyFile(nonce, sha), bytes);
   }
 
   function readReplyFile(nonce, sha) {
