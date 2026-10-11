@@ -104,7 +104,9 @@ function isLedgerState(s) {
 }
 
 export function openLedger(opts, seams) {
-  const { dir, resolver = null } = opts || {};
+  // readOnly (review 3 B1, prune dry run): no mkdir, no lock file, no open-time recovery or sweep, no write;
+  // a held or stale lock is still refused.
+  const { dir, resolver = null, readOnly = false } = opts || {};
   const s = seams || {};
   const fsx = s.fs || nodeFs;
   const now = (opts && opts.now) || Date.now;
@@ -198,6 +200,7 @@ export function openLedger(opts, seams) {
   try { st = fsx.lstatSync(dir); } catch (err) {
     if (!err || err.code !== "ENOENT") throw new LedgerError("LEDGER_WRITE_FAILED", errnoName(err));
   }
+  if (st === null && readOnly === true) throw new LedgerError("LEDGER_NOT_FOUND");
   if (st === null) {
     try { fsx.mkdirSync(dir, { mode: 0o700 }); } catch (err) {
       if (!err || err.code !== "EEXIST") throw new LedgerError("LEDGER_WRITE_FAILED", errnoName(err));
@@ -209,7 +212,13 @@ export function openLedger(opts, seams) {
 
   const owner = randomBytes(16).toString("hex");
   let mode = "read_write";
-  try {
+  if (readOnly === true) {
+    try { fsx.lstatSync(lockPath); } catch (err) {
+      if (!err || err.code !== "ENOENT") throw new LedgerError("LEDGER_CORRUPT", errnoName(err));
+      mode = "read_only";
+    }
+    if (mode !== "read_only") throw new LedgerError(lockHolderDead() ? "LEDGER_LOCK_STALE" : "LEDGER_LOCKED");
+  } else try {
     const fd = fsx.openSync(lockPath, "wx", 0o600);
     try {
       fsx.writeSync(fd, Buffer.from(JSON.stringify({ v: 1, owner, pid: process.pid, created_at: iso(now()) }), "utf8"));
@@ -257,7 +266,7 @@ export function openLedger(opts, seams) {
   try {
     const r = readBounded(ledgerPath, LEDGER_LIMITS.ledgerBytes);
     if (r.status === "missing") {
-      if (mode === "read_only") throw new LedgerError("LEDGER_WRITE_FAILED", "EACCES");
+      if (mode === "read_only" && readOnly !== true) throw new LedgerError("LEDGER_WRITE_FAILED", "EACCES");
       state = { schema: LEDGER_SCHEMA, version: LEDGER_VERSION, generation: 0, records: {}, outbox: {}, retired: [] };
     } else if (r.status !== "ok") {
       throw new LedgerError("LEDGER_CORRUPT", r.errno);

@@ -217,3 +217,51 @@ test("S4 an intent left by a dead process becomes uncertain on reopen and drops 
   release();
   await tick;
 });
+
+// Review 3 B1: the prune dry run is strictly read-only (no lock, no recovery, no sweep, no write).
+test("prune --dry-run leaves ledger.json and the directory byte-identical (pending intent, orphan/tmp files, past-retention record)", async (t) => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "telesession-prune-ro-"));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const dir = path.join(base, "ledger");
+  const l = openLedger({ dir, resolver });
+  const mk = (n, extra) => l.createRequest({
+    nonce: n, request_id: null, origin: { host: "peer-o", session: "inbox" }, destination: DEST, reply_to: { host: "peer-o", session: "inbox" },
+    generation: "g", payload_sha256: sha(n), deadline_ms: 1, retain_ms: 1, ...extra,
+  });
+  assert.equal(mk("1".repeat(32)).ok, true);
+  assert.equal(mk("2".repeat(32), { deadline_ms: 600000, retain_ms: 600000 }).ok, true);
+  assert.equal(mk("3".repeat(32), { deadline_ms: 1, retain_ms: 600000 }).ok, true);
+  assert.equal(l.appendReply({ nonce: "2".repeat(32), text: "r", from: DEST, verified: true }).ok, true);
+  const { key } = l.enqueue({ nonce: "2".repeat(32), to: { host: "dest-box", session: "w" }, kind: "relay", text: "relay text" });
+  assert.equal(l.outboxTransition(key, "queued", { state: "intent", intent_at: new Date().toISOString() }).ok, true);
+  l.enqueue({ nonce: "3".repeat(32), to: { host: "dest-box", session: "w" }, kind: "relay", text: "past deadline" });
+  l.close();
+  fs.writeFileSync(path.join(dir, "replies", `${"2".repeat(32)}-${"0".repeat(64)}.json`), "{}", { mode: 0o600 });
+  fs.writeFileSync(path.join(dir, `.ledger.json.${"0".repeat(16)}.tmp`), "x", { mode: 0o600 });
+  await new Promise((res) => setTimeout(res, 20));
+  const snap = () => {
+    const out = {};
+    const walk = (d) => { for (const n of fs.readdirSync(d).sort()) { const p = path.join(d, n); out[path.relative(dir, p)] = fs.lstatSync(p).isDirectory() ? (walk(p), "dir") : fs.readFileSync(p, "hex"); } };
+    walk(dir);
+    return out;
+  };
+  const before = snap();
+  assert.equal(before.lock, undefined);
+  const dry = spawnSync(process.execPath, [PRUNE, "--dry-run"], { env: { PATH: process.env.PATH, TELESESSION_STATE_DIR: base }, encoding: "utf8", timeout: 20000 });
+  assert.equal(dry.status, 0, dry.stderr);
+  assert.deepEqual(JSON.parse(dry.stdout).records.map((x) => x.nonce), ["1".repeat(32)]);
+  assert.deepEqual(snap(), before, "nothing written, swept or locked");
+  // The read-only open itself: no lock file, every mutator refused, a held lock still refused.
+  const ro = openLedger({ dir, readOnly: true });
+  assert.equal(ro.mode, "read_only");
+  assert.equal(ro.sweepOutbox().code, "LEDGER_READ_ONLY");
+  assert.equal(ro.recordEvent({ nonce: "2".repeat(32) }).code, "LEDGER_READ_ONLY");
+  assert.equal(ro.outbox().find((o) => o.key === key).state, "intent", "no open-time recovery");
+  ro.close();
+  assert.deepEqual(snap(), before);
+  const w = openLedger({ dir });
+  assert.throws(() => openLedger({ dir, readOnly: true }), { code: "LEDGER_LOCKED" });
+  w.close();
+  assert.throws(() => openLedger({ dir: path.join(base, "absent"), readOnly: true }), { code: "LEDGER_NOT_FOUND" });
+  assert.equal(fs.existsSync(path.join(base, "absent")), false);
+});
