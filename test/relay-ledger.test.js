@@ -160,6 +160,30 @@ test("correlation_id mismatch on an event or reply → CORRELATION_MISMATCH with
   assert.equal(l.status({ nonce: NONCE }).stage, "origin_ack_received");
 });
 
+// Review N13/G5: the event list is bounded (64); an evicted completion key must not re-apply.
+test("event-list eviction at 64 never re-applies processing_completed or moves ack_seq", (t) => {
+  const { l, now } = setup(t);
+  const r1 = l.appendReply({ nonce: NONCE, text: "final one", from: DEST, verified: true });
+  const r2 = l.appendReply({ nonce: NONCE, text: "final two", from: DEST, verified: true });
+  const fin = (r, text) => ack("processing_completed", { reply_seq: r.seq, reply_sha256: sha(text) });
+  l.recordEvent(fin(r1, "final one"));
+  assert.equal(l.recordEvent(fin(r2, "final two")).applied, true);
+  const before = l.status({ nonce: NONCE });
+  assert.equal(before.ack_seq, 2);
+  for (let i = 0; i < 64; i += 1) l.recordEvent(ack("transport_accepted", { from: { host: "peer-o", session: `relay-${i}` }, hop: "intermediary" }));
+  assert.equal(l.record(NONCE).events.length, 64);
+  assert.ok(!l.record(NONCE).events.some((k) => k.includes(sha("final two"))), "completion keys evicted");
+  now.advance(1000);
+  for (const [r, text] of [[r2, "final two"], [r1, "final one"]]) {
+    const again = l.recordEvent(fin(r, text));
+    assert.deepEqual([again.ok, again.applied], [true, false], text);
+  }
+  const after = l.status({ nonce: NONCE });
+  assert.equal(after.ack_seq, 2);
+  assert.equal(after.stages.processing_completed, before.stages.processing_completed);
+  assert.equal(after.stages.origin_ack_received, before.stages.origin_ack_received);
+});
+
 test("T3 out-of-order ACKs: completed before consumed; stage never regresses, timestamp filled later", (t) => {
   const { l, now } = setup(t);
   l.recordEvent(ack("transport_accepted", { from: HOP, hop: "intermediary" }));
