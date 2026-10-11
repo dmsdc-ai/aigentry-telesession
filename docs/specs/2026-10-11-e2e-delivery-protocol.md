@@ -240,6 +240,9 @@ Pure functions over the ledger with an injected `send(item) → {ok, transport_i
 4. UNCERTAIN: on open, any `intent` without receipt (crash between 1 and 3) → `uncertain`. Never resent
    automatically; surfaced for operator review.
 5. DEDUP: an item with a receipt is never relayed again; a changed payload is a new key.
+6. COMMIT CHECK: every transition's commit result is checked; a failed one is reported in
+   `commit_failed: [{key, code}]` instead of its outcome (a lost receipt is never reported as `sent`; the
+   item stays `intent` and becomes `uncertain` on reopen).
 `sent` is hop evidence (`transport_accepted` of that leg) only.
 
 Activation gate: the library and a one-shot CLI entry may exist; running it as a process, timer or
