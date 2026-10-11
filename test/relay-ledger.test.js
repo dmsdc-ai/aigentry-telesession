@@ -198,6 +198,35 @@ test("T4 restart recovery: reopening mid-flow reloads records, seq and checkpoin
   }).deduplicated, true);
 });
 
+// Review N8/S2: a tampered ledger.json must not steer reply-file paths out of the replies dir.
+test("tampered nested reply / late / outbox entries make ledger.json LEDGER_CORRUPT", (t) => {
+  const { l, open, dir } = setup(t);
+  l.appendReply({ nonce: NONCE, text: "r1", from: DEST, verified: true });
+  l.holdLate({ nonce: NONCE, sha256: sha("held"), text: "held" });
+  l.enqueue({ nonce: NONCE, to: DEST, kind: "request", text: "p" });
+  l.close();
+  const file = path.join(dir, "ledger.json");
+  const good = fs.readFileSync(file, "utf8");
+  const okay = open();
+  okay.close();
+  const tampers = [
+    (j) => { j.records[NONCE].replies[0].sha256 = "../../../../tmp/x"; },
+    (j) => { j.records[NONCE].replies[0].from = { host: "../x", session: "w" }; },
+    (j) => { j.records[NONCE].replies[0].seq = "1"; },
+    (j) => { j.records[NONCE].late_pending[0].sha256 = "../escape"; },
+    (j) => { j.records[NONCE].replies.push(null); },
+    (j) => { const o = Object.values(j.outbox)[0]; o.to = { host: "x", session: "../../y" }; },
+    (j) => { const o = Object.values(j.outbox)[0]; o.key = "f".repeat(32); },
+  ];
+  for (const [i, tamper] of tampers.entries()) {
+    const j = JSON.parse(good);
+    tamper(j);
+    fs.unlinkSync(file);
+    fs.writeFileSync(file, JSON.stringify(j), { mode: 0o600 });
+    assert.throws(() => open(), (e) => e instanceof LedgerError && e.code === "LEDGER_CORRUPT", `tamper ${i}`);
+  }
+});
+
 // Review N3/G4: a crash between the reply-file write and the commit leaves an unreferenced file.
 test("open sweeps unreferenced replies/*.json; referenced reply and late-held files stay", (t) => {
   const { l, open, dir } = setup(t);

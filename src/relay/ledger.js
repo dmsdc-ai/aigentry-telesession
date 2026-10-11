@@ -65,12 +65,19 @@ const isEndpoint = (e) => e !== null && typeof e === "object" && typeof e.host =
 const endpointOf = (e) => ({ host: e.host, session: e.session });
 const isPlain = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 
+// Nested entries name reply files (`replies/<nonce>-<sha256>.json`) and endpoints: validated so a
+// tampered ledger.json cannot steer a read/unlink outside the replies dir.
+const isReplyEntry = (x) => isPlain(x) && Number.isSafeInteger(x.seq) && x.seq >= 1 && HEX64_RE.test(x.sha256) && isEndpoint(x.from);
+const isLateEntry = (x) => isPlain(x) && HEX64_RE.test(x.sha256);
+const isOutboxItem = (k, o) => isPlain(o) && o.key === k && HEX32_RE.test(k) && OUTBOX_STATES.includes(o.state) && HEX32_RE.test(o.nonce)
+  && isEndpoint(o.to) && typeof o.kind === "string" && KIND_RE.test(o.kind) && HEX64_RE.test(o.payload_sha256);
+
 function isRecord(key, r) {
   return isPlain(r) && r.nonce === key && HEX32_RE.test(r.nonce) && HEX64_RE.test(r.payload_sha256)
     && isEndpoint(r.origin) && isEndpoint(r.destination) && isEndpoint(r.reply_to) && (r.via === null || isEndpoint(r.via))
     && (r.correlation_id === undefined || r.correlation_id === null || HEX32_RE.test(r.correlation_id))
-    && isPlain(r.stages) && Array.isArray(r.replies) && Number.isSafeInteger(r.next_seq) && r.next_seq >= 1
-    && Array.isArray(r.events) && Array.isArray(r.late_pending) && isPlain(r.rejected) && isPlain(r.unproven)
+    && isPlain(r.stages) && Array.isArray(r.replies) && r.replies.every(isReplyEntry) && Number.isSafeInteger(r.next_seq) && r.next_seq >= 1
+    && Array.isArray(r.events) && Array.isArray(r.late_pending) && r.late_pending.every(isLateEntry) && isPlain(r.rejected) && isPlain(r.unproven)
     && Number.isSafeInteger(r.created_ms) && Number.isSafeInteger(r.deadline_ms) && Number.isSafeInteger(r.retain_until_ms);
 }
 
@@ -79,7 +86,7 @@ function isLedgerState(s) {
   if (!isPlain(s.records) || !isPlain(s.outbox) || !Array.isArray(s.retired)) return false;
   if (Object.keys(s.records).length > LEDGER_LIMITS.records || Object.keys(s.outbox).length > LEDGER_LIMITS.outbox) return false;
   return Object.entries(s.records).every(([k, r]) => isRecord(k, r))
-    && Object.values(s.outbox).every((o) => isPlain(o) && OUTBOX_STATES.includes(o.state) && HEX32_RE.test(o.nonce));
+    && Object.entries(s.outbox).every(([k, o]) => isOutboxItem(k, o));
 }
 
 export function openLedger(opts, seams) {
