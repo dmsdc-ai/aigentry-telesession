@@ -35,9 +35,14 @@ End-to-end delivery protocol (spec `docs/specs/2026-10-11-e2e-delivery-protocol.
 - Relay destination: the in-process relay passed only the session name to the transport send and dropped the
   host the route resolved. It now passes the route's peer as `destination`; a local route (the target itself)
   stays a direct send.
-- Receipt binding: `applyReceipts` accepts `injectIds` and refuses a receipt naming another inject
-  (`INJECT_MISMATCH`). Host and session were already bound by the ledger. No live caller passes `injectIds`
-  yet; `NO_RECEIPTS` remains the default.
+- Receipt binding (fail closed): `request_status` passes the injects this origin knows (its own inject and
+  its relay receipts) to `applyReceipts`. A receipt naming another inject is refused (`INJECT_MISMATCH`), and
+  with no known inject every receipt is refused (`INJECT_UNKNOWN`). An unproven receipt from another session
+  sets no marker. `attested_by.host_label` is not compared (spec §9.1 binds the verified host and the attested
+  session). Refusals are counted in the adapter result only.
+- In 0.2.0, relayed receipts are refused by design (the origin cannot know the final inject) pending
+  https://github.com/dmsdc-ai/aigentry-telesession/issues/8. The relay is opt-in and `NO_RECEIPTS` is the
+  default, so nothing live changes.
 - Unit runner list (#6): `test:unit` now names every test file that runs without a real daemon (16 files,
   was 4), including the fake-adapter full-route proof (`test:e2e` still runs it alone); `test:real-daemon`
   names the rest; a guard test fails on an unnamed test file.

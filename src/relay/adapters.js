@@ -57,22 +57,26 @@ function isReceipt(r) {
 }
 
 // Receipts in the order fetched (out-of-order evidence is handled by the ledger: stages never regress).
-// `injectIds`: the inject(s) that carried this request; a receipt naming another inject is refused
-// (INJECT_MISMATCH). Host + session are bound by the ledger (proven host and attested sid vs destination).
-// Without `injectIds` the inject is not checked (no live caller passes it yet: NO_RECEIPTS is the default).
+// `injectIds`: the inject(s) this origin knows carried the request. Fail closed: a receipt naming another
+// inject is refused (INJECT_MISMATCH), and with no known inject every receipt is refused (INJECT_UNKNOWN).
+// Host + session: a proven receipt is source-checked by the ledger (verified host + attested sid vs the
+// destination); an unproven one is source-checked here (attested sid) before its marker is set.
+// `attested_by.host_label` is not part of the binding (SPEC §9.1: the host is the verified sender host).
 export function applyReceipts({ ledger, nonce, receipts, provenance = DEFAULT_PROVENANCE, injectIds }) {
   const out = { applied: 0, unproven: 0, deduplicated: 0, refused: {} };
-  const injects = injectIds === undefined ? null : new Set(injectIds);
+  const injects = new Set(injectIds === undefined || injectIds === null ? [] : injectIds);
   const refuse = (code) => { out.refused[code] = (out.refused[code] || 0) + 1; };
   for (const r of (Array.isArray(receipts) ? receipts : []).slice(0, RECEIPTS_MAX)) {
     const rec = ledger.record(nonce);
     if (!rec) { refuse("UNKNOWN_CORRELATION"); continue; }
     if (!isReceipt(r)) { refuse("INVALID_RECEIPT"); continue; }
     if (r.correlation_id !== rec.correlation_id) { refuse("CORRELATION_MISMATCH"); continue; }
-    if (injects !== null && !injects.has(r.inject_id)) { refuse("INJECT_MISMATCH"); continue; }
     if (r.role !== "final") { refuse("HOP_FACT_ONLY"); continue; }
     if (r.auth_basis !== "own_bearer") { refuse("NOT_OWN_BEARER"); continue; }
+    if (injects.size === 0) { refuse("INJECT_UNKNOWN"); continue; }
+    if (!injects.has(r.inject_id)) { refuse("INJECT_MISMATCH"); continue; }
     const prov = provenance.verify(r);
+    if (!prov.authenticated && r.attested_by.sid !== rec.destination.session) { refuse("SOURCE_MISMATCH"); continue; }
     const from = { host: prov.authenticated ? prov.host : rec.destination.host, session: r.attested_by.sid };
     const ev = {
       nonce, stage: r.stage, payload_sha256: rec.payload_sha256, correlation_id: r.correlation_id, from, hop: "destination",

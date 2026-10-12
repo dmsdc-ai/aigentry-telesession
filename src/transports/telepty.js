@@ -1412,8 +1412,11 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     if (!lr || lr.terminal || !lr.correlation_id) return;
     try {
       const list = await receiptAdapter.fetch(lr.correlation_id);
-      if (Array.isArray(list) && list.length) applyReceipts({ ledger, nonce, receipts: list, provenance: provenanceAdapter });
       const q = byNonce(nonce);
+      // The injects this origin knows carried the request: its own inject + its relay receipts for the nonce.
+      const injectIds = [q && q.inject_id, ...ledger.outbox().filter((o) => o.nonce === nonce && o.receipt).map((o) => o.receipt.transport_id)]
+        .filter((x) => typeof x === "string");
+      if (Array.isArray(list) && list.length) applyReceipts({ ledger, nonce, receipts: list, provenance: provenanceAdapter, injectIds });
       if (lr.via === null && q && q.inject_id && lr.stages.agent_consumed === null) {
         applyConsumption({ ledger, nonce, observation: await receiptAdapter.consumption(q.inject_id) });
       }
