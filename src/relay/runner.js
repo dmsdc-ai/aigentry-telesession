@@ -73,8 +73,12 @@ export function createRelayRunner({ ledger, send, resolver, intervalMs = 0, maxI
 // transport.send record → relay contract. The relay key is the transport idempotency key, so a resend of
 // the same item can never inject twice. Refusals before any inject are definite non-sends ("no"). The
 // route's peer travels as `destination` (the same session name may exist on several hosts).
-export function transportSendPrimitive(send) {
+// Fail closed (#2026101110 U2): the transport injects into its LOCAL daemon only, so an item for another
+// peer is refused before any inject (never delivered to a local same-name session). A real cross-host send
+// needs a daemon-side exact remote forward (telepty#111).
+export function transportSendPrimitive(send, { localPeer = "local" } = {}) {
   return async (item) => {
+    if (item.peer_id !== localPeer) return { ok: false, sent: "no", code: "PEER_UNSUPPORTED" };
     const r = await send({
       target: item.session, text: item.text, request_id: `relay:${item.key}`, destination: { host: item.peer_id, session: item.session },
     });
