@@ -166,8 +166,9 @@ test("transportSendPrimitive maps transport send records to the relay contract",
 });
 
 // Acceptance (a): the route's peer must reach the transport send (the primitive used to send `target: session`
-// only). The same session name on two hosts goes to the exact peer each item's route names.
-test("relay destination: the same session on two hosts reaches the transport send with the exact peer the route names", async (t) => {
+// only). The same session name on two hosts: the local peer's item reaches the send with its exact peer; the
+// other peer's item is refused before any send (PEER_UNSUPPORTED, #2026101110 U2 — remote forward is telepty#111).
+test("relay destination: the same session on two hosts — the local peer is sent with its exact peer, the other refused PEER_UNSUPPORTED (telepty#111)", async (t) => {
   const two = createRouteResolver([{ peer_id: "peer-a", locators: ["box-a"] }, { peer_id: "peer-b", locators: ["box-b"] }]);
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "telesession-runner-dest-"));
   const l = openLedger({ dir: path.join(base, "ledger"), resolver: two });
@@ -179,12 +180,11 @@ test("relay destination: the same session on two hosts reaches the transport sen
   const toA = l.enqueue({ nonce: NONCE, to: { host: "box-a", session: "w" }, kind: "relay", text: "for a" }).key;
   const toB = l.enqueue({ nonce: NONCE, to: { host: "box-b", session: "w" }, kind: "relay", text: "for b" }).key;
   const calls = [];
-  const send = transportSendPrimitive(async (a) => { calls.push(a); return { ok: true, accepted: true, inject_id: `inj-${calls.length}` }; });
+  const send = transportSendPrimitive(async (a) => { calls.push(a); return { ok: true, accepted: true, inject_id: `inj-${calls.length}` }; }, { localPeer: "peer-a" });
   const out = await createRelayRunner({ ledger: l, send, resolver: two }).tick();
-  assert.deepEqual(out.sent.sort(), [toA, toB].sort());
-  const by = Object.fromEntries(calls.map((c) => [c.text, c]));
-  assert.deepEqual(by["for a"].destination, { host: "peer-a", session: "w" });
-  assert.deepEqual(by["for b"].destination, { host: "peer-b", session: "w" });
+  assert.deepEqual([out.sent, out.requeued], [[toA], [toB]]);
+  assert.deepEqual(calls.map((c) => [c.text, c.destination]), [["for a", { host: "peer-a", session: "w" }]]);
+  assert.equal(l.outbox().find((o) => o.key === toB).last_error, "PEER_UNSUPPORTED");
 });
 
 test("config: TELESESSION_RELAY_INTERVAL_MS is opt-in; absent/0 keeps the config shape; invalid or without a state dir refused", () => {
