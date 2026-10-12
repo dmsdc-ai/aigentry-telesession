@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Relay sends to another host fail closed (#2026101110 U2). The transport injects only into its local telepty
+  daemon, and telepty has no daemon-side forward to an exact remote session (telepty#111). Before this fix, a relay
+  item routed to another peer was injected into the local session that had the same name. Such an item is now
+  refused before any inject with `PEER_UNSUPPORTED` (`sent: "no"`, so the existing requeue and quarantine rules apply).
+  The transport's default resolver now reports a non-local destination as `PEER_UNKNOWN` instead of
+  `ROUTE_UNRESOLVED`. Local relay items and an origin `send` with a remote `destination` (the relayed model through
+  the local leg-1 target) are unchanged.
+
 ## 0.2.0 — 2026-10-12
 
 End-to-end delivery protocol (spec `docs/specs/2026-10-11-e2e-delivery-protocol.md`).
