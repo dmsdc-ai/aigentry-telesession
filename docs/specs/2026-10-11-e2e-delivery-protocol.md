@@ -106,7 +106,7 @@ origin agent never needs to poll leg n directly.
 Ordering is `seq` (assigned at commit time, under the single-writer lock), not file mtime or name.
 
 ### 4.4 Status view (`telesession_request_status` result)
-`{ok, nonce, correlation_id, request_id, status, status_reasons, replies, next_cursor, ledger:{mode, write_failed, late_dropped, ack_event_failed}, stage, stages, unproven, deadline_passed, reply_count, late_after_ttl_count, cursor, ack_seq, final_ack_seq, first_ack_seq, delivered_to_origin_agent, checkpoint, outbox, rejected, completion_fact:null}`;
+`{ok, nonce, correlation_id, request_id, status, status_reasons, replies, next_cursor, ledger:{mode, write_failed, late_dropped, ack_event_failed, ledger_full}, stage, stages, unproven, deadline_passed, reply_count, late_after_ttl_count, cursor, ack_seq, final_ack_seq, first_ack_seq, delivered_to_origin_agent, checkpoint, outbox, rejected, completion_fact:null}`;
 `status` ∈ `pending | completed | rejected | unknown | expired | not_tracked`.
 Retention fields (§6.1): `lifecycle` ∈ `active | past_deadline | retired`, `retired_at`, `quarantined:
 [{key, kind, state, reason, at}]` (this nonce's quarantined outbox items) and `outbox.quarantined` (count;
@@ -180,7 +180,7 @@ Every write: tmp (O_EXCL, 0600) → write → fsync → close → rename → dir
 Reply text file is written and fsynced BEFORE the commit that references it (a crash leaves at most an
 unreferenced file, swept on open: a `replies/<nonce>-<sha256>.json` not referenced by any record's
 `replies`/`late_pending` is removed when a writable ledger opens; the replies dir must be a private
-non-symlink directory). Bounds: records 1024, replies per nonce 32, outbox 256, ledger file
+non-symlink directory). Bounds: records 1024 (non-retired; §6.1), replies per nonce 32, outbox 256, ledger file
 4 MiB, reply text 64 KiB (reply file ≤ 6 × 64 KiB + 4 KiB, the worst-case JSON escaping; a larger file is
 refused with `LEDGER_FULL` before it is written), events per record 64, retired 256. Restart: reload `ledger.json`, validate,
 re-enter idempotently (§7, §10). The ledger never stores the origin prompt text, tokens or bearer values; an outbox item keeps its relay
@@ -216,8 +216,12 @@ unconditionally; instead each stage of a record's life has an explicit meaning:
 
 Retiring is a marker: the record, its reply files and its outbox items stay, and `request_status` /
 `readReplies` keep working (§8). `NONCE_RETIRED`/`NONCE_CONFLICT` still protect the nonce. Retired
-records count toward the record and byte bounds, so a long-running ledger eventually returns
-`LEDGER_FULL` (fail closed, with a code) until an operator prunes it.
+records do not count toward the record bound (issue #5): when the non-retired records reach it,
+`createRequest` retires the records past `retain_until_ms` and re-checks. They still count toward the
+4 MiB byte bound, so a long-running ledger eventually returns `LEDGER_FULL` (fail closed, with a code)
+until an operator prunes it. The transport asks the ledger (`capacity`, counting sends still in flight)
+before it injects: a full ledger refuses the send with `LEDGER_FULL` (`accepted:false`, nothing injected,
+counted in `ledger.ledger_full`, not `write_failed`), so no accepted inject is left without a record.
 
 Outbox items: `state` is the transport fact (`queued → intent → sent | failed | uncertain`, §10) and
 `quarantine: null | {reason, at}` is a review marker. Reasons:

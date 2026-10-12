@@ -47,6 +47,7 @@ const ERRNO_RE = /^E[A-Z0-9]{1,31}$/;
 const TMP_RE = /^\.(?:ledger\.json|[0-9a-f]{32}-[0-9a-f]{64}\.json)\.[0-9a-f]{16}\.tmp$/;
 const REPLY_FILE_RE = /^([0-9a-f]{32})-([0-9a-f]{64})\.json$/;
 const LOCK_BYTES = 4096;
+const RECORD_MARGIN_BYTES = 4096;
 const READ_ONLY_CODES = new Set(["EACCES", "EROFS", "EPERM"]);
 const DIR_FSYNC_IGNORED = new Set(["EISDIR", "EPERM", "EINVAL", "EBADF"]);
 
@@ -73,6 +74,8 @@ const isEndpoint = (e) => e !== null && typeof e === "object" && typeof e.host =
   && typeof e.session === "string" && SID_RE.test(e.session);
 const endpointOf = (e) => ({ host: e.host, session: e.session });
 const isPlain = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+// Issue #5: `LEDGER_LIMITS.records` bounds the non-retired records; retired ones count toward the byte bound only.
+const liveCount = (records) => Object.values(records).filter((r) => !(isPlain(r) && r.retired_at)).length;
 
 // Nested entries name reply files (`replies/<nonce>-<sha256>.json`) and endpoints: validated so a
 // tampered ledger.json cannot steer a read/unlink outside the replies dir.
@@ -98,7 +101,7 @@ function isRecord(key, r) {
 function isLedgerState(s) {
   if (!isPlain(s) || s.schema !== LEDGER_SCHEMA || s.version !== LEDGER_VERSION || !Number.isSafeInteger(s.generation)) return false;
   if (!isPlain(s.records) || !isPlain(s.outbox) || !Array.isArray(s.retired)) return false;
-  if (Object.keys(s.records).length > LEDGER_LIMITS.records || Object.keys(s.outbox).length > LEDGER_LIMITS.outbox) return false;
+  if (liveCount(s.records) > LEDGER_LIMITS.records || Object.keys(s.outbox).length > LEDGER_LIMITS.outbox) return false;
   return Object.entries(s.records).every(([k, r]) => isRecord(k, r))
     && Object.entries(s.outbox).every(([k, o]) => isOutboxItem(k, o));
 }
@@ -401,10 +404,10 @@ export function openLedger(opts, seams) {
     // (a record reconstructed after a crash: the wire id was not persisted).
     const correlationId = a.correlation_id === null ? null : a.correlation_id ?? randomBytes(16).toString("hex");
     const r = commit((d) => {
-      if (Object.keys(d.records).length >= LEDGER_LIMITS.records) {
+      if (liveCount(d.records) >= LEDGER_LIMITS.records) {
         const due = Object.values(d.records).filter((x) => t > x.retain_until_ms).map((x) => x.nonce);
         retire(d, due);
-        if (Object.keys(d.records).length >= LEDGER_LIMITS.records) return fail("LEDGER_FULL");
+        if (liveCount(d.records) >= LEDGER_LIMITS.records) return fail("LEDGER_FULL");
       }
       d.records[a.nonce] = {
         nonce: a.nonce, correlation_id: correlationId, request_id: a.request_id ?? null, origin: endpointOf(a.origin), destination: endpointOf(a.destination),
@@ -418,6 +421,16 @@ export function openLedger(opts, seams) {
       };
     });
     return r.ok ? { ok: true, deduplicated: false, correlation_id: correlationId } : r;
+  }
+
+  // Issue #5: would a new record fit (non-retired records, counting `reserved` creates still in flight, and the
+  // byte bound with a record-sized margin)? Read-only; the transport asks before it sends (fail closed).
+  function capacity(reserved = 0) {
+    const t = now();
+    const live = Object.values(state.records).filter((r) => !r.retired_at && t <= r.retain_until_ms).length;
+    if (live + reserved >= LEDGER_LIMITS.records) return fail("LEDGER_FULL");
+    if (Buffer.byteLength(JSON.stringify(state), "utf8") + (reserved + 1) * RECORD_MARGIN_BYTES > LEDGER_LIMITS.ledgerBytes) return fail("LEDGER_FULL");
+    return { ok: true };
   }
 
   // An event/receipt may carry the correlation id; a different one is refused with no state change.
@@ -781,7 +794,7 @@ export function openLedger(opts, seams) {
 
   return Object.freeze({
     get mode() { return mode; },
-    createRequest, recordEvent, appendReply, readReplies, status, find, has, record,
+    createRequest, capacity, recordEvent, appendReply, readReplies, status, find, has, record,
     holdLate, latePending, readLateText, promoteLate, dropLate,
     enqueue, outbox, outboxTransition, sweepOutbox, prunable,
     close() {

@@ -314,6 +314,35 @@ describe("transport with correlation ledger (loopback fake telepty)", { skip: NO
     assert.equal(s.ok, true, "existing tools unchanged");
   });
 
+  // Issue #5 (owner review F1): a full ledger refuses the send before the inject (fail closed): typed error,
+  // counted as ledger_full (not write_failed), and no accepted inject without a correlation record.
+  test("#5 LEDGER_FULL ledger → send refused with LEDGER_FULL before any inject; counted ledger_full, not write_failed", async (t) => {
+    const sb = makeSandbox("ts-ledger-full-");
+    const fake = await startFakeTelepty();
+    const dir = path.join(sb.root, "ledger");
+    const seed = openLedger({ dir });
+    const e = { host: "local", session: "seed" };
+    assert.equal(seed.createRequest({ nonce: "a".repeat(32), origin: e, destination: e, reply_to: e, generation: null, payload_sha256: "b".repeat(64), deadline_ms: 60000 }).ok, true);
+    seed.close();
+    const file = path.join(dir, "ledger.json");
+    const st0 = JSON.parse(fs.readFileSync(file, "utf8"));
+    const proto = st0.records["a".repeat(32)];
+    for (let i = 0; i < 1024; i++) { const nonce = i.toString(16).padStart(32, "0"); st0.records[nonce] = { ...structuredClone(proto), nonce }; }
+    delete st0.records["a".repeat(32)];
+    fs.writeFileSync(file, JSON.stringify(st0));
+    const cfg = normalizeConfig({ teleptyUrl: fake.origin, token: fake.token, targets: ["target-1"], inboxPrefix: PREFIX, stateDir: sb.stateDir });
+    const tr = createTeleptyTransport(cfg, sb.seam(), { ledger: () => openLedger({ dir }) });
+    t.after(async () => { await tr.close(); await fake.close(); sb.remove(); });
+    const s = await tr.send({ target: "target-1", text: "no room to track this", request_id: "job-full" });
+    assert.equal(s.ok, false, JSON.stringify(s));
+    assert.deepEqual(s.error, { code: "LEDGER_FULL", accepted: false });
+    assert.equal(fake.injectsTo("target-1").length, 0, "nothing was injected");
+    const h = await tr.health();
+    assert.deepEqual([h.ledger.ledger_full, h.ledger.write_failed], [1, 0]);
+    const again = await tr.send({ target: "target-1", text: "no room to track this", request_id: "job-full" });
+    assert.equal(again.error.code, "LEDGER_FULL", "the request id is not consumed by a refusal");
+  });
+
   test("request_status without a ledger → LEDGER_NOT_CONFIGURED; bad arguments refused", async (t) => {
     const { fake, make } = await setup(t);
     const cfg = normalizeConfig({ teleptyUrl: fake.origin, token: fake.token, targets: ["target-1"], inboxPrefix: PREFIX });

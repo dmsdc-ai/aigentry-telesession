@@ -94,7 +94,7 @@ describe("post-expiry lookup and final receipt (loopback fake telepty)", { skip:
     assert.deepEqual(u1, { ok: true, request_id: "nope", status: "not_tracked", completion_fact: null });
     const { ledger: c2, ...u2 } = await tr.requestStatus({ correlation_id: "0".repeat(32) });
     assert.deepEqual(u2, { ok: true, correlation_id: "0".repeat(32), status: "not_tracked", completion_fact: null });
-    assert.deepEqual(Object.keys(c1).sort(), ["ack_event_failed", "late_dropped", "mode", "write_failed"], "counters only");
+    assert.deepEqual(Object.keys(c1).sort(), ["ack_event_failed", "late_dropped", "ledger_full", "mode", "write_failed"], "counters only");
     assert.deepEqual(c1, c2);
     const st = await tr.requestStatus({ nonce: s.nonce });
     assert.equal(st.transport_nonce, "live");

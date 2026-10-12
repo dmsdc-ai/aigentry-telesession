@@ -282,3 +282,56 @@ test("retired record refuses recordEvent and appendReply with RETIRED (counted);
   assert.deepEqual([s.reply_count, s.stage, s.rejected.RETIRED, s.checkpoint.cursor], [1, "unknown", 3, 1]);
   assert.equal(l2.readReplies({ nonce: NONCE, cursor: 0 }).replies[0].text, "before");
 });
+
+// Issue #5 (owner review F1): `records` bounds the non-retired records. Retirement stays a marker (nothing is
+// deleted), so a ledger whose records are all past retention keeps accepting new requests.
+function fillRecords(dir, n) {
+  const file = path.join(dir, "ledger.json");
+  const s = JSON.parse(fs.readFileSync(file, "utf8"));
+  const proto = s.records[NONCE];
+  for (let i = 0; i < n; i++) {
+    const nonce = i.toString(16).padStart(32, "0");
+    s.records[nonce] = { ...structuredClone(proto), nonce, request_id: `fill-${i}` };
+  }
+  delete s.records[NONCE];
+  fs.writeFileSync(file, JSON.stringify(s));
+}
+const fresh = (nonce) => ({
+  nonce, request_id: null, origin: { host: "peer-o", session: "inbox" }, destination: DEST, reply_to: { host: "peer-o", session: "inbox" },
+  generation: "g1", payload_sha256: sha("q"), deadline_ms: 60000,
+});
+
+test("#5 a ledger whose 1024 records are all retired still accepts a new request; the retired records stay and reopen works", (t) => {
+  const { l, now, open, dir } = setup(t);
+  l.close();
+  fillRecords(dir, 1024);
+  now.advance(700000);
+  const l2 = open();
+  assert.equal(l2.record("0".repeat(32)).retired_at !== null, true, "retired on open (marker)");
+  const c = l2.createRequest(fresh("f".repeat(32)));
+  assert.equal(c.ok, true, JSON.stringify(c));
+  assert.ok(l2.record("0".repeat(32)), "the retired record is kept");
+  assert.deepEqual(l2.capacity(), { ok: true });
+  l2.close();
+  const l3 = open();
+  assert.ok(l3.record("f".repeat(32)) && l3.record("0".repeat(32)), "1025 records (1024 retired) reopen without LEDGER_CORRUPT");
+});
+
+test("#5 retirement during createRequest: 1024 records past retain_until (no marker yet) → the new request is accepted", (t) => {
+  const { l, now, open, dir } = setup(t);
+  l.close();
+  fillRecords(dir, 1024);
+  const l2 = open();
+  now.advance(700000);
+  assert.equal(l2.createRequest(fresh("e".repeat(32))).ok, true);
+  assert.match(l2.record("0".repeat(32)).retired_at, /^\d{4}-/);
+});
+
+test("#5 1024 non-retired records → createRequest and capacity() refuse LEDGER_FULL (fail closed, with a code)", (t) => {
+  const { l, open, dir } = setup(t);
+  l.close();
+  fillRecords(dir, 1024);
+  const l2 = open();
+  assert.deepEqual(l2.capacity(), { ok: false, code: "LEDGER_FULL" });
+  assert.deepEqual(l2.createRequest(fresh("d".repeat(32))), { ok: false, code: "LEDGER_FULL" });
+});

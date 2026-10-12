@@ -469,7 +469,9 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     ledger = null;
     ledgerOpenCode = err && typeof err.code === "string" && /^[A-Z0-9_]{1,64}$/.test(err.code) ? err.code : "LEDGER_OPEN_FAILED";
   }
-  const ledgerStats = { write_failed: 0, late_dropped: 0, ack_event_failed: 0 };
+  const ledgerStats = { write_failed: 0, late_dropped: 0, ack_event_failed: 0, ledger_full: 0 };
+  // Issue #5: sends between the capacity check and their ledger record (each holds one record slot).
+  let ledgerReserved = 0;
   const LOCAL = "local";
   const tracks = (nonce) => ledger !== null && ledger.has(nonce);
   // SPEC §9.1 adapters; the defaults read nothing and prove nothing (today's behaviour).
@@ -1168,10 +1170,23 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       }
       inflight.add(key);
     }
+    // Issue #5: a full ledger refuses the send before anything is injected (fail closed): no accepted inject
+    // without a correlation record.
+    const slot = ledger !== null && ledger.mode === "read_write";
+    if (slot) {
+      const cap = ledger.capacity(ledgerReserved);
+      if (!cap.ok) {
+        if (key !== null) inflight.delete(key);
+        ledgerStats.ledger_full += 1;
+        return fail(cap.code, { accepted: false });
+      }
+      ledgerReserved += 1;
+    }
     try {
       return await sendNew(target, text, requestId, bodySha, key, destination);
     } finally {
       if (key !== null) inflight.delete(key);
+      if (slot) ledgerReserved -= 1;
     }
   });
 
@@ -1277,7 +1292,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
         reply_to: { host: LOCAL, session: q.reply_to }, generation: null, payload_sha256: q.payload_sha256,
         deadline_ms: Math.max(0, q.expires_at - Date.now()),
       });
-      if (!c.ok) { if (c.code !== "NONCE_RETIRED") ledgerStats.write_failed += 1; continue; }
+      if (!c.ok) { if (c.code === "LEDGER_FULL") ledgerStats.ledger_full += 1; else if (c.code !== "NONCE_RETIRED") ledgerStats.write_failed += 1; continue; }
       ledger.recordEvent({
         nonce: q.nonce, stage: "transport_accepted", payload_sha256: q.payload_sha256,
         from: { host: LOCAL, session: "telepty-daemon" }, hop: "intermediary", generation: null, authenticated: true,
@@ -1296,7 +1311,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       reply_to: { host: LOCAL, session: rec.reply_to }, generation: relayed ? null : rec.target_epoch,
       payload_sha256: rec.payload_sha256, deadline_ms: rec.expires_at - rec.sent_at,
     });
-    if (!c.ok) { ledgerStats.write_failed += 1; return; }
+    if (!c.ok) { ledgerStats[c.code === "LEDGER_FULL" ? "ledger_full" : "write_failed"] += 1; return; }
     ledger.recordEvent({
       nonce: rec.nonce, stage: "transport_accepted", payload_sha256: rec.payload_sha256,
       from: { host: LOCAL, session: "telepty-daemon" }, hop: "intermediary", generation: null, authenticated: true,
