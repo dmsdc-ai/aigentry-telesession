@@ -24,14 +24,33 @@ End-to-end delivery protocol (spec `docs/specs/2026-10-11-e2e-delivery-protocol.
   now refuses the send before the inject with `LEDGER_FULL` (`accepted:false`), counted in the new
   `ledger.ledger_full` counter instead of `write_failed`. Retired records still count toward the 4 MiB
   byte bound (operator prune remains dry-run only).
-- Unit runner list (#6): `test:unit` now names every test file that runs without a real daemon (15 files,
-  was 4); `test:real-daemon` and `test:e2e` name the rest; a guard test fails on an unnamed test file.
+- Ledger capacity, review 1 B1 (#5): the pre-send check could approve a send whose create was then refused
+  (records past retention but not yet marked, near the byte bound: retiring them inside the create overflowed
+  4 MiB), so the inject was accepted and left untracked on every send. The transport now reserves the record
+  in the ledger before the inject (`reserve`/`release` replace `capacity`): due records are retired in their
+  own commit, and the reservation holds one record and 8 KiB (was a 4 KiB margin, below a largest record) that
+  no other commit may use, including the reconstruction of lost records. The size check uses the committed
+  file size (no full `JSON.stringify` per send). Near the byte bound, other ledger writes may now return
+  `LEDGER_FULL` while sends are in flight (8 KiB per send).
+- Unit runner list (#6): `test:unit` now names every test file that runs without a real daemon (16 files,
+  was 4), including the fake-adapter full-route proof (`test:e2e` still runs it alone); `test:real-daemon`
+  names the rest; a guard test fails on an unnamed test file.
+
+### Spec change (for the spec owner)
+
+- `docs/specs/2026-10-11-e2e-delivery-protocol.md` §6.1 is rewritten in this release: retired records no
+  longer count toward the 1024-record bound, and the transport reserves the record before the inject. PR #3's
+  copy of the spec still has the old text ("retired records count toward the record and byte bounds").
 
 ### Compatibility
 
 - The request header gains an additive `correlation=` field.
 - Only a reply carrying the `[telesession ack=final]` token on one of its first three lines is the semantic ACK.
 - After expiry, `read_reply` returns `ok:true` with no `inject_id`; `wait_ms` is ignored.
+- Rollback hazard (#5): the ledger load check now bounds only the non-retired records, so this release can
+  write a ledger with more than 1024 records in total (the extra ones retired). An earlier build opens such a
+  ledger as `LEDGER_CORRUPT` (the ledger is then unavailable and sends go untracked). Before reverting, an
+  operator must prune the retired records down to 1024 records in total. No on-disk format or version change.
 
 ### Verified / not verified in this release
 
