@@ -17,6 +17,16 @@ End-to-end delivery protocol (spec `docs/specs/2026-10-11-e2e-delivery-protocol.
 - Opt-in in-process relay runner, `TELESESSION_RELAY_INTERVAL_MS` (default off), and a one-shot
   `telesession-relay-tick` CLI that refuses to run while the live lock is held.
 
+### Fixed
+
+- Ledger capacity (#5): the 1024-record bound counts non-retired records only (retirement stays a marker;
+  nothing is deleted), so a ledger whose records are all retired accepts new requests again. A full ledger
+  now refuses the send before the inject with `LEDGER_FULL` (`accepted:false`), counted in the new
+  `ledger.ledger_full` counter instead of `write_failed`. Retired records still count toward the 4 MiB
+  byte bound (operator prune remains dry-run only).
+- Unit runner list (#6): `test:unit` now names every test file that runs without a real daemon (15 files,
+  was 4); `test:real-daemon` and `test:e2e` name the rest; a guard test fails on an unnamed test file.
+
 ### Compatibility
 
 - The request header gains an additive `correlation=` field.
