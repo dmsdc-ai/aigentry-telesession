@@ -1151,6 +1151,8 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       return fail("INVALID_ARGUMENT");
     }
     if (!cfg.targets.includes(target)) return fail("TARGET_NOT_ALLOWED");
+    // A destination that is the target itself on this host (a local relay route) is a direct send.
+    if (destination !== undefined && destination.host === LOCAL && destination.session === target) destination = undefined;
     await awaitRecovery();
     purgeExpired();
     const requestId = request_id === undefined ? null : request_id;

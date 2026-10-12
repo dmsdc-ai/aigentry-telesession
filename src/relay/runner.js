@@ -71,10 +71,13 @@ export function createRelayRunner({ ledger, send, resolver, intervalMs = 0, maxI
 }
 
 // transport.send record → relay contract. The relay key is the transport idempotency key, so a resend of
-// the same item can never inject twice. Refusals before any inject are definite non-sends ("no").
+// the same item can never inject twice. Refusals before any inject are definite non-sends ("no"). The
+// route's peer travels as `destination` (the same session name may exist on several hosts).
 export function transportSendPrimitive(send) {
   return async (item) => {
-    const r = await send({ target: item.session, text: item.text, request_id: `relay:${item.key}` });
+    const r = await send({
+      target: item.session, text: item.text, request_id: `relay:${item.key}`, destination: { host: item.peer_id, session: item.session },
+    });
     if (r && r.ok === true) {
       if (r.accepted === true && typeof r.inject_id === "string") return { ok: true, transport_id: r.inject_id };
       if (r.accepted === false) return { ok: false, sent: "yes", code: r.error_code || "SEND_REFUSED" };

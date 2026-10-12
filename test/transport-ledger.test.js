@@ -383,6 +383,19 @@ describe("transport with correlation ledger (loopback fake telepty)", { skip: NO
     assert.deepEqual([h.ledger.ledger_full, h.ledger.write_failed], [3, 0]);
   });
 
+  // Acceptance (a): the relay primitive now always passes the route's peer; a local route (the target itself on
+  // this host) stays a direct record, while another host stays relayed via the target.
+  test("relay destination {local, target} → direct record (via null); a remote destination stays relayed", async (t) => {
+    const { ledger, make } = await setup(t);
+    const tr = make();
+    const local = await tr.send({ target: "target-1", text: "local relay route", destination: { host: "local", session: "target-1" } });
+    assert.equal(local.ok, true, JSON.stringify(local));
+    assert.deepEqual([ledger.record(local.nonce).via, ledger.record(local.nonce).destination], [null, { host: "local", session: "target-1" }]);
+    const remote = await tr.send({ target: "target-1", text: "remote relay route", destination: { host: "peer-b", session: "target-1" } });
+    assert.equal(remote.ok, true, JSON.stringify(remote));
+    assert.deepEqual([ledger.record(remote.nonce).via, ledger.record(remote.nonce).destination], [{ host: "local", session: "target-1" }, { host: "peer-b", session: "target-1" }]);
+  });
+
   test("request_status without a ledger → LEDGER_NOT_CONFIGURED; bad arguments refused", async (t) => {
     const { fake, make } = await setup(t);
     const cfg = normalizeConfig({ teleptyUrl: fake.origin, token: fake.token, targets: ["target-1"], inboxPrefix: PREFIX });

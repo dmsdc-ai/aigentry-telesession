@@ -153,9 +153,9 @@ test("enabled interval: start() ticks on its own timer; stop() ends it", async (
 test("transportSendPrimitive maps transport send records to the relay contract", async () => {
   const calls = [];
   const map = (rec) => transportSendPrimitive(async (a) => { calls.push(a); return rec; });
-  const it = { key: "k".repeat(32), session: "target-1", text: "hi" };
+  const it = { key: "k".repeat(32), peer_id: "local", session: "target-1", text: "hi" };
   assert.deepEqual(await map({ ok: true, accepted: true, inject_id: "inj-1" })(it), { ok: true, transport_id: "inj-1" });
-  assert.deepEqual(calls[0], { target: "target-1", text: "hi", request_id: `relay:${"k".repeat(32)}` });
+  assert.deepEqual(calls[0], { target: "target-1", text: "hi", request_id: `relay:${"k".repeat(32)}`, destination: { host: "local", session: "target-1" } });
   assert.deepEqual(await map({ ok: true, accepted: "unknown", reason: "DAEMON_TIMEOUT" })(it), { ok: false, sent: "unknown", code: "DAEMON_TIMEOUT" });
   assert.deepEqual(await map({ ok: true, accepted: false, error_code: "SESSION_NOT_FOUND" })(it), { ok: false, sent: "yes", code: "SESSION_NOT_FOUND" });
   assert.deepEqual(await map({ ok: false, error: { code: "SESSION_NOT_FOUND", http_status: 404, accepted: false } })(it), { ok: false, sent: "yes", code: "SESSION_NOT_FOUND" });
@@ -163,6 +163,28 @@ test("transportSendPrimitive maps transport send records to the relay contract",
   assert.deepEqual(await map({ ok: false, error: { code: "EXACT_ROUTING_UNCONFIRMED", accepted: "unknown" } })(it), { ok: false, sent: "unknown", code: "EXACT_ROUTING_UNCONFIRMED" });
   assert.deepEqual(await map({ ok: false, error: { code: "TARGET_NOT_ALLOWED" } })(it), { ok: false, sent: "no", code: "TARGET_NOT_ALLOWED" });
   assert.deepEqual(await map({ ok: false, error: { code: "TRANSPORT_INTERNAL" } })(it), { ok: false, sent: "unknown", code: "TRANSPORT_INTERNAL" });
+});
+
+// Acceptance (a): the route's peer must reach the transport send (the primitive used to send `target: session`
+// only). The same session name on two hosts goes to the exact peer each item's route names.
+test("relay destination: the same session on two hosts reaches the transport send with the exact peer the route names", async (t) => {
+  const two = createRouteResolver([{ peer_id: "peer-a", locators: ["box-a"] }, { peer_id: "peer-b", locators: ["box-b"] }]);
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "telesession-runner-dest-"));
+  const l = openLedger({ dir: path.join(base, "ledger"), resolver: two });
+  t.after(() => { l.close(); fs.rmSync(base, { recursive: true, force: true }); });
+  l.createRequest({
+    nonce: NONCE, request_id: null, origin: { host: "peer-a", session: "inbox" }, destination: { host: "peer-a", session: "w" },
+    reply_to: { host: "peer-a", session: "inbox" }, generation: "g1", payload_sha256: sha("p"), deadline_ms: 60000,
+  });
+  const toA = l.enqueue({ nonce: NONCE, to: { host: "box-a", session: "w" }, kind: "relay", text: "for a" }).key;
+  const toB = l.enqueue({ nonce: NONCE, to: { host: "box-b", session: "w" }, kind: "relay", text: "for b" }).key;
+  const calls = [];
+  const send = transportSendPrimitive(async (a) => { calls.push(a); return { ok: true, accepted: true, inject_id: `inj-${calls.length}` }; });
+  const out = await createRelayRunner({ ledger: l, send, resolver: two }).tick();
+  assert.deepEqual(out.sent.sort(), [toA, toB].sort());
+  const by = Object.fromEntries(calls.map((c) => [c.text, c]));
+  assert.deepEqual(by["for a"].destination, { host: "peer-a", session: "w" });
+  assert.deepEqual(by["for b"].destination, { host: "peer-b", session: "w" });
 });
 
 test("config: TELESESSION_RELAY_INTERVAL_MS is opt-in; absent/0 keeps the config shape; invalid or without a state dir refused", () => {
