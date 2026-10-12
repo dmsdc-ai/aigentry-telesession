@@ -235,6 +235,21 @@ describe("applyReceipts: a refused proven receipt stores nothing (review 3 B2, N
     assert.deepEqual([s.reply_count, s.stage, s.final_ack_seq], [1, "origin_ack_received", 1]);
   });
 
+  // Acceptance (b): a receipt resolves to the inject that carried the request and to the final host + session;
+  // another inject_id, host or session is refused and stores nothing. NO_RECEIPTS stays the default (not wired).
+  test("receipt binding: resolves to the original inject_id + host + session; another inject, host or session is refused", async (t) => {
+    const l = mk(t);
+    assert.deepEqual(await NO_RECEIPTS.fetch(CID), []);
+    const wrong = [rc({ inject_id: "i-other" }), rc({ verified_sender_host: "other-peer" }), rc({ attested_by: { host_label: FINAL.host, sid: "other-sid", epoch: "E1" } })];
+    assert.deepEqual(applyReceipts({ ledger: l, nonce: N, receipts: wrong, provenance: prov, injectIds: ["i1"] }),
+      { applied: 0, unproven: 0, deduplicated: 0, refused: { INJECT_MISMATCH: 1, SOURCE_MISMATCH: 2 } });
+    assert.deepEqual([l.status({ nonce: N }).reply_count, l.status({ nonce: N }).stage], [0, "unknown"]);
+    assert.equal(applyReceipts({ ledger: l, nonce: N, receipts: [rc()], provenance: prov, injectIds: ["i1"] }).applied, 1);
+    const [entry] = l.readReplies({ nonce: N, cursor: 0 }).replies;
+    const body = JSON.parse(entry.text.split("\n").slice(1).join("\n"));
+    assert.deepEqual([body.inject_id, body.provenance.host, body.attested_by.sid, entry.from], ["i1", FINAL.host, FINAL.session, FINAL]);
+  });
+
   test("N-c: an over-long or malformed at / host_label / inject_id / epoch is INVALID_RECEIPT, nothing stored", (t) => {
     const l = mk(t);
     const bad = [

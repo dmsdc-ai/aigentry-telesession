@@ -57,14 +57,19 @@ function isReceipt(r) {
 }
 
 // Receipts in the order fetched (out-of-order evidence is handled by the ledger: stages never regress).
-export function applyReceipts({ ledger, nonce, receipts, provenance = DEFAULT_PROVENANCE }) {
+// `injectIds`: the inject(s) that carried this request; a receipt naming another inject is refused
+// (INJECT_MISMATCH). Host + session are bound by the ledger (proven host and attested sid vs destination).
+// Without `injectIds` the inject is not checked (no live caller passes it yet: NO_RECEIPTS is the default).
+export function applyReceipts({ ledger, nonce, receipts, provenance = DEFAULT_PROVENANCE, injectIds }) {
   const out = { applied: 0, unproven: 0, deduplicated: 0, refused: {} };
+  const injects = injectIds === undefined ? null : new Set(injectIds);
   const refuse = (code) => { out.refused[code] = (out.refused[code] || 0) + 1; };
   for (const r of (Array.isArray(receipts) ? receipts : []).slice(0, RECEIPTS_MAX)) {
     const rec = ledger.record(nonce);
     if (!rec) { refuse("UNKNOWN_CORRELATION"); continue; }
     if (!isReceipt(r)) { refuse("INVALID_RECEIPT"); continue; }
     if (r.correlation_id !== rec.correlation_id) { refuse("CORRELATION_MISMATCH"); continue; }
+    if (injects !== null && !injects.has(r.inject_id)) { refuse("INJECT_MISMATCH"); continue; }
     if (r.role !== "final") { refuse("HOP_FACT_ONLY"); continue; }
     if (r.auth_basis !== "own_bearer") { refuse("NOT_OWN_BEARER"); continue; }
     const prov = provenance.verify(r);
