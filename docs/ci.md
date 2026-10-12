@@ -112,6 +112,10 @@ predates it.
 TELESESSION_TEST_TELEPTY_DIR=<telepty source tree> node --test test/real-daemon-restart.test.js test/transport-telepty.test.js test/mcp.test.js
 ```
 
+The same set is `npm run test:real-daemon`. `test:unit` names every test file that runs without a real daemon
+or the MCP SDK (`transport-telepty` too: its real-daemon block is skipped NOTRUN there); `test:e2e` runs the
+fake-adapter full-route proof. `test/test-runners.test.js` fails when a test file is named by none of them.
+
 ## Configured versus actually run
 
 These workflow files only **configure** CI. A pass exists only once a run on GitHub shows green for the
