@@ -1,6 +1,6 @@
 {
   "name": "@dmsdc-ai/telesession",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Session-level prompt exchange over a local telepty daemon: exact targets, owned inbox, audit-verified replies, MCP adapter.",
   "type": "module",
