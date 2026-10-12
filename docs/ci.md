@@ -105,6 +105,8 @@ It creates no GitHub release, runs no `npm publish` and performs no deployment. 
 
 The real-daemon gate workflow is held in PR #3 pending repository workflow permission; until it lands, the
 real-daemon set is run locally before a release (command below) and its counts are recorded in the release notes.
+The telepty source tree used must contain the telepty#108 fix for RC5 to pass; the held CI gate's pin (`e86f414`)
+predates it.
 
 ```
 TELESESSION_TEST_TELEPTY_DIR=<telepty source tree> node --test test/real-daemon-restart.test.js test/transport-telepty.test.js test/mcp.test.js

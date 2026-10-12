@@ -42,4 +42,7 @@ Not verified:
 - No unattended cross-host E2E was executed.
 - The real-daemon CI gate is not included; the workflow is held in PR #3.
 - The relay runner is not activated anywhere.
-- RC5 (telepty#107) status: <to be filled by the orchestrator from task #2026101201>
+- RC5 (telepty#107) status: passes against telepty with PR #108 (`5b3619e`, per-session submit barrier) —
+  real-daemon set 28/28 pass, RC5 alone 3/3 consecutive passes (2026-10-12); fails on `e86f414` and `v0.8.5`
+  (27/28; a pre-existing telepty defect, not a regression in this release). The release requires a telepty
+  build containing #108; the pinned ref moves to the tag that carries it once released.
