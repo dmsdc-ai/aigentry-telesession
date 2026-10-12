@@ -10,7 +10,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { openLedger } from "../src/relay/ledger.js";
+import { openLedger, LEDGER_LIMITS } from "../src/relay/ledger.js";
 import { createRouteResolver } from "../src/relay/route.js";
 import { relayTick } from "../src/relay/relay.js";
 import { createRelayRunner } from "../src/relay/runner.js";
@@ -311,7 +311,7 @@ test("#5 a ledger whose 1024 records are all retired still accepts a new request
   const c = l2.createRequest(fresh("f".repeat(32)));
   assert.equal(c.ok, true, JSON.stringify(c));
   assert.ok(l2.record("0".repeat(32)), "the retired record is kept");
-  assert.deepEqual(l2.capacity(), { ok: true });
+  assert.equal(l2.reserve().ok, true);
   l2.close();
   const l3 = open();
   assert.ok(l3.record("f".repeat(32)) && l3.record("0".repeat(32)), "1025 records (1024 retired) reopen without LEDGER_CORRUPT");
@@ -327,11 +327,86 @@ test("#5 retirement during createRequest: 1024 records past retain_until (no mar
   assert.match(l2.record("0".repeat(32)).retired_at, /^\d{4}-/);
 });
 
-test("#5 1024 non-retired records → createRequest and capacity() refuse LEDGER_FULL (fail closed, with a code)", (t) => {
+test("#5 1024 non-retired records → createRequest and reserve() refuse LEDGER_FULL (fail closed, with a code)", (t) => {
   const { l, open, dir } = setup(t);
   l.close();
   fillRecords(dir, 1024);
   const l2 = open();
-  assert.deepEqual(l2.capacity(), { ok: false, code: "LEDGER_FULL" });
+  assert.deepEqual(l2.reserve(), { ok: false, code: "LEDGER_FULL" });
   assert.deepEqual(l2.createRequest(fresh("d".repeat(32))), { ok: false, code: "LEDGER_FULL" });
+});
+
+// Review 1 B1: the pre-send check and createRequest must decide on the same state. 1024 records that became
+// due while the ledger was open (no marker yet) plus retired records near the byte bound: retiring them inside
+// the create grows the file past 4 MiB, so the create is refused; the check must refuse too (both, every time).
+function fillNearByteBound(dir) {
+  const file = path.join(dir, "ledger.json");
+  const s = JSON.parse(fs.readFileSync(file, "utf8"));
+  const proto = s.records["0".repeat(32)];
+  let bytes = Buffer.byteLength(JSON.stringify(s));
+  for (let i = 1024; bytes < LEDGER_LIMITS.ledgerBytes - 8192 - 1200; i++) {
+    const nonce = i.toString(16).padStart(32, "0");
+    s.records[nonce] = { ...structuredClone(proto), nonce, request_id: `old-${i}`, retired_at: "2026-10-01T00:00:00.000Z" };
+    bytes += Buffer.byteLength(`,"${nonce}":${JSON.stringify(s.records[nonce])}`);
+  }
+  fs.writeFileSync(file, JSON.stringify(s));
+}
+
+test("B1 1024 due-but-unmarked records near the byte bound → the pre-send check refuses exactly when createRequest does", (t) => {
+  const { l, now, open, dir } = setup(t);
+  l.close();
+  fillRecords(dir, 1024);
+  fillNearByteBound(dir);
+  const l2 = open();
+  now.advance(700000);
+  const before = fs.readFileSync(path.join(dir, "ledger.json"));
+  for (const n of ["d".repeat(32), "e".repeat(32)]) {
+    const pre = l2.reserve();
+    const c = l2.createRequest({ ...fresh(n), reservation: pre.reservation });
+    assert.equal(pre.ok, c.ok, `check ${JSON.stringify(pre)} vs create ${JSON.stringify(c)}`);
+    assert.deepEqual(pre, { ok: false, code: "LEDGER_FULL" });
+  }
+  assert.deepEqual(fs.readFileSync(path.join(dir, "ledger.json")), before, "nothing committed");
+});
+
+test("B1 reserve() retires the due records in its own commit; the reserved create then never retires and succeeds", (t) => {
+  const { l, now, open, dir } = setup(t);
+  l.close();
+  fillRecords(dir, 1024);
+  const l2 = open();
+  now.advance(700000);
+  const pre = l2.reserve();
+  assert.equal(pre.ok, true, JSON.stringify(pre));
+  assert.match(l2.record("0".repeat(32)).retired_at, /^\d{4}-/, "retirement persisted before the create");
+  assert.equal(l2.createRequest({ ...fresh("d".repeat(32)), reservation: pre.reservation }).ok, true);
+  l2.release(pre.reservation);
+});
+
+test("B1/NB2 a held reservation keeps its slot: an unreserved create cannot take the last record or its bytes", (t) => {
+  const { l, open, dir } = setup(t);
+  l.close();
+  fillRecords(dir, 1023);
+  const l2 = open();
+  const pre = l2.reserve();
+  assert.equal(pre.ok, true);
+  assert.deepEqual(l2.reserve(), { ok: false, code: "LEDGER_FULL" }, "1023 + 1 reserved");
+  assert.deepEqual(l2.createRequest(fresh("c".repeat(32))), { ok: false, code: "LEDGER_FULL" }, "reconcile-style create refused");
+  assert.equal(l2.createRequest({ ...fresh("d".repeat(32)), reservation: pre.reservation }).ok, true, "the reserved create fits");
+  l2.release(pre.reservation);
+  assert.deepEqual(l2.reserve(), { ok: false, code: "LEDGER_FULL" }, "1024 live");
+});
+
+test("B1 RECORD_MARGIN_BYTES (8192) covers a largest transport record plus its transport_accepted event", (t) => {
+  const { l } = setup(t);
+  const big = { host: "h".repeat(253), session: "s".repeat(128) };
+  const nonce = "9".repeat(32);
+  const gen = "\u0001".repeat(256);
+  assert.equal(l.createRequest({
+    nonce, request_id: "r".repeat(128), origin: big, destination: big, reply_to: big, via: big, via_generation: gen,
+    generation: gen, payload_sha256: sha("x"), deadline_ms: 900000, correlation_id: "c".repeat(32),
+  }).ok, true);
+  assert.equal(l.recordEvent({ nonce, stage: "transport_accepted", payload_sha256: sha("x"), from: { host: "local", session: "telepty-daemon" },
+    hop: "intermediary", generation: null, authenticated: true }).ok, true);
+  const growth = Buffer.byteLength(`,${JSON.stringify(nonce)}:${JSON.stringify(l.record(nonce))}`, "utf8");
+  assert.ok(growth <= 8192, `largest record + event = ${growth} bytes`);
 });

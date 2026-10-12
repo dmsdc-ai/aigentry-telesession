@@ -8,7 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { normalizeConfig, createTeleptyTransport, classifyAuditRows } from "../src/index.js";
-import { openLedger } from "../src/relay/ledger.js";
+import { openLedger, LEDGER_LIMITS } from "../src/relay/ledger.js";
 import { waitFor } from "./helpers.js";
 import { makeSandbox, readJson, writeStateDir } from "./helpers/fault-fs.js";
 import { startFakeTelepty, parseWire } from "./helpers/fake-telepty.js";
@@ -341,6 +341,46 @@ describe("transport with correlation ledger (loopback fake telepty)", { skip: NO
     assert.deepEqual([h.ledger.ledger_full, h.ledger.write_failed], [1, 0]);
     const again = await tr.send({ target: "target-1", text: "no room to track this", request_id: "job-full" });
     assert.equal(again.error.code, "LEDGER_FULL", "the request id is not consumed by a refusal");
+  });
+
+  // Review 1 B1: 1024 records that became due while the ledger was open (no marker yet) plus retired records
+  // near the byte bound. Retiring them inside the create overflows 4 MiB: the send must be refused before the
+  // inject, never accepted and then left untracked.
+  test("B1 due-but-unmarked records near the byte bound → send refused LEDGER_FULL, nothing injected, request id not consumed", async (t) => {
+    const sb = makeSandbox("ts-ledger-b1-");
+    const fake = await startFakeTelepty();
+    const dir = path.join(sb.root, "ledger");
+    let off = 0;
+    const now = () => Date.now() + off;
+    const seed = openLedger({ dir, now });
+    const e = { host: "local", session: "seed" };
+    assert.equal(seed.createRequest({ nonce: "a".repeat(32), origin: e, destination: e, reply_to: e, generation: null, payload_sha256: "b".repeat(64), deadline_ms: 60000, retain_ms: 600000 }).ok, true);
+    seed.close();
+    const file = path.join(dir, "ledger.json");
+    const st0 = JSON.parse(fs.readFileSync(file, "utf8"));
+    const proto = st0.records["a".repeat(32)];
+    delete st0.records["a".repeat(32)];
+    let i = 0;
+    const nn = () => (i++).toString(16).padStart(32, "0");
+    for (let k = 0; k < 1024; k++) { const nonce = nn(); st0.records[nonce] = { ...structuredClone(proto), nonce }; }
+    for (let bytes = Buffer.byteLength(JSON.stringify(st0)); bytes < LEDGER_LIMITS.ledgerBytes - 8192 - 1200;) {
+      const nonce = nn();
+      st0.records[nonce] = { ...structuredClone(proto), nonce, retired_at: "2026-10-01T00:00:00.000Z" };
+      bytes += Buffer.byteLength(`,"${nonce}":${JSON.stringify(st0.records[nonce])}`);
+    }
+    fs.writeFileSync(file, JSON.stringify(st0));
+    const cfg = normalizeConfig({ teleptyUrl: fake.origin, token: fake.token, targets: ["target-1"], inboxPrefix: PREFIX, stateDir: sb.stateDir });
+    const tr = createTeleptyTransport(cfg, sb.seam(), { ledger: () => openLedger({ dir, now }) });
+    t.after(async () => { await tr.close(); await fake.close(); sb.remove(); });
+    off = 700000;
+    for (const rid of ["job-1", "job-1", "job-2"]) {
+      const s = await tr.send({ target: "target-1", text: "tracked?", request_id: rid });
+      assert.equal(s.ok, false, JSON.stringify(s));
+      assert.deepEqual(s.error, { code: "LEDGER_FULL", accepted: false });
+    }
+    assert.equal(fake.injectsTo("target-1").length, 0, "nothing was injected");
+    const h = await tr.health();
+    assert.deepEqual([h.ledger.ledger_full, h.ledger.write_failed], [3, 0]);
   });
 
   test("request_status without a ledger → LEDGER_NOT_CONFIGURED; bad arguments refused", async (t) => {

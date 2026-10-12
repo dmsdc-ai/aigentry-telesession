@@ -470,8 +470,6 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     ledgerOpenCode = err && typeof err.code === "string" && /^[A-Z0-9_]{1,64}$/.test(err.code) ? err.code : "LEDGER_OPEN_FAILED";
   }
   const ledgerStats = { write_failed: 0, late_dropped: 0, ack_event_failed: 0, ledger_full: 0 };
-  // Issue #5: sends between the capacity check and their ledger record (each holds one record slot).
-  let ledgerReserved = 0;
   const LOCAL = "local";
   const tracks = (nonce) => ledger !== null && ledger.has(nonce);
   // SPEC §9.1 adapters; the defaults read nothing and prove nothing (today's behaviour).
@@ -1170,27 +1168,23 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       }
       inflight.add(key);
     }
-    // Issue #5: a full ledger refuses the send before anything is injected (fail closed): no accepted inject
-    // without a correlation record.
-    const slot = ledger !== null && ledger.mode === "read_write";
-    if (slot) {
-      const cap = ledger.capacity(ledgerReserved);
-      if (!cap.ok) {
-        if (key !== null) inflight.delete(key);
-        ledgerStats.ledger_full += 1;
-        return fail(cap.code, { accepted: false });
-      }
-      ledgerReserved += 1;
+    // Issue #5 / review 1 B1: the ledger reserves the record before anything is injected (fail closed): a
+    // refusal is typed and nothing is sent; an accepted inject's create uses the reserved slot.
+    const slot = ledger !== null && ledger.mode === "read_write" ? ledger.reserve() : null;
+    if (slot && !slot.ok) {
+      if (key !== null) inflight.delete(key);
+      ledgerStats[slot.code === "LEDGER_FULL" ? "ledger_full" : "write_failed"] += 1;
+      return fail(slot.code, { accepted: false });
     }
     try {
-      return await sendNew(target, text, requestId, bodySha, key, destination);
+      return await sendNew(target, text, requestId, bodySha, key, destination, slot ? slot.reservation : undefined);
     } finally {
       if (key !== null) inflight.delete(key);
-      if (slot) ledgerReserved -= 1;
+      if (slot) ledger.release(slot.reservation);
     }
   });
 
-  async function sendNew(target, text, requestId, bodySha, key, destination) {
+  async function sendNew(target, text, requestId, bodySha, key, destination, reservation) {
     if (closing) return fail("TRANSPORT_CLOSING");
     if (noteLock()) return fail("STORE_LOCK_LOST");
     if (!flushHeld()) return fail(noteLock() ? "STORE_LOCK_LOST" : "STORE_DEGRADED");
@@ -1268,7 +1262,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       settle({ target_epoch: obs.body.session_epoch });
     }
     const rec = S.requests[rkey];
-    if (ledger) openLedgerRecord(rec, destination, correlationId);
+    if (ledger) openLedgerRecord(rec, destination, correlationId, reservation);
     return ok({
       inject_id: b.inject_id, target, nonce, correlation_id: correlationId, reply_to: inboxId, accepted: true,
       delivery: b.bootstrap_queued === true ? "queued" : "unknown",
@@ -1301,7 +1295,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
   }
 
   // Correlation record for an accepted inject: daemon acceptance is hop evidence (transport_accepted) only.
-  function openLedgerRecord(rec, destination, correlationId) {
+  function openLedgerRecord(rec, destination, correlationId, reservation) {
     const leg1 = { host: LOCAL, session: rec.target };
     const relayed = destination !== undefined;
     const c = ledger.createRequest({
@@ -1309,7 +1303,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       destination: relayed ? { host: destination.host, session: destination.session } : leg1,
       via: relayed ? leg1 : null, via_generation: relayed ? rec.target_epoch : null,
       reply_to: { host: LOCAL, session: rec.reply_to }, generation: relayed ? null : rec.target_epoch,
-      payload_sha256: rec.payload_sha256, deadline_ms: rec.expires_at - rec.sent_at,
+      payload_sha256: rec.payload_sha256, deadline_ms: rec.expires_at - rec.sent_at, reservation,
     });
     if (!c.ok) { ledgerStats[c.code === "LEDGER_FULL" ? "ledger_full" : "write_failed"] += 1; return; }
     ledger.recordEvent({

@@ -219,9 +219,12 @@ Retiring is a marker: the record, its reply files and its outbox items stay, and
 records do not count toward the record bound (issue #5): when the non-retired records reach it,
 `createRequest` retires the records past `retain_until_ms` and re-checks. They still count toward the
 4 MiB byte bound, so a long-running ledger eventually returns `LEDGER_FULL` (fail closed, with a code)
-until an operator prunes it. The transport asks the ledger (`capacity`, counting sends still in flight)
-before it injects: a full ledger refuses the send with `LEDGER_FULL` (`accepted:false`, nothing injected,
-counted in `ledger.ledger_full`, not `write_failed`), so no accepted inject is left without a record.
+until an operator prunes it. The transport reserves the record (`reserve`) before it injects: the ledger
+retires the records past `retain_until_ms` in their own commit, then holds one record and 8 KiB (a largest
+record plus its `transport_accepted` event) in memory until the send's create uses it or the send ends;
+every other commit keeps the held slots free. A full ledger refuses the send with `LEDGER_FULL`
+(`accepted:false`, nothing injected, counted in `ledger.ledger_full`, not `write_failed`), so no accepted
+inject is left without a record for lack of room (review 1 B1).
 
 Outbox items: `state` is the transport fact (`queued → intent → sent | failed | uncertain`, §10) and
 `quarantine: null | {reason, at}` is a review marker. Reasons:

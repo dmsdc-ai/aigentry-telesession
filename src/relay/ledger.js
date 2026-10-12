@@ -47,7 +47,7 @@ const ERRNO_RE = /^E[A-Z0-9]{1,31}$/;
 const TMP_RE = /^\.(?:ledger\.json|[0-9a-f]{32}-[0-9a-f]{64}\.json)\.[0-9a-f]{16}\.tmp$/;
 const REPLY_FILE_RE = /^([0-9a-f]{32})-([0-9a-f]{64})\.json$/;
 const LOCK_BYTES = 4096;
-const RECORD_MARGIN_BYTES = 4096;
+const RECORD_MARGIN_BYTES = 8192; // ≥ a largest record plus its transport_accepted event (test: 5669 B)
 const READ_ONLY_CODES = new Set(["EACCES", "EROFS", "EPERM"]);
 const DIR_FSYNC_IGNORED = new Set(["EISDIR", "EPERM", "EINVAL", "EBADF"]);
 
@@ -266,17 +266,23 @@ export function openLedger(opts, seams) {
   }
 
   let state;
+  // Review 1 B1/NB3: the committed file's size (no stringify per send) and the record slots held by sends
+  // between reserve() and their createRequest (in memory; each keeps RECORD_MARGIN_BYTES and one record free).
+  let stateBytes = 0;
+  const reservations = new Set();
   try {
     const r = readBounded(ledgerPath, LEDGER_LIMITS.ledgerBytes);
     if (r.status === "missing") {
       if (mode === "read_only" && readOnly !== true) throw new LedgerError("LEDGER_WRITE_FAILED", "EACCES");
       state = { schema: LEDGER_SCHEMA, version: LEDGER_VERSION, generation: 0, records: {}, outbox: {}, retired: [] };
+      stateBytes = Buffer.byteLength(JSON.stringify(state), "utf8");
     } else if (r.status !== "ok") {
       throw new LedgerError("LEDGER_CORRUPT", r.errno);
     } else {
       try { state = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(r.buf)); } catch { throw new LedgerError("LEDGER_CORRUPT"); }
       if (isPlain(state) && state.schema === LEDGER_SCHEMA && state.version !== LEDGER_VERSION) throw new LedgerError("LEDGER_VERSION_UNSUPPORTED");
       if (!isLedgerState(state)) throw new LedgerError("LEDGER_CORRUPT");
+      stateBytes = r.buf.length;
     }
   } catch (err) {
     releaseLock();
@@ -284,7 +290,8 @@ export function openLedger(opts, seams) {
     throw new LedgerError("LEDGER_CORRUPT", errnoName(err));
   }
 
-  function commit(mutator) {
+  // `own`: the reservation this commit consumes; every other reservation keeps its bytes free.
+  function commit(mutator, own = null) {
     if (mode !== "read_write") return fail("LEDGER_READ_ONLY");
     if (closed || lost) return fail("LEDGER_LOCK_LOST");
     const draft = structuredClone(state);
@@ -293,11 +300,13 @@ export function openLedger(opts, seams) {
     if (ret && ret.ok === false) return ret;
     draft.generation = state.generation + 1;
     const bytes = Buffer.from(JSON.stringify(draft), "utf8");
-    if (bytes.length > LEDGER_LIMITS.ledgerBytes) return fail("LEDGER_FULL");
+    const held = (reservations.size - (own !== null && reservations.has(own) ? 1 : 0)) * RECORD_MARGIN_BYTES;
+    if (bytes.length + held > LEDGER_LIMITS.ledgerBytes) return fail("LEDGER_FULL");
     if (!lockHeld()) return fail("LEDGER_LOCK_LOST");
     const w = atomicWrite(ledgerPath, bytes);
     if (!w.ok) return w;
     state = draft;
+    stateBytes = bytes.length;
     return { ok: true, value: ret };
   }
 
@@ -403,11 +412,14 @@ export function openLedger(opts, seams) {
     // Minted once at creation (the origin); immutable, never derived from request_id or nonce. null = unknown
     // (a record reconstructed after a crash: the wire id was not persisted).
     const correlationId = a.correlation_id === null ? null : a.correlation_id ?? randomBytes(16).toString("hex");
+    // Review 1 B1: a create holding a reservation (reserve()) uses that slot; the others' slots stay free.
+    const own = a.reservation !== undefined && reservations.has(a.reservation) ? a.reservation : null;
+    const others = reservations.size - (own !== null ? 1 : 0);
     const r = commit((d) => {
-      if (liveCount(d.records) >= LEDGER_LIMITS.records) {
+      if (liveCount(d.records) + others >= LEDGER_LIMITS.records) {
         const due = Object.values(d.records).filter((x) => t > x.retain_until_ms).map((x) => x.nonce);
         retire(d, due);
-        if (liveCount(d.records) >= LEDGER_LIMITS.records) return fail("LEDGER_FULL");
+        if (liveCount(d.records) + others >= LEDGER_LIMITS.records) return fail("LEDGER_FULL");
       }
       d.records[a.nonce] = {
         nonce: a.nonce, correlation_id: correlationId, request_id: a.request_id ?? null, origin: endpointOf(a.origin), destination: endpointOf(a.destination),
@@ -419,18 +431,35 @@ export function openLedger(opts, seams) {
         replies: [], next_seq: 1, checkpoint: null, ack_seq: null, first_ack_seq: null, unproven: {}, late_pending: [], events: [], rejected: {},
         ...(a.reconstructed === true ? { reconstructed: true } : {}),
       };
-    });
+    }, own);
+    if (r.ok && own !== null) reservations.delete(own);
     return r.ok ? { ok: true, deduplicated: false, correlation_id: correlationId } : r;
   }
 
-  // Issue #5: would a new record fit (non-retired records, counting `reserved` creates still in flight, and the
-  // byte bound with a record-sized margin)? Read-only; the transport asks before it sends (fail closed).
-  function capacity(reserved = 0) {
-    const t = now();
-    const live = Object.values(state.records).filter((r) => !r.retired_at && t <= r.retain_until_ms).length;
-    if (live + reserved >= LEDGER_LIMITS.records) return fail("LEDGER_FULL");
-    if (Buffer.byteLength(JSON.stringify(state), "utf8") + (reserved + 1) * RECORD_MARGIN_BYTES > LEDGER_LIMITS.ledgerBytes) return fail("LEDGER_FULL");
-    return { ok: true };
+  // Issue #5 / review 1 B1: hold one record slot (count and RECORD_MARGIN_BYTES) for a create that follows a
+  // send. Records past retain_until_ms are retired first in their own commit, so the reserved createRequest
+  // never retires and always fits; every other commit keeps the held bytes free. The transport reserves
+  // before it injects (fail closed) and releases afterwards (a no-op once createRequest consumed it).
+  function reserve() {
+    if (mode !== "read_write") return fail("LEDGER_READ_ONLY");
+    if (closed || lost) return fail("LEDGER_LOCK_LOST");
+    if (liveCount(state.records) + reservations.size >= LEDGER_LIMITS.records) {
+      const t = now();
+      const due = Object.values(state.records).filter((x) => !x.retired_at && t > x.retain_until_ms).map((x) => x.nonce);
+      if (due.length) {
+        const r = commit((d) => retire(d, due));
+        if (!r.ok) return r;
+      }
+      if (liveCount(state.records) + reservations.size >= LEDGER_LIMITS.records) return fail("LEDGER_FULL");
+    }
+    if (stateBytes + (reservations.size + 1) * RECORD_MARGIN_BYTES > LEDGER_LIMITS.ledgerBytes) return fail("LEDGER_FULL");
+    const reservation = Object.freeze({});
+    reservations.add(reservation);
+    return { ok: true, reservation };
+  }
+
+  function release(reservation) {
+    reservations.delete(reservation);
   }
 
   // An event/receipt may carry the correlation id; a different one is refused with no state change.
@@ -794,7 +823,7 @@ export function openLedger(opts, seams) {
 
   return Object.freeze({
     get mode() { return mode; },
-    createRequest, capacity, recordEvent, appendReply, readReplies, status, find, has, record,
+    createRequest, reserve, release, recordEvent, appendReply, readReplies, status, find, has, record,
     holdLate, latePending, readLateText, promoteLate, dropLate,
     enqueue, outbox, outboxTransition, sweepOutbox, prunable,
     close() {
