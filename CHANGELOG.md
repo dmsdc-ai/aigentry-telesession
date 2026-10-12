@@ -32,6 +32,12 @@ End-to-end delivery protocol (spec `docs/specs/2026-10-11-e2e-delivery-protocol.
   no other commit may use, including the reconstruction of lost records. The size check uses the committed
   file size (no full `JSON.stringify` per send). Near the byte bound, other ledger writes may now return
   `LEDGER_FULL` while sends are in flight (8 KiB per send).
+- Relay destination: the in-process relay passed only the session name to the transport send and dropped the
+  host the route resolved. It now passes the route's peer as `destination`; a local route (the target itself)
+  stays a direct send.
+- Receipt binding: `applyReceipts` accepts `injectIds` and refuses a receipt naming another inject
+  (`INJECT_MISMATCH`). Host and session were already bound by the ledger. No live caller passes `injectIds`
+  yet; `NO_RECEIPTS` remains the default.
 - Unit runner list (#6): `test:unit` now names every test file that runs without a real daemon (16 files,
   was 4), including the fake-adapter full-route proof (`test:e2e` still runs it alone); `test:real-daemon`
   names the rest; a guard test fails on an unnamed test file.
