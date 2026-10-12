@@ -103,6 +103,13 @@ Triggers: `workflow_dispatch` and pushes of tags matching `v*`.
 It creates no GitHub release, runs no `npm publish` and performs no deployment. `package.json` keeps
 `"private": true`, so npm would refuse a publish anyway.
 
+The real-daemon gate workflow is held in PR #3 pending repository workflow permission; until it lands, the
+real-daemon set is run locally before a release (command below) and its counts are recorded in the release notes.
+
+```
+TELESESSION_TEST_TELEPTY_DIR=<telepty source tree> node --test test/real-daemon-restart.test.js test/transport-telepty.test.js test/mcp.test.js
+```
+
 ## Configured versus actually run
 
 These workflow files only **configure** CI. A pass exists only once a run on GitHub shows green for the

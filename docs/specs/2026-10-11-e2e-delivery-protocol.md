@@ -438,7 +438,9 @@ Slice 2 (task #2026101110):
 (e) in-process relay runner + `telesession-relay-tick` CLI (§10); (f) retention lifecycle, outbox quarantine
 and `telesession-ledger-prune --dry-run` (§6.1, §11); (g) post-expiry lookup by nonce / request_id /
 correlation_id and `read_reply` from the ledger (§8); (h) provenance/receipt adapters + full-route isolated
-E2E (§9.1); (i) required real-daemon CI gate (`.github/workflows/real-daemon.yml`, docs/ci.md); (j) review
+E2E (§9.1); (i) real-daemon CI gate: the workflow is held in PR #3 pending repository workflow permission;
+until it lands, the real-daemon set is run locally before a release (docs/ci.md) and its counts are recorded in
+the release notes; (j) review
 follow-ups N5, N11 (fail-closed reconstruction), N14, N17, S4.
 
 ## 14. Test matrix (new files under `test/`)
