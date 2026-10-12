@@ -114,7 +114,7 @@ TELESESSION_TEST_TELEPTY_DIR=<telepty source tree> node --test test/real-daemon-
 
 The same set is `npm run test:real-daemon`. `test:unit` names every test file that runs without a real daemon
 or the MCP SDK (`transport-telepty` too: its real-daemon block is skipped NOTRUN there); `test:e2e` runs the
-fake-adapter full-route proof. `test/test-runners.test.js` fails when a test file is named by none of them.
+fake-adapter full-route proof on its own (it is daemon-free, so `test:unit` names it too). `test/test-runners.test.js` fails when a test file is named by none of them.
 
 ## Configured versus actually run
 
