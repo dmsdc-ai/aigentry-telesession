@@ -22,6 +22,9 @@ export const LEDGER_LIMITS = Object.freeze({
   replyFileBytes: 6 * 65536 + 4096, eventsPerRecord: 64, retired: 256, latePending: 4, outboxTextChars: 8000,
   retainMs: 7 * 86400000, sendAttempts: 3,
 });
+// SPEC 2026-10-12 §4.2: applied path-S receipt identities per record; a new identity at the bound is refused
+// (RECEIPT_LIMIT), never evicted (an evicted identity would pass the replay check again, I-5).
+export const APPLIED_RECEIPTS_MAX = 16;
 export const STAGES = Object.freeze(["transport_accepted", "durable_received", "agent_consumed", "processing_completed", "origin_ack_received"]);
 
 const EVENT_STAGES = new Set(["transport_accepted", "durable_received", "agent_consumed", "processing_completed", "rejected"]);
@@ -39,6 +42,7 @@ const dropText = (o) => {
 const HEX32_RE = /^[0-9a-f]{32}$/;
 const HEX64_RE = /^[0-9a-f]{64}$/;
 const REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+const INJECT_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const HOST_RE = /^[A-Za-z0-9._:\[\]-]{1,253}$/;
 const SID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const KIND_RE = /^[a-z][a-z0-9_]{0,31}$/;
@@ -93,6 +97,9 @@ function isRecord(key, r) {
     && (r.correlation_id === undefined || r.correlation_id === null || HEX32_RE.test(r.correlation_id))
     && (r.retired_at === undefined || r.retired_at === null || typeof r.retired_at === "string")
     && (r.reconstructed === undefined || typeof r.reconstructed === "boolean")
+    && (r.origin_inject_id === undefined || r.origin_inject_id === null || (typeof r.origin_inject_id === "string" && INJECT_ID_RE.test(r.origin_inject_id)))
+    && (r.applied_receipts === undefined || (Array.isArray(r.applied_receipts) && r.applied_receipts.length <= APPLIED_RECEIPTS_MAX
+      && r.applied_receipts.every((x) => typeof x === "string" && HEX64_RE.test(x))))
     && isPlain(r.stages) && Array.isArray(r.replies) && r.replies.every(isReplyEntry) && Number.isSafeInteger(r.next_seq) && r.next_seq >= 1
     && Array.isArray(r.events) && Array.isArray(r.late_pending) && r.late_pending.every(isLateEntry) && isPlain(r.rejected) && isPlain(r.unproven)
     && Number.isSafeInteger(r.created_ms) && Number.isSafeInteger(r.deadline_ms) && Number.isSafeInteger(r.retain_until_ms);
@@ -399,7 +406,8 @@ export function openLedger(opts, seams) {
         || !(a.via === undefined || a.via === null || isEndpoint(a.via))
         || !(a.generation === null || (typeof a.generation === "string" && a.generation.length > 0 && a.generation.length <= 256))
         || !HEX64_RE.test(a.payload_sha256 || "") || !Number.isSafeInteger(a.deadline_ms) || a.deadline_ms < 0
-        || !(a.correlation_id === undefined || a.correlation_id === null || HEX32_RE.test(a.correlation_id))) {
+        || !(a.correlation_id === undefined || a.correlation_id === null || HEX32_RE.test(a.correlation_id))
+        || !(a.origin_inject_id === undefined || a.origin_inject_id === null || (typeof a.origin_inject_id === "string" && INJECT_ID_RE.test(a.origin_inject_id)))) {
       return fail("INVALID_ARGUMENT");
     }
     const prior = state.records[a.nonce];
@@ -430,6 +438,8 @@ export function openLedger(opts, seams) {
         created_ms: t, deadline_ms: t + a.deadline_ms, retain_until_ms: t + Math.max(retainMs, a.deadline_ms),
         replies: [], next_seq: 1, checkpoint: null, ack_seq: null, first_ack_seq: null, unproven: {}, late_pending: [], events: [], rejected: {},
         ...(a.reconstructed === true ? { reconstructed: true } : {}),
+        // SPEC 2026-10-12 §1.1: the inject the delivering daemon minted for this origin's send (I).
+        ...(typeof a.origin_inject_id === "string" ? { origin_inject_id: a.origin_inject_id } : {}),
       };
     }, own);
     if (r.ok && own !== null) reservations.delete(own);
@@ -479,6 +489,7 @@ export function openLedger(opts, seams) {
     if (!rec) return fail("UNKNOWN_CORRELATION");
     if (isRetired(rec)) return reject(rec.nonce, "RETIRED");
     if (!EVENT_STAGES.has(ev.stage) || !isEndpoint(ev.from)) return fail("INVALID_ARGUMENT");
+    if (ev.receipt_identity !== undefined && !(typeof ev.receipt_identity === "string" && HEX64_RE.test(ev.receipt_identity))) return fail("INVALID_ARGUMENT");
     if (correlationMismatch(rec, ev.correlation_id)) return fail("CORRELATION_MISMATCH");
     if (ev.payload_sha256 !== rec.payload_sha256) return reject(rec.nonce, "HASH_MISMATCH");
     if (rec.terminal) return fail("TERMINAL");
@@ -500,6 +511,13 @@ export function openLedger(opts, seams) {
     if (final && !learn && (rec.generation === null || ev.generation !== rec.generation)) return reject(rec.nonce, "GENERATION_MISMATCH");
     // Review N14: a recorded final ACK is not undone by a later refusal (counted, not applied).
     if (ev.stage === "rejected" && rec.stages.origin_ack_received !== null) return reject(rec.nonce, "REJECT_AFTER_ACK");
+    // SPEC 2026-10-12 §1.3 B9: a path-S receipt identity applies once; it is stored in the event's commit.
+    const identity = ev.receipt_identity === undefined ? null : ev.receipt_identity;
+    if (identity !== null) {
+      const appliedIds = Array.isArray(rec.applied_receipts) ? rec.applied_receipts : [];
+      if (appliedIds.includes(identity)) return { ok: true, applied: false, deduplicated: true, stage: rec.stage };
+      if (appliedIds.length >= APPLIED_RECEIPTS_MAX) return fail("RECEIPT_LIMIT");
+    }
     // A final reply is part of the completion event's identity: a later final reply is a new event.
     const replySha = ev.stage === "processing_completed" && typeof ev.reply_sha256 === "string" && HEX64_RE.test(ev.reply_sha256) ? `:${ev.reply_sha256}` : "";
     const key = `${rec.payload_sha256}:${hopKey(ev.from)}:${ev.stage}${replySha}`;
@@ -515,6 +533,7 @@ export function openLedger(opts, seams) {
     const r = commit((d) => {
       const q = d.records[rec.nonce];
       if (learn) q.generation = ev.generation;
+      if (identity !== null) q.applied_receipts = [...(Array.isArray(q.applied_receipts) ? q.applied_receipts : []), identity];
       q.events.push(key);
       while (q.events.length > LEDGER_LIMITS.eventsPerRecord) q.events.shift();
       if (ev.stage === "rejected") {

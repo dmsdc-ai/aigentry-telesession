@@ -4,9 +4,13 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { generateKeyPairSync, sign, createHash } from "node:crypto";
 import { canonicalJson, RECEIPT_SIG_DOMAIN, verifyReceiptSig, keyIdOf } from "../src/relay/receipt-sig.js";
 import { createRouteResolver, RouteError } from "../src/relay/route.js";
+import { openLedger, LEDGER_VERSION, APPLIED_RECEIPTS_MAX } from "../src/relay/ledger.js";
 
 const b64url = (buf) => buf.toString("base64url");
 function keyPair() {
@@ -94,4 +98,82 @@ test("N-3 key_id ≠ fingerprint of its SPKI, one key_id under two peers, and ma
   ];
   for (const table of bad) assert.throws(() => createRouteResolver(table), (e) => e instanceof RouteError && e.code === "ROUTE_TABLE_INVALID");
   assert.doesNotThrow(() => createRouteResolver([peer("mac", [{ key_id: a.keyId, public_key_spki_b64: a.spki }]), peer("linux", [])]));
+});
+
+// ── §7 step 3: src/relay/ledger.js origin_inject_id, applied_receipts (bounded 16, same commit) ──
+
+const sha = (s) => createHash("sha256").update(s, "utf8").digest("hex");
+const NONCE = "1".repeat(32);
+const CID = "c".repeat(32);
+const LEG1 = { host: "local", session: "target-1" };
+const DEST = { host: "mac", session: "w" };
+
+function tmpLedger(t, opts = {}) {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "telesession-rb-"));
+  const dir = path.join(base, "ledger");
+  let l = openLedger({ dir, ...opts });
+  t.after(() => { l.close(); fs.rmSync(base, { recursive: true, force: true }); });
+  return { get l() { return l; }, dir, reopen() { l.close(); l = openLedger({ dir, ...opts }); return l; } };
+}
+function relayedRecord(l, extra = {}) {
+  return l.createRequest({
+    nonce: NONCE, correlation_id: CID, request_id: null, origin: { host: "local", session: "inbox" }, destination: DEST, via: LEG1, via_generation: "ep",
+    reply_to: { host: "local", session: "inbox" }, generation: null, payload_sha256: sha("p"), deadline_ms: 60000, origin_inject_id: "I-1", ...extra,
+  });
+}
+const destEvent = (stage, extra = {}) => ({
+  nonce: NONCE, stage, payload_sha256: sha("p"), correlation_id: CID, from: DEST, hop: "destination", generation: "E1", learn_generation: true, authenticated: true, ...extra,
+});
+
+test("step 3 createRequest stores origin_inject_id (validated); LEDGER_VERSION stays 1", (t) => {
+  const h = tmpLedger(t);
+  assert.equal(LEDGER_VERSION, 1);
+  assert.equal(relayedRecord(h.l, { origin_inject_id: "bad id" }).code, "INVALID_ARGUMENT");
+  assert.equal(relayedRecord(h.l).ok, true);
+  assert.equal(h.l.record(NONCE).origin_inject_id, "I-1");
+  assert.equal(h.reopen().record(NONCE).origin_inject_id, "I-1", "persisted");
+});
+
+test("step 3 recordEvent receipt_identity: appended in the same commit as the event; a present identity is deduplicated; 16 bound → RECEIPT_LIMIT, never evicted", (t) => {
+  const h = tmpLedger(t);
+  relayedRecord(h.l);
+  const id = (n) => sha(`mac/J-${n}/processing_completed`);
+  const apply = (n) => {
+    const text = `reply ${n}`;
+    const a = h.l.appendReply({ nonce: NONCE, text, from: DEST, verified: true, correlation_id: CID });
+    return h.l.recordEvent(destEvent("processing_completed", { reply_seq: a.seq, reply_sha256: sha(text), receipt_identity: id(n) }));
+  };
+  assert.equal(apply(1).applied, true);
+  assert.deepEqual(h.l.record(NONCE).applied_receipts, [id(1)]);
+  const dup = h.l.recordEvent(destEvent("agent_consumed", { receipt_identity: id(1) }));
+  assert.deepEqual([dup.ok, dup.applied, dup.deduplicated], [true, false, true], "identity present → deduplicated, even for another event");
+  assert.deepEqual(h.l.recordEvent(destEvent("agent_consumed", { receipt_identity: id(1), check_only: true })).deduplicated, true);
+  for (let n = 2; n <= APPLIED_RECEIPTS_MAX; n++) assert.equal(apply(n).applied, true, `identity ${n}`);
+  assert.equal(APPLIED_RECEIPTS_MAX, 16);
+  const before = h.l.record(NONCE);
+  assert.deepEqual(h.l.recordEvent(destEvent("processing_completed", { reply_sha256: sha("x"), receipt_identity: id(17) })), { ok: false, code: "RECEIPT_LIMIT" });
+  assert.deepEqual(h.l.recordEvent(destEvent("processing_completed", { reply_sha256: sha("x"), receipt_identity: id(17), check_only: true })), { ok: false, code: "RECEIPT_LIMIT" });
+  assert.deepEqual(h.l.record(NONCE), before, "no state change at the bound");
+  assert.equal(h.l.recordEvent(destEvent("agent_consumed", { receipt_identity: id(3) })).deduplicated, true, "an applied identity still dedupes at the bound");
+  assert.equal(h.l.recordEvent(destEvent("agent_consumed", { receipt_identity: "nothex" })).code, "INVALID_ARGUMENT");
+});
+
+test("step 3 a tampered origin_inject_id or applied_receipts in ledger.json → LEDGER_CORRUPT on open", (t) => {
+  const h = tmpLedger(t);
+  relayedRecord(h.l);
+  h.l.close();
+  const file = path.join(h.dir, "ledger.json");
+  const good = fs.readFileSync(file, "utf8");
+  for (const patch of [{ origin_inject_id: "bad id" }, { origin_inject_id: 7 }, { applied_receipts: ["x"] }, { applied_receipts: "x" },
+    { applied_receipts: Array.from({ length: 17 }, (_, i) => sha(String(i))) }]) {
+    const st = JSON.parse(good);
+    Object.assign(st.records[NONCE], patch);
+    fs.writeFileSync(file, JSON.stringify(st), { mode: 0o600 });
+    assert.throws(() => openLedger({ dir: h.dir }), (e) => e.code === "LEDGER_CORRUPT", JSON.stringify(patch));
+  }
+  const st = JSON.parse(good);
+  Object.assign(st.records[NONCE], { origin_inject_id: null, applied_receipts: Array.from({ length: 16 }, (_, i) => sha(String(i))) });
+  fs.writeFileSync(file, JSON.stringify(st), { mode: 0o600 });
+  h.reopen();
+  assert.equal(h.l.record(NONCE).applied_receipts.length, 16);
 });
