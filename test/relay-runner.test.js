@@ -324,6 +324,31 @@ describe("relay runner inside the transport and the one-shot CLI (loopback fake 
     assert.equal(ledger.outbox().find((x) => x.key === key).state, "uncertain");
   });
 
+  // Round 2 review B-1: REQUEST_IN_FLIGHT (a same-id send is in flight) is not a proven non-send; retrying it under
+  // a new attempt key escapes the same-id dedupe and delivers the text twice.
+  test("B-1 REQUEST_IN_FLIGHT is uncertain, never retried with a new attempt key: the text is delivered once", async (t) => {
+    const { fake, ledger, tr } = await transportSetup(t);
+    const s = await tr.send({ target: "target-1", text: "origin job" });
+    const { key } = ledger.enqueue({ nonce: s.nonce, to: { host: "local", session: "target-1" }, kind: "relay", text: "relayed hop text" });
+    const realFetch = globalThis.fetch;
+    let release; const gate = new Promise((r) => { release = r; });
+    let hold = true;
+    t.mock.method(globalThis, "fetch", async (url, init) => {
+      if (hold && isInject(url, init)) { hold = false; await gate; }
+      return realFetch(url, init);
+    });
+    const ext = tr.send({ target: "target-1", text: "relayed hop text", request_id: `relay:${key}` });
+    await new Promise((r) => setTimeout(r, 200));
+    const one = await tr.relayTick();
+    release();
+    assert.equal((await ext).accepted, true);
+    assert.deepEqual(one.uncertain, [key], JSON.stringify(one));
+    await tr.relayTick();
+    const n = fake.sessions.get("target-1").delivered.filter((d) => d.prompt.endsWith("\nrelayed hop text")).length;
+    assert.equal(n, 1, "the relay text is delivered exactly once");
+    assert.equal(ledger.outbox().find((x) => x.key === key).state, "uncertain");
+  });
+
   test("relay enabled by config ticks on its own inside the transport and stops on close", async (t) => {
     const { ledger, tr } = await transportSetup(t, { relayIntervalMs: 1000 });
     const s = await tr.send({ target: "target-1", text: "origin job" });
