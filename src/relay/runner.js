@@ -23,7 +23,14 @@ export function createRelayRunner({ ledger, send, resolver, intervalMs = 0, maxI
 
   async function run() {
     try {
-      if (typeof ledger.sweepOutbox === "function") ledger.sweepOutbox();
+      // A failed sweep leaves expired/retired items unquarantined: no claim or send on top of it (TS2).
+      if (typeof ledger.sweepOutbox === "function") {
+        const sw = ledger.sweepOutbox();
+        if (!sw || sw.ok !== true) {
+          lastResult = { error: "RELAY_SWEEP_FAILED" };
+          return { ok: false, code: "RELAY_SWEEP_FAILED" };
+        }
+      }
       const out = await relayTick({ ledger, send, resolver, maxItems, deadlineAt: now() + maxTickMs, now });
       lastResult = Object.fromEntries(BUCKETS.map((k) => [k, out[k].length]));
       return { ok: true, ...out };
