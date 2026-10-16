@@ -279,6 +279,51 @@ describe("relay runner inside the transport and the one-shot CLI (loopback fake 
     assert.equal((await tr.health()).relay.last_result.sent, 1);
   });
 
+  // Mac re-review TS3: a definite non-send (connection refused at the inject POST) must be retried with a new
+  // POST on the next tick, not answered from the transport's persisted refusal; an ambiguous one never is.
+  const refused = () => new TypeError("fetch failed", { cause: Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }) });
+  const isInject = (url, init) => init && init.method === "POST" && /\/inject$/.test(String(url));
+
+  test("TS3 connection refused at the inject: requeued, then the next tick POSTs again and is sent once", async (t) => {
+    const { fake, ledger, tr } = await transportSetup(t);
+    const s = await tr.send({ target: "target-1", text: "origin job" });
+    assert.equal(s.ok, true, JSON.stringify(s));
+    const { key } = ledger.enqueue({ nonce: s.nonce, to: { host: "local", session: "target-1" }, kind: "relay", text: "relayed hop text" });
+    const realFetch = globalThis.fetch;
+    let refuseNext = true;
+    t.mock.method(globalThis, "fetch", async (url, init) => {
+      if (refuseNext && isInject(url, init)) { refuseNext = false; throw refused(); }
+      return realFetch(url, init);
+    });
+    const before = fake.injectArrivals.length;
+    const one = await tr.relayTick();
+    assert.deepEqual(one.requeued, [key], JSON.stringify(one));
+    assert.equal(fake.injectArrivals.length, before, "the refused POST never reached the daemon");
+    const two = await tr.relayTick();
+    assert.deepEqual(two.sent, [key], JSON.stringify(two));
+    assert.equal(fake.injectArrivals.length, before + 1, "exactly one new POST");
+    const o = ledger.outbox().find((x) => x.key === key);
+    assert.deepEqual([o.state, o.attempts, o.receipt.transport_id], ["sent", 1, fake.injectsTo("target-1").at(-1).inject_id]);
+  });
+
+  test("TS3 control: an inject whose response is lost is uncertain and never POSTed again", async (t) => {
+    const { fake, ledger, tr } = await transportSetup(t);
+    const s = await tr.send({ target: "target-1", text: "origin job" });
+    const { key } = ledger.enqueue({ nonce: s.nonce, to: { host: "local", session: "target-1" }, kind: "relay", text: "relayed hop text" });
+    const realFetch = globalThis.fetch;
+    let loseNext = true;
+    t.mock.method(globalThis, "fetch", async (url, init) => {
+      const res = await realFetch(url, init);
+      if (loseNext && isInject(url, init)) { loseNext = false; await res.arrayBuffer(); throw new TypeError("fetch failed"); }
+      return res;
+    });
+    const before = fake.injectArrivals.length;
+    assert.deepEqual((await tr.relayTick()).uncertain, [key]);
+    assert.deepEqual((await tr.relayTick()).uncertain, [key]);
+    assert.equal(fake.injectArrivals.length, before + 1, "one POST in total");
+    assert.equal(ledger.outbox().find((x) => x.key === key).state, "uncertain");
+  });
+
   test("relay enabled by config ticks on its own inside the transport and stops on close", async (t) => {
     const { ledger, tr } = await transportSetup(t, { relayIntervalMs: 1000 });
     const s = await tr.send({ target: "target-1", text: "origin job" });

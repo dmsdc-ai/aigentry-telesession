@@ -43,7 +43,7 @@ export async function relayTick({ ledger, send, resolver, maxItems = Infinity, d
     attempted += 1;
     let r;
     try {
-      r = await send({ key: cur.key, nonce: cur.nonce, kind: cur.kind, peer_id: route.peer_id, locator: route.locator, session: route.session, text: cur.text });
+      r = await send({ key: cur.key, nonce: cur.nonce, kind: cur.kind, peer_id: route.peer_id, locator: route.locator, session: route.session, text: cur.text, attempt: cur.attempts });
     } catch {
       r = { ok: false, sent: "unknown", code: "SEND_THREW" };
     }
