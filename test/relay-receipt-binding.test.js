@@ -11,6 +11,7 @@ import { generateKeyPairSync, sign, createHash } from "node:crypto";
 import { canonicalJson, RECEIPT_SIG_DOMAIN, verifyReceiptSig, keyIdOf } from "../src/relay/receipt-sig.js";
 import { createRouteResolver, RouteError } from "../src/relay/route.js";
 import { openLedger, LEDGER_VERSION, APPLIED_RECEIPTS_MAX } from "../src/relay/ledger.js";
+import { applyReceipts } from "../src/relay/adapters.js";
 
 const b64url = (buf) => buf.toString("base64url");
 function keyPair() {
@@ -176,4 +177,87 @@ test("step 3 a tampered origin_inject_id or applied_receipts in ledger.json → 
   fs.writeFileSync(file, JSON.stringify(st), { mode: 0o600 });
   h.reopen();
   assert.equal(h.l.record(NONCE).applied_receipts.length, 16);
+});
+
+// ── §7 step 4: src/relay/adapters.js path S (B0–B9, B6g, no provenance call) vs path D (unchanged) ──
+
+const THROWING_PROVENANCE = Object.freeze({ verify() { throw new Error("path S must not consult the provenance adapter"); } });
+function v2(k, over = {}, attested = null) {
+  const body = { ...BODY, correlation_id: CID, origin_inject_id: "I-1", final_inject_id: "J-1", stage: "agent_consumed", ...over };
+  if (attested) body.attested_by = { ...body.attested_by, ...attested };
+  return signed(k, body);
+}
+function pathS(t, { keys = [], extra } = {}) {
+  const h = tmpLedger(t);
+  relayedRecord(h.l, extra);
+  const table = [{ peer_id: "local", locators: ["local"] }, { peer_id: "mac", locators: ["mac"], receipt_keys: keys.map((k) => ({ key_id: k.keyId, public_key_spki_b64: k.spki })) }];
+  return { h, apply: (receipts, o = {}) => applyReceipts({ ledger: h.l, nonce: NONCE, receipts, provenance: THROWING_PROVENANCE, pinnedKeys: createRouteResolver(o.table || table), localPeer: "local" }) };
+}
+const OUT = (o) => ({ applied: 0, unproven: 0, deduplicated: 0, refused: {}, ...o });
+
+test("step 4 path S: a v2 receipt signed under the key pinned for O's own name binds; reply names I, J, final_session, key_id; provenance never consulted", (t) => {
+  const k = keyPair();
+  const { h, apply } = pathS(t, { keys: [k] });
+  assert.deepEqual(apply([v2(k), v2(k, { stage: "processing_completed", seq: 2 })]), OUT({ applied: 2 }));
+  const st = h.l.status({ nonce: NONCE });
+  assert.deepEqual([st.stage, st.reply_count, st.unproven], ["origin_ack_received", 1, {}]);
+  const [entry] = h.l.readReplies({ nonce: NONCE, cursor: 0 }).replies;
+  const body = JSON.parse(entry.text.split("\n").slice(1).join("\n"));
+  assert.deepEqual([entry.attestation, entry.from], ["destination", DEST]);
+  assert.deepEqual([body.origin_inject_id, body.final_inject_id, body.final_session, body.key_id, body.host], ["I-1", "J-1", "w", k.keyId, "mac"]);
+  assert.equal(h.l.record(NONCE).applied_receipts.length, 2);
+});
+
+test("step 4 path S refusal order B0–B7: each refuses with its code, changes no stage and sets no marker", (t) => {
+  const k = keyPair();
+  const other = keyPair();
+  const { h, apply } = pathS(t, { keys: [k] });
+  const v1 = { correlation_id: CID, inject_id: "J-1", stage: "agent_consumed", role: "final", seq: 1, at: "x", attested_by: { sid: "w", epoch: "E1" }, auth_basis: "own_bearer" };
+  const cases = [
+    [{ junk: true }, "INVALID_RECEIPT"],
+    [v1, "SIGNATURE_REQUIRED"],
+    [{ ...v2(k), inject_id: "J-2" }, "INVALID_RECEIPT"],
+    [{ ...v2(k), v: 3 }, "INVALID_RECEIPT"],
+    [v2(k, { correlation_id: "f".repeat(32) }), "CORRELATION_MISMATCH"],
+    [{ ...v2(k), role: "hop" }, "HOP_FACT_ONLY"],
+    [{ ...v2(k), auth_basis: "daemon_token" }, "NOT_OWN_BEARER"],
+    [v2(k, { origin_inject_id: "I-2" }), "INJECT_MISMATCH"],
+    [v2(k, { origin_inject_id: null }), "INJECT_MISMATCH"],
+    [v2(other), "KEY_UNKNOWN"],
+    [{ ...v2(k), stage: "processing_completed" }, "SIGNATURE_INVALID"],
+    [v2(k, { session_guard: null }), "F_GUARD_ABSENT"],
+    [v2(k, { session_guard: "other" }), "F_GUARD_ABSENT"],
+    [v2(k, { final_session: "x" }, { sid: "x" }), "SOURCE_MISMATCH"],
+    [v2(k, {}, { sid: "x" }), "SOURCE_MISMATCH"],
+    [v2(k, {}, { epoch: "E2" }), "SOURCE_MISMATCH"],
+  ];
+  for (const [i, [r, code]] of cases.entries()) assert.deepEqual(apply([r]), OUT({ refused: { [code]: 1 } }), `${i} ${code}`);
+  const st = h.l.status({ nonce: NONCE });
+  assert.deepEqual([st.stage, st.unproven, st.reply_count, st.rejected], ["unknown", {}, 0, {}]);
+});
+
+test("step 4 path S: B3 INJECT_UNKNOWN without rec.origin_inject_id; B5 SOURCE_MISMATCH for a key pinned under another peer; terminal → STALE_AFTER_TERMINAL; B9 dedupe", (t) => {
+  const k = keyPair();
+  const g = keyPair();
+  const noI = pathS(t, { keys: [k], extra: { origin_inject_id: undefined } });
+  assert.deepEqual(noI.apply([v2(k)]), OUT({ refused: { INJECT_UNKNOWN: 1 } }));
+  const { h, apply } = pathS(t, { keys: [k] });
+  const table = [{ peer_id: "local", locators: ["local"] }, { peer_id: "mac", locators: ["mac"], receipt_keys: [{ key_id: k.keyId, public_key_spki_b64: k.spki }] },
+    { peer_id: "linux", locators: ["linux"], receipt_keys: [{ key_id: g.keyId, public_key_spki_b64: g.spki }] }];
+  assert.deepEqual(apply([v2(g)], { table }), OUT({ refused: { SOURCE_MISMATCH: 1 } }));
+  assert.deepEqual(apply([v2(k), v2(k), v2(k, { seq: 9, at: "later" })]), OUT({ applied: 1, deduplicated: 2 }));
+  assert.deepEqual(apply([v2(k, { stage: "rejected", final_inject_id: "J-2" })]), OUT({ applied: 1 }));
+  assert.equal(h.l.status({ nonce: NONCE }).status, "rejected");
+  assert.deepEqual(apply([v2(k, { stage: "processing_completed", final_inject_id: "J-3" })]), OUT({ refused: { STALE_AFTER_TERMINAL: 1 } }));
+});
+
+test("step 4 path selection by record: a local direct record (via null, destination local) keeps the 8016f25 rule even for a v2-shaped receipt", (t) => {
+  const k = keyPair();
+  const h = tmpLedger(t);
+  h.l.createRequest({ nonce: NONCE, correlation_id: CID, request_id: null, origin: { host: "local", session: "inbox" }, destination: { host: "local", session: "w" },
+    reply_to: { host: "local", session: "inbox" }, generation: "E1", payload_sha256: sha("p"), deadline_ms: 60000, origin_inject_id: "J-1" });
+  const r = { ...v2(k, { origin_inject_id: "ignored" }), sig: "A".repeat(86) };
+  // No allowlisted provenance → the 8016f25 unproven path (marker), and the bad signature is never evaluated.
+  assert.deepEqual(applyReceipts({ ledger: h.l, nonce: NONCE, receipts: [r], injectIds: ["J-1"], pinnedKeys: createRouteResolver([{ peer_id: "local", locators: ["local"] }]) }), OUT({ unproven: 1 }));
+  assert.deepEqual(applyReceipts({ ledger: h.l, nonce: NONCE, receipts: [{ ...r, inject_id: "J-9", final_inject_id: "J-9" }], injectIds: ["J-1"] }), OUT({ refused: { INJECT_MISMATCH: 1 } }));
 });

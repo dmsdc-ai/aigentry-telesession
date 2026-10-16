@@ -11,10 +11,14 @@
  *     (`role:"final"`, `auth_basis:"own_bearer"`) AND its provenance is proven; otherwise the stage stays
  *     unproven with REMOTE_PROVENANCE_UNAVAILABLE. A proven `processing_completed` receipt is validated as an
  *     event first; only an accepted (or already-applied) one is then stored as a verified reply entry, so the origin agent's cursor/checkpoint covers it (→ origin_ack_received).
+ * SPEC 2026-10-12 §1.3 (path selection by record, never by receipt): a local direct record (path D) keeps the
+ * rule above unchanged; a relayed or cross-host direct record (path S) accepts only a signed v2 receipt
+ * (B0–B9) under a key pinned for O's own name of the destination, and never consults the provenance adapter.
  * Pure over the ledger API; no I/O of its own.
  */
 
 import { createHash } from "node:crypto";
+import { verifyReceiptSig } from "./receipt-sig.js";
 
 const HEX32_RE = /^[0-9a-f]{32}$/;
 const HOST_RE = /^[A-Za-z0-9._:\[\]-]{1,253}$/;
@@ -26,6 +30,11 @@ const AT_RE = /^[0-9A-Za-z.:+-]{1,64}$/;
 const EPOCH_RE = /^[\x21-\x7e]{1,256}$/;
 const RECEIPT_STAGES = new Set(["agent_consumed", "processing_completed", "rejected"]);
 const RECEIPTS_MAX = 64;
+const KEY_ID_RE = /^ed25519:[A-Za-z0-9_-]{43}$/;
+const SIG_RE = /^[A-Za-z0-9_-]{86}$/;
+const HEX64_RE = /^[0-9a-f]{64}$/;
+const GUARD_RE = /^[A-Za-z0-9._:-]{1,64}$/;
+const SESSION_GUARD = "peer-scope-v1";
 
 const sha256hex = (s) => createHash("sha256").update(s, "utf8").digest("hex");
 const isPlain = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -56,19 +65,94 @@ function isReceipt(r) {
     && typeof r.attested_by.epoch === "string" && EPOCH_RE.test(r.attested_by.epoch);
 }
 
+// SPEC 2026-10-12 §2.2: the v2 shape on top of the v1 one (bounded fields; inject_id is the final inject J).
+export function isReceiptV2(r) {
+  if (!isReceipt(r) || r.v !== 2) return false;
+  const a = r.attested_by;
+  return typeof r.final_inject_id === "string" && INJECT_ID_RE.test(r.final_inject_id) && r.inject_id === r.final_inject_id
+    && (r.origin_inject_id === null || (typeof r.origin_inject_id === "string" && INJECT_ID_RE.test(r.origin_inject_id)))
+    && typeof r.final_session === "string" && SID_RE.test(r.final_session)
+    && typeof r.final_session_epoch === "string" && EPOCH_RE.test(r.final_session_epoch)
+    && (r.at === null || typeof r.at === "string")
+    && (a.generation === null || (Number.isSafeInteger(a.generation) && a.generation >= 0))
+    && (r.delivered_payload_sha256 === null || (typeof r.delivered_payload_sha256 === "string" && HEX64_RE.test(r.delivered_payload_sha256)))
+    && (r.session_guard === null || (typeof r.session_guard === "string" && GUARD_RE.test(r.session_guard)))
+    && typeof r.key_id === "string" && KEY_ID_RE.test(r.key_id) && typeof r.sig === "string" && SIG_RE.test(r.sig);
+}
+
+// Path S, B0–B7 (first failing check refuses; no state change, no marker, never evaluated as v1 or unproven).
+// Returns a refusal code, or null when the receipt may go to the ledger (B8/B9).
+function signedRefusal(r, rec, destPeer, pinnedKeys) {
+  if (!isReceipt(r)) return "INVALID_RECEIPT";
+  if (r.v === undefined && r.sig === undefined) return "SIGNATURE_REQUIRED";
+  if (!isReceiptV2(r)) return "INVALID_RECEIPT";
+  if (r.correlation_id !== rec.correlation_id) return "CORRELATION_MISMATCH";
+  if (r.role !== "final") return "HOP_FACT_ONLY";
+  if (r.auth_basis !== "own_bearer") return "NOT_OWN_BEARER";
+  if (typeof rec.origin_inject_id !== "string") return "INJECT_UNKNOWN";
+  const bound = rec.via !== null
+    ? r.origin_inject_id === rec.origin_inject_id
+    : r.final_inject_id === rec.origin_inject_id && r.origin_inject_id === null;                 // B4d cross-host direct
+  if (!bound) return "INJECT_MISMATCH";
+  const keys = pinnedKeys && destPeer !== null ? pinnedKeys.receiptKeys(destPeer) : new Map();
+  if (!keys.has(r.key_id)) {
+    const other = pinnedKeys ? pinnedKeys.peerOfKey(r.key_id) : null;
+    return other !== null && other !== destPeer && verifyReceiptSig(r, pinnedKeys.receiptKeys(other)).ok ? "SOURCE_MISMATCH" : "KEY_UNKNOWN";
+  }
+  if (!verifyReceiptSig(r, keys).ok) return "SIGNATURE_INVALID";
+  if (r.session_guard !== SESSION_GUARD) return "F_GUARD_ABSENT";
+  if (r.final_session !== rec.destination.session || r.attested_by.sid !== r.final_session
+      || r.attested_by.epoch !== r.final_session_epoch) return "SOURCE_MISMATCH";
+  return null;
+}
+
 // Receipts in the order fetched (out-of-order evidence is handled by the ledger: stages never regress).
 // `injectIds`: the inject(s) this origin knows carried the request. Fail closed: a receipt naming another
 // inject is refused (INJECT_MISMATCH), and with no known inject every receipt is refused (INJECT_UNKNOWN).
 // Host + session: a proven receipt is source-checked by the ledger (verified host + attested sid vs the
 // destination); an unproven one is source-checked here (attested sid) before its marker is set.
 // `attested_by.host_label` is not part of the binding (SPEC §9.1: the host is the verified sender host).
-export function applyReceipts({ ledger, nonce, receipts, provenance = DEFAULT_PROVENANCE, injectIds }) {
+// `pinnedKeys` (path S): the route resolver ({canonical, receiptKeys, peerOfKey}); `localPeer`: this node's own
+// peer id. Path S = `rec.via !== null` or a destination whose canonical peer is not `localPeer`.
+export function applyReceipts({ ledger, nonce, receipts, provenance = DEFAULT_PROVENANCE, injectIds, pinnedKeys = null, localPeer = "local" }) {
   const out = { applied: 0, unproven: 0, deduplicated: 0, refused: {} };
   const injects = new Set(injectIds === undefined || injectIds === null ? [] : injectIds);
   const refuse = (code) => { out.refused[code] = (out.refused[code] || 0) + 1; };
+  const canon = (host) => (pinnedKeys && typeof pinnedKeys.canonical === "function" ? pinnedKeys.canonical(host) : host);
   for (const r of (Array.isArray(receipts) ? receipts : []).slice(0, RECEIPTS_MAX)) {
     const rec = ledger.record(nonce);
     if (!rec) { refuse("UNKNOWN_CORRELATION"); continue; }
+    const destPeer = canon(rec.destination.host);
+    if (rec.via !== null || destPeer !== localPeer) {
+      const code = signedRefusal(r, rec, destPeer, pinnedKeys);
+      if (code !== null) { refuse(code); continue; }
+      if (rec.terminal) { refuse("STALE_AFTER_TERMINAL"); continue; }
+      const ev = {
+        nonce, stage: r.stage, payload_sha256: rec.payload_sha256, correlation_id: r.correlation_id, from: rec.destination, hop: "destination",
+        generation: r.final_session_epoch, learn_generation: true, authenticated: true,
+        receipt_identity: sha256hex(`${destPeer}/${r.final_inject_id}/${r.stage}`),
+      };
+      if (r.stage === "processing_completed") {
+        // §4.1: the verified reply entry names I, J, the final session and the key; host = O's own name.
+        const text = `[telesession receipt stage=processing_completed]\n${JSON.stringify({
+          correlation_id: r.correlation_id, inject_id: r.inject_id, seq: r.seq, at: r.at,
+          attested_by: { sid: r.attested_by.sid, epoch: r.attested_by.epoch, generation: r.attested_by.generation }, auth_basis: r.auth_basis,
+          origin_inject_id: r.origin_inject_id, final_inject_id: r.final_inject_id, final_session: r.final_session, key_id: r.key_id,
+          host: rec.destination.host,
+        })}`;
+        const c = ledger.recordEvent({ ...ev, reply_sha256: sha256hex(text), check_only: true });
+        if (!c.ok) { refuse(c.code); continue; }
+        if (c.deduplicated) { out.deduplicated += 1; continue; }
+        const a = ledger.appendReply({ nonce, text, from: rec.destination, verified: true, correlation_id: r.correlation_id });
+        if (!a.ok) { refuse(a.code); continue; }
+        Object.assign(ev, { reply_seq: a.seq, reply_sha256: sha256hex(text) });
+      }
+      const e = ledger.recordEvent(ev);
+      if (e.ok && e.applied) out.applied += 1;
+      else if (e.ok) out.deduplicated += 1;
+      else refuse(e.code);
+      continue;
+    }
     if (!isReceipt(r)) { refuse("INVALID_RECEIPT"); continue; }
     if (r.correlation_id !== rec.correlation_id) { refuse("CORRELATION_MISMATCH"); continue; }
     if (r.role !== "final") { refuse("HOP_FACT_ONLY"); continue; }

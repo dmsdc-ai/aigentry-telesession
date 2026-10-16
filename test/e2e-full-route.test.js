@@ -107,28 +107,29 @@ describe("full route: origin → leg-1 → relay → fake final daemon → final
   // inject, which the origin never learns (leg-1 relays from its own process). The fail-closed inject binding
   // therefore refuses every relayed receipt (INJECT_MISMATCH, counted in the adapter result): no stage, no
   // marker, no reply; the request stays pending until the protocol carries the origin's inject id back.
+  // SPEC 2026-10-12 §1.3 (U1): a relayed record is path S, so these v1 receipts are refused SIGNATURE_REQUIRED.
   const refusedAtOrigin = (originLedger, s, seam) => applyReceipts({
     ledger: originLedger, nonce: s.nonce, receipts: seam.receipts.get(s.correlation_id), injectIds: [s.inject_id],
     provenance: createProvenanceAdapter({ allowedBases: [FAKE_PROOF_BASIS] }),
   });
 
-  test("relayed, proven provenance: final receipts are refused INJECT_MISMATCH (origin cannot bind the final inject); pending, no stage, no reply", async (t) => {
+  test("relayed, proven provenance: final receipts are refused SIGNATURE_REQUIRED (origin cannot bind the final inject); pending, no stage, no reply", async (t) => {
     const { s, origin, daemon, envelope, seam, originLedger } = await route(t, "proven");
     daemon.attest(envelope, "agent_consumed");
     daemon.attest(envelope, "processing_completed");
     const st = await origin.requestStatus({ request_id: "e2e-1", cursor: 0 });
     assert.deepEqual([st.status, st.stage, st.stages.agent_consumed, st.unproven], ["pending", "transport_accepted", "unknown", {}], JSON.stringify(st));
     assert.deepEqual([st.reply_count, st.final_ack_seq], [0, null]);
-    assert.deepEqual(refusedAtOrigin(originLedger, s, seam), { applied: 0, unproven: 0, deduplicated: 0, refused: { INJECT_MISMATCH: 2 } });
+    assert.deepEqual(refusedAtOrigin(originLedger, s, seam), { applied: 0, unproven: 0, deduplicated: 0, refused: { SIGNATURE_REQUIRED: 2 } });
   });
 
-  test("relayed, unproven provenance: receipts are refused INJECT_MISMATCH before any marker; pending, no REMOTE_PROVENANCE_UNAVAILABLE marker", async (t) => {
+  test("relayed, unproven provenance: receipts are refused SIGNATURE_REQUIRED before any marker; pending, no REMOTE_PROVENANCE_UNAVAILABLE marker", async (t) => {
     const { s, origin, daemon, envelope, seam, originLedger } = await route(t, "unproven");
     daemon.attest(envelope, "agent_consumed");
     daemon.attest(envelope, "processing_completed");
     const st = await origin.requestStatus({ request_id: "e2e-1", cursor: 0 });
     assert.deepEqual([st.status, st.stage, st.unproven, st.reply_count, st.final_ack_seq], ["pending", "transport_accepted", {}, 0, null], JSON.stringify(st));
-    assert.deepEqual(refusedAtOrigin(originLedger, s, seam), { applied: 0, unproven: 0, deduplicated: 0, refused: { INJECT_MISMATCH: 2 } });
+    assert.deepEqual(refusedAtOrigin(originLedger, s, seam), { applied: 0, unproven: 0, deduplicated: 0, refused: { SIGNATURE_REQUIRED: 2 } });
   });
 
   test("relayed: duplicate, out-of-order and replayed receipts are all refused; repeated pulls change nothing; a foreign correlation stays not_tracked", async (t) => {
@@ -141,7 +142,7 @@ describe("full route: origin → leg-1 → relay → fake final daemon → final
       const st = await origin.requestStatus({ correlation_id: s.correlation_id });
       assert.deepEqual([st.status, st.stage, st.reply_count, st.final_ack_seq, st.unproven], ["pending", "transport_accepted", 0, null, {}], JSON.stringify(st));
     }
-    assert.deepEqual(refusedAtOrigin(originLedger, s, seam), { applied: 0, unproven: 0, deduplicated: 0, refused: { INJECT_MISMATCH: 3 } });
+    assert.deepEqual(refusedAtOrigin(originLedger, s, seam), { applied: 0, unproven: 0, deduplicated: 0, refused: { SIGNATURE_REQUIRED: 3 } });
     assert.equal((await origin.requestStatus({ correlation_id: "f".repeat(32) })).status, "not_tracked");
   });
 
@@ -213,13 +214,13 @@ describe("full route: origin → leg-1 → relay → fake final daemon → final
     const l = openLedger({ dir: path.join(base, "ledger") });
     t.after(() => { l.close(); fs.rmSync(base, { recursive: true, force: true }); });
     l.createRequest({
-      nonce: s.nonce, correlation_id: s.correlation_id, request_id: null, origin: { host: "local", session: "inbox" }, destination: FINAL,
-      via: { host: "local", session: "target-1" }, via_generation: "ep", reply_to: { host: "local", session: "inbox" }, generation: null,
+      nonce: s.nonce, correlation_id: s.correlation_id, request_id: null, origin: { host: "local", session: "inbox" }, destination: { host: "local", session: FINAL.session },
+      via: null, reply_to: { host: "local", session: "inbox" }, generation: "E1",
       payload_sha256: sha("p"), deadline_ms: 60000,
     });
     const prov = createProvenanceAdapter({ allowedBases: [FAKE_PROOF_BASIS] });
     const hop = { correlation_id: s.correlation_id, inject_id: "i1", stage: "processing_completed", role: "hop", seq: 1, at: "x",
-      attested_by: { host_label: FINAL.host, sid: FINAL.session, epoch: FINAL_EPOCH }, auth_basis: "own_bearer", verified_sender_host: FINAL.host, sender_proof: { basis: FAKE_PROOF_BASIS } };
+      attested_by: { host_label: "local", sid: FINAL.session, epoch: FINAL_EPOCH }, auth_basis: "own_bearer", verified_sender_host: "local", sender_proof: { basis: FAKE_PROOF_BASIS } };
     const out = applyReceipts({ ledger: l, nonce: s.nonce, receipts: [
       hop, { ...hop, role: "final", auth_basis: "daemon_token" }, { ...hop, role: "final", correlation_id: "f".repeat(32) }, { junk: true }, null,
     ], provenance: prov });
@@ -231,19 +232,21 @@ describe("full route: origin → leg-1 → relay → fake final daemon → final
 
 // Review 3 B2: a proven processing_completed receipt the ledger refuses stores no reply entry; N-c: bounded fields.
 describe("applyReceipts: a refused proven receipt stores nothing (review 3 B2, N-c)", () => {
+  // SPEC 2026-10-12 §7 step 6 (iii): the 8016f25 rule is the path-D rule (I-7), so these run on a local direct record.
+  const DEST = { host: "local", session: FINAL.session };
   const CID = "a".repeat(32);
   const N = "1".repeat(32);
   const prov = createProvenanceAdapter({ allowedBases: [FAKE_PROOF_BASIS] });
   const rc = (o) => ({ correlation_id: CID, inject_id: "i1", stage: "processing_completed", role: "final", seq: 1, at: "2026-10-12T00:00:00.000Z",
-    attested_by: { host_label: FINAL.host, sid: FINAL.session, epoch: "E1" }, auth_basis: "own_bearer", verified_sender_host: FINAL.host,
+    attested_by: { host_label: "local", sid: FINAL.session, epoch: "E1" }, auth_basis: "own_bearer", verified_sender_host: "local",
     sender_proof: { basis: FAKE_PROOF_BASIS }, ...o });
   function mk(t) {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "telesession-b2-"));
     const l = openLedger({ dir: path.join(base, "ledger") });
     t.after(() => { l.close(); fs.rmSync(base, { recursive: true, force: true }); });
     assert.equal(l.createRequest({
-      nonce: N, correlation_id: CID, request_id: null, origin: { host: "local", session: "inbox" }, destination: FINAL,
-      via: { host: "local", session: "t1" }, via_generation: "ep", reply_to: { host: "local", session: "inbox" }, generation: null,
+      nonce: N, correlation_id: CID, request_id: null, origin: { host: "local", session: "inbox" }, destination: DEST,
+      via: null, reply_to: { host: "local", session: "inbox" }, generation: "E1",
       payload_sha256: sha("p"), deadline_ms: 60000,
     }).ok, true);
     return l;
@@ -279,14 +282,14 @@ describe("applyReceipts: a refused proven receipt stores nothing (review 3 B2, N
   test("receipt binding: resolves to the original inject_id + host + session; another inject, host or session is refused", async (t) => {
     const l = mk(t);
     assert.deepEqual(await NO_RECEIPTS.fetch(CID), []);
-    const wrong = [rc({ inject_id: "i-other" }), rc({ verified_sender_host: "other-peer" }), rc({ attested_by: { host_label: FINAL.host, sid: "other-sid", epoch: "E1" } })];
+    const wrong = [rc({ inject_id: "i-other" }), rc({ verified_sender_host: "other-peer" }), rc({ attested_by: { host_label: "local", sid: "other-sid", epoch: "E1" } })];
     assert.deepEqual(applyReceipts({ ledger: l, nonce: N, receipts: wrong, provenance: prov, injectIds: ["i1"] }),
       { applied: 0, unproven: 0, deduplicated: 0, refused: { INJECT_MISMATCH: 1, SOURCE_MISMATCH: 2 } });
     assert.deepEqual([l.status({ nonce: N }).reply_count, l.status({ nonce: N }).stage], [0, "unknown"]);
     assert.equal(applyReceipts({ ledger: l, nonce: N, receipts: [rc()], provenance: prov, injectIds: ["i1"] }).applied, 1);
     const [entry] = l.readReplies({ nonce: N, cursor: 0 }).replies;
     const body = JSON.parse(entry.text.split("\n").slice(1).join("\n"));
-    assert.deepEqual([body.inject_id, body.provenance.host, body.attested_by.sid, entry.from], ["i1", FINAL.host, FINAL.session, FINAL]);
+    assert.deepEqual([body.inject_id, body.provenance.host, body.attested_by.sid, entry.from], ["i1", DEST.host, DEST.session, DEST]);
   });
 
   // Follow-up 2: fail closed when no inject id is known for the correlation (refused + counted, nothing stored).
@@ -304,7 +307,7 @@ describe("applyReceipts: a refused proven receipt stores nothing (review 3 B2, N
   test("unproven receipt with a mismatched source: SOURCE_MISMATCH, no REMOTE_PROVENANCE_UNAVAILABLE marker", (t) => {
     const l = mk(t);
     const unproven = (o) => rc({ verified_sender_host: undefined, sender_proof: undefined, ...o });
-    const out = applyReceipts({ ledger: l, nonce: N, receipts: [unproven({ attested_by: { host_label: FINAL.host, sid: "other-sid", epoch: "E1" } })], provenance: prov, injectIds: ["i1"] });
+    const out = applyReceipts({ ledger: l, nonce: N, receipts: [unproven({ attested_by: { host_label: "local", sid: "other-sid", epoch: "E1" } })], provenance: prov, injectIds: ["i1"] });
     assert.deepEqual(out, { applied: 0, unproven: 0, deduplicated: 0, refused: { SOURCE_MISMATCH: 1 } });
     assert.deepEqual(l.status({ nonce: N }).unproven, {});
     assert.deepEqual(applyReceipts({ ledger: l, nonce: N, receipts: [unproven()], provenance: prov, injectIds: ["i1"] }), { applied: 0, unproven: 1, deduplicated: 0, refused: {} });
@@ -316,7 +319,7 @@ describe("applyReceipts: a refused proven receipt stores nothing (review 3 B2, N
     const bad = [
       rc({ at: "2".repeat(65) }), rc({ at: 7 }), rc({ inject_id: "i".repeat(129) }), rc({ inject_id: "i\n1" }),
       rc({ attested_by: { host_label: "h".repeat(254), sid: FINAL.session, epoch: "E1" } }),
-      rc({ attested_by: { host_label: FINAL.host, sid: FINAL.session, epoch: "E\u00001" } }),
+      rc({ attested_by: { host_label: "local", sid: FINAL.session, epoch: "E\u00001" } }),
     ];
     assert.deepEqual(applyReceipts({ ledger: l, nonce: N, receipts: bad, provenance: prov }), { applied: 0, unproven: 0, deduplicated: 0, refused: { INVALID_RECEIPT: 6 } });
     const s = l.status({ nonce: N });
