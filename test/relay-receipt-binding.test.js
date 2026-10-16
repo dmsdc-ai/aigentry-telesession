@@ -404,6 +404,8 @@ const pendingNoMarker = (l, nonce = NONCE) => {
 };
 
 async function daemonCall(fake, method, p, body) {
+  // Loopback fake daemon only: its origin is http://127.0.0.1:<port> and every call is an /api/ path.
+  if (!/^http:\/\/127\.0\.0\.1:\d{1,5}$/.test(fake.origin) || !/^\/api\/[^/]/.test(p)) throw new Error("daemonCall: loopback fake daemon /api/ paths only");
   const res = await fetch(fake.origin + p, { method, headers: { "x-telepty-token": fake.token, "content-type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
   return { status: res.status, body: await res.json() };
 }

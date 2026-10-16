@@ -42,6 +42,8 @@
   The transport's default resolver now reports a non-local destination as `PEER_UNKNOWN` instead of
   `ROUTE_UNRESOLVED`. Local relay items and an origin `send` with a remote `destination` (the relayed model through
   the local leg-1 target) are unchanged.
+- Snyk Code review of 1391aaf/904d7c8: the U1 test helper `daemonCall` (`test/relay-receipt-binding.test.js`) now
+  refuses anything but the loopback fake daemon's origin and an `/api/` path. Test-only; no src change.
 
 ## 0.2.0 — 2026-10-12
 
