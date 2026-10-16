@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Added
+
+- Relayed-receipt binding, origin side (#2026101110 U1, #8, #7; spec `docs/specs/2026-10-12-relayed-receipt-binding.md`).
+  Receipts are checked by record type. A local direct record keeps the 0.2.0 rule unchanged. A relayed or cross-host
+  direct record ("path S") accepts only a v2 receipt from the final daemon. That receipt must be signed (Ed25519,
+  verified with `node:crypto`; there is no signing code in `src/`) with a key pinned in the route resolver's new
+  optional per-peer `receipt_keys`, under the origin's own name for the destination. It is then checked in the
+  B0–B9 order: correlation, origin inject, key, signature, `session_guard`, final session, stage rules, and
+  a once-only receipt identity. A refused receipt is counted with its code. It changes no state, sets no marker and
+  is never evaluated as v1 or unproven. A relayed v1 receipt is now refused `SIGNATURE_REQUIRED` instead of
+  `INJECT_MISMATCH`; the outcome (refused) is the same.
+- The ledger record gains two optional fields, `origin_inject_id` and `applied_receipts` (bounded at 16; at the bound a
+  new identity is refused with `RECEIPT_LIMIT` and nothing is evicted). `LEDGER_VERSION` stays `1`, so a 0.2.0 build
+  still opens the ledger. A direct record now stays bound through `origin_inject_id` after the store purges its request.
+- `telesession_request_status` gains an optional `receipt_refusals` field holding the refusals from the last receipt
+  pull, omitted when there are none.
+- Nothing changes in a live deployment by default. The default receipt adapter stays `NO_RECEIPTS` and no
+  `receipt_keys` are pinned. Production completion needs telepty#100/#111/#113 and the operator approval in spec
+  §2.5/§4.4. The tests run only against synthetic fixtures (`test/helpers/fake-receipts.js`, `fake-telepty.js`,
+  `relay-context.js`).
+
 ### Fixed
 
 - Relay sends to another host fail closed (#2026101110 U2). The transport injects only into its local telepty
