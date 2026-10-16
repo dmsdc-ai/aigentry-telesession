@@ -2,7 +2,7 @@
 // SYNTHETIC final daemon (test/helpers/fake-receipts.js). Keys are generated in this process only and never
 // persisted. Nothing here is evidence that telepty#100 / #111 / #113 exist (SPEC §2.4, §5).
 
-import { test } from "node:test";
+import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -11,7 +11,11 @@ import { generateKeyPairSync, sign, createHash } from "node:crypto";
 import { canonicalJson, RECEIPT_SIG_DOMAIN, verifyReceiptSig, keyIdOf } from "../src/relay/receipt-sig.js";
 import { createRouteResolver, RouteError } from "../src/relay/route.js";
 import { openLedger, LEDGER_VERSION, APPLIED_RECEIPTS_MAX } from "../src/relay/ledger.js";
-import { applyReceipts } from "../src/relay/adapters.js";
+import { applyReceipts, createProvenanceAdapter } from "../src/relay/adapters.js";
+import { normalizeConfig, createTeleptyTransport } from "../src/index.js";
+import { makeSandbox, readJson, writeStateDir } from "./helpers/fault-fs.js";
+import { startFakeTelepty } from "./helpers/fake-telepty.js";
+import { FAKE_PROOF_BASIS } from "./helpers/fake-receipts.js";
 
 const b64url = (buf) => buf.toString("base64url");
 function keyPair() {
@@ -260,4 +264,95 @@ test("step 4 path selection by record: a local direct record (via null, destinat
   // No allowlisted provenance → the 8016f25 unproven path (marker), and the bad signature is never evaluated.
   assert.deepEqual(applyReceipts({ ledger: h.l, nonce: NONCE, receipts: [r], injectIds: ["J-1"], pinnedKeys: createRouteResolver([{ peer_id: "local", locators: ["local"] }]) }), OUT({ unproven: 1 }));
   assert.deepEqual(applyReceipts({ ledger: h.l, nonce: NONCE, receipts: [{ ...r, inject_id: "J-9", final_inject_id: "J-9" }], injectIds: ["J-1"] }), OUT({ refused: { INJECT_MISMATCH: 1 } }));
+});
+
+// ── §7 step 5: src/transports/telepty.js wiring (origin_inject_id, known set, pinnedKeys, receipt_refusals) ──
+
+const NO_LOOPBACK = process.env.TELESESSION_TEST_NO_LOOPBACK === "1"
+  ? "NOTRUN: loopback bind/connect not permitted here (TELESESSION_TEST_NO_LOOPBACK=1)" : false;
+
+// One origin (O): fake daemon + store + ledger + transport; `receipts` is a settable list served by the adapter.
+async function originSide(t, { resolver, prefix = "ts-rb-" } = {}) {
+  const sb = makeSandbox(prefix);
+  const fake = await startFakeTelepty();
+  const served = new Map();
+  const adapter = { fetch: async (c) => structuredClone(served.get(c) || []), consumption: async () => ({ status: "unknown" }) };
+  const ledgerDir = path.join(sb.root, "ledger");
+  const open = [];
+  const make = ({ ledger = true } = {}) => {
+    const l = ledger ? openLedger({ dir: ledgerDir }) : null;
+    const cfg = normalizeConfig({ teleptyUrl: fake.origin, token: fake.token, targets: ["target-1"], inboxPrefix: "tsr", stateDir: sb.stateDir });
+    const tr = createTeleptyTransport(cfg, sb.seam(), {
+      ...(l ? { ledger: l } : {}), receipts: adapter, provenance: createProvenanceAdapter({ allowedBases: [FAKE_PROOF_BASIS] }), ...(resolver ? { resolver } : {}),
+    });
+    const o = { tr, l };
+    open.push(o);
+    return o;
+  };
+  const closeOne = async (o) => { await o.tr.close(); if (o.l) o.l.close(); open.splice(open.indexOf(o), 1); };
+  t.after(async () => { for (const o of [...open]) await closeOne(o); await fake.close(); sb.remove(); });
+  const ageStore = (key, ms) => {
+    const state = readJson(path.join(sb.stateDir, "state.json"));
+    for (const k of ["created_at", "sent_at", "expires_at", "retain_until"]) state.requests[key][k] -= ms;
+    fs.unlinkSync(path.join(sb.stateDir, "state.json"));
+    writeStateDir(sb.stateDir, state);
+  };
+  return { sb, fake, served, make, closeOne, ageStore };
+}
+const v1Direct = (s, epoch, stage, seq) => ({ correlation_id: s.correlation_id, inject_id: s.inject_id, stage, role: "final", seq, at: "2026-10-17T00:00:00.000Z",
+  attested_by: { host_label: "local", sid: "target-1", epoch }, auth_basis: "own_bearer", verified_sender_host: "local", sender_proof: { basis: FAKE_PROOF_BASIS } });
+
+describe("step 5 transport wiring (loopback fake telepty)", { skip: NO_LOOPBACK }, () => {
+  test("step 5 openLedgerRecord persists origin_inject_id = the send's inject_id", async (t) => {
+    const o = await originSide(t);
+    const { tr, l } = o.make();
+    const s = await tr.send({ target: "target-1", text: "job", request_id: "w-1" });
+    assert.equal(s.ok, true, JSON.stringify(s));
+    assert.equal(l.record(s.nonce).origin_inject_id, s.inject_id);
+  });
+
+  test("B-D2 direct after the store purged the request (ledger live): still bound through rec.origin_inject_id", async (t) => {
+    const o = await originSide(t);
+    const a = o.make();
+    const s = await a.tr.send({ target: "target-1", text: "job", request_id: "bd2" });
+    assert.equal(s.ok, true, JSON.stringify(s));
+    const epoch = o.fake.sessions.get("target-1").epoch;
+    await o.closeOne(a);
+    o.ageStore("r:bd2", 86400000 + 16 * 60 * 1000);
+    const b = o.make();
+    assert.equal((await b.tr.readReply({ nonce: s.nonce })).error.code, "NONCE_EXPIRED", "store record purged");
+    o.served.set(s.correlation_id, [v1Direct(s, epoch, "agent_consumed", 1), v1Direct(s, epoch, "processing_completed", 2)]);
+    const st = await b.tr.requestStatus({ nonce: s.nonce });
+    assert.deepEqual([st.stage, st.final_ack_seq, st.receipt_refusals], ["origin_ack_received", 1, undefined], JSON.stringify(st));
+  });
+
+  test("step 5 reconcileLedger: a reconstructed record carries the store's inject_id as origin_inject_id", async (t) => {
+    const o = await originSide(t);
+    const a = o.make({ ledger: false });
+    const s = await a.tr.send({ target: "target-1", text: "job", request_id: "rc-0" });
+    assert.equal(s.ok, true, JSON.stringify(s));
+    await o.closeOne(a);
+    const b = o.make();
+    assert.deepEqual([b.l.record(s.nonce).reconstructed, b.l.record(s.nonce).origin_inject_id], [true, s.inject_id]);
+  });
+
+  test("step 5 request_status: pinnedKeys from the configured resolver bind a relayed v2 receipt; receipt_refusals = last pull only, omitted when empty", async (t) => {
+    const k = keyPair();
+    const resolver = createRouteResolver([{ peer_id: "local", locators: ["local"] }, { peer_id: "mac", locators: ["mac"], receipt_keys: [{ key_id: k.keyId, public_key_spki_b64: k.spki }] }]);
+    const o = await originSide(t, { resolver });
+    const { tr } = o.make();
+    const s = await tr.send({ target: "target-1", text: "job", request_id: "ps-1", destination: DEST });
+    assert.equal(s.ok, true, JSON.stringify(s));
+    const rc = (stage, extra = {}) => v2(k, { correlation_id: s.correlation_id, origin_inject_id: s.inject_id, final_inject_id: "J-1", stage, ...extra });
+    const v1 = { correlation_id: s.correlation_id, inject_id: "J-1", stage: "agent_consumed", role: "final", seq: 1, at: "x", attested_by: { sid: "w", epoch: "E1" }, auth_basis: "own_bearer" };
+    o.served.set(s.correlation_id, [v1, rc("agent_consumed", { session_guard: null })]);
+    for (let i = 0; i < 2; i++) {
+      const st = await tr.requestStatus({ nonce: s.nonce });
+      assert.deepEqual([st.stage, st.receipt_refusals], ["transport_accepted", { SIGNATURE_REQUIRED: 1, F_GUARD_ABSENT: 1 }], `poll ${i}: ${JSON.stringify(st)}`);
+    }
+    o.served.set(s.correlation_id, [rc("agent_consumed"), rc("processing_completed", { seq: 2 })]);
+    const st = await tr.requestStatus({ nonce: s.nonce });
+    assert.deepEqual([st.stage, st.receipt_refusals, st.replies[0].attestation], ["origin_ack_received", undefined, "destination"], JSON.stringify(st));
+    assert.equal((await tr.requestStatus({ nonce: s.nonce, cursor: st.next_cursor })).status, "completed");
+  });
 });

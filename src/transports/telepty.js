@@ -40,6 +40,7 @@ const RECEIVER_BODY_CAP = 64 * 1024;
 const RECEIVER_TIMEOUT_MS = 5000;
 const RECEIVER_MAX_CONNECTIONS = 32;
 const STORE_MAX = 64;
+const REFUSALS_MAX = 64;
 const ISSUED_MAX = 16;
 const ISSUED_TTL_MS = 15 * 60 * 1000;
 const RETIRED_MAX = 256;
@@ -483,8 +484,12 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     const r = localRoutes.resolve(e);
     return !r.ok && r.code === "ROUTE_UNRESOLVED" ? { ok: false, code: "PEER_UNKNOWN" } : r;
   } });
+  // SPEC 2026-10-12 §2.3: path-S receipt keys are the ones pinned in this resolver (none by default → KEY_UNKNOWN).
+  const routes = ext.resolver || defaultResolver;
+  // §4.1 receipt_refusals: the refusals of the last pull per nonce (bounded, in memory; not a health counter).
+  const lastRefusals = new Map();
   const relay = ledger ? createRelayRunner({
-    ledger, resolver: ext.resolver || defaultResolver,
+    ledger, resolver: routes,
     intervalMs: ledger.mode === "read_write" ? cfg.relayIntervalMs : 0, send: transportSendPrimitive((a) => send(a), { localPeer: LOCAL }),
   }) : null;
 
@@ -1292,7 +1297,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
         nonce: q.nonce, correlation_id: null, reconstructed: true, request_id: q.request_id, origin: { host: LOCAL, session: q.reply_to },
         destination: { host: "unknown", session: q.target }, via: leg1, via_generation: q.target_epoch,
         reply_to: { host: LOCAL, session: q.reply_to }, generation: null, payload_sha256: q.payload_sha256,
-        deadline_ms: Math.max(0, q.expires_at - Date.now()),
+        deadline_ms: Math.max(0, q.expires_at - Date.now()), origin_inject_id: q.inject_id,
       });
       if (!c.ok) { if (c.code === "LEDGER_FULL") ledgerStats.ledger_full += 1; else if (c.code !== "NONCE_RETIRED") ledgerStats.write_failed += 1; continue; }
       ledger.recordEvent({
@@ -1311,7 +1316,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       destination: relayed ? { host: destination.host, session: destination.session } : leg1,
       via: relayed ? leg1 : null, via_generation: relayed ? rec.target_epoch : null,
       reply_to: { host: LOCAL, session: rec.reply_to }, generation: relayed ? null : rec.target_epoch,
-      payload_sha256: rec.payload_sha256, deadline_ms: rec.expires_at - rec.sent_at, reservation,
+      payload_sha256: rec.payload_sha256, deadline_ms: rec.expires_at - rec.sent_at, reservation, origin_inject_id: rec.inject_id,
     });
     if (!c.ok) { ledgerStats[c.code === "LEDGER_FULL" ? "ledger_full" : "write_failed"] += 1; return; }
     ledger.recordEvent({
@@ -1419,10 +1424,17 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     try {
       const list = await receiptAdapter.fetch(lr.correlation_id);
       const q = byNonce(nonce);
-      // The injects this origin knows carried the request: its own inject + its relay receipts for the nonce.
-      const injectIds = [q && q.inject_id, ...ledger.outbox().filter((o) => o.nonce === nonce && o.receipt).map((o) => o.receipt.transport_id)]
+      // The injects this origin knows carried the request: its own inject (the ledger's I outlives the store
+      // record, SPEC 2026-10-12 §1.1) + its relay receipts for the nonce.
+      const injectIds = [lr.origin_inject_id ?? (q && q.inject_id), ...ledger.outbox().filter((o) => o.nonce === nonce && o.receipt).map((o) => o.receipt.transport_id)]
         .filter((x) => typeof x === "string");
-      if (Array.isArray(list) && list.length) applyReceipts({ ledger, nonce, receipts: list, provenance: provenanceAdapter, injectIds });
+      const out = Array.isArray(list) && list.length
+        ? applyReceipts({ ledger, nonce, receipts: list, provenance: provenanceAdapter, injectIds, pinnedKeys: routes, localPeer: LOCAL }) : null;
+      lastRefusals.delete(nonce);
+      if (out && Object.keys(out.refused).length) {
+        lastRefusals.set(nonce, out.refused);
+        while (lastRefusals.size > REFUSALS_MAX) lastRefusals.delete(lastRefusals.keys().next().value);
+      }
       if (lr.via === null && q && q.inject_id && lr.stages.agent_consumed === null) {
         applyConsumption({ ledger, nonce, observation: await receiptAdapter.consumption(q.inject_id) });
       }
@@ -1449,8 +1461,10 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     if (st.lifecycle === undefined) return { ...st, ledger: { mode: ledger.mode, ...ledgerStats } };
     const q = byNonce(st.nonce);
     const live = Boolean(q) && isLive(q, Date.now());
+    const refusals = lastRefusals.get(st.nonce);
     return {
       ...st, ...(live ? {} : { status_reasons: [...st.status_reasons, "TRANSPORT_NONCE_EXPIRED"] }), transport_nonce: live ? "live" : "expired",
+      ...(refusals ? { receipt_refusals: { ...refusals } } : {}),
       ...ledgerReplies(st.nonce, cursor), ledger: { mode: ledger.mode, ...ledgerStats },
     };
   });
