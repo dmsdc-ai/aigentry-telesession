@@ -14,6 +14,7 @@
 import nodeFs from "node:fs";
 import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
+import { relayContextVariant, RELAY_HOP_MAX } from "./relay-context.js";
 
 export const LEDGER_SCHEMA = "telesession-ledger";
 export const LEDGER_VERSION = 1;
@@ -85,11 +86,18 @@ const liveCount = (records) => Object.values(records).filter((r) => !(isPlain(r)
 // tampered ledger.json cannot steer a read/unlink outside the replies dir.
 const isReplyEntry = (x) => isPlain(x) && Number.isSafeInteger(x.seq) && x.seq >= 1 && HEX64_RE.test(x.sha256) && isEndpoint(x.from);
 const isLateEntry = (x) => isPlain(x) && HEX64_RE.test(x.sha256);
+// SPEC 2026-10-12 §1.2 (U4): an R-side relay item carries the context R sends to F (an outgoing hop up to
+// RELAY_HOP_MAX + 1 is kept so the send refuses it, RELAY_HOP_LIMIT) and an ambiguous I lookup's code.
+const isOutboxRelayContext = (c) => relayContextVariant(c, { maxHop: RELAY_HOP_MAX + 1 }) === "final";
+const isOriginLookup = (x) => isPlain(x) && Object.keys(x).length === 2 && x.code === "ORIGIN_INJECT_AMBIGUOUS"
+  && (x.candidates === null || (Number.isSafeInteger(x.candidates) && x.candidates >= 0));
 const isOutboxItem = (k, o) => isPlain(o) && o.key === k && HEX32_RE.test(k) && OUTBOX_STATES.includes(o.state) && HEX32_RE.test(o.nonce)
   && isEndpoint(o.to) && typeof o.kind === "string" && KIND_RE.test(o.kind) && HEX64_RE.test(o.payload_sha256)
   && (o.quarantine === undefined || o.quarantine === null
     || (isPlain(o.quarantine) && QUARANTINE_REASONS.has(o.quarantine.reason) && typeof o.quarantine.at === "string"))
-  && (o.excerpt === undefined || (typeof o.excerpt === "string" && o.excerpt.length <= 2 * OUTBOX_EXCERPT_CHARS));
+  && (o.excerpt === undefined || (typeof o.excerpt === "string" && o.excerpt.length <= 2 * OUTBOX_EXCERPT_CHARS))
+  && (o.relay_context === undefined || o.relay_context === null || isOutboxRelayContext(o.relay_context))
+  && (o.origin_lookup === undefined || o.origin_lookup === null || isOriginLookup(o.origin_lookup));
 
 function isRecord(key, r) {
   return isPlain(r) && r.nonce === key && HEX32_RE.test(r.nonce) && HEX64_RE.test(r.payload_sha256)
@@ -766,11 +774,13 @@ export function openLedger(opts, seams) {
 
   // ── Outbox (driven by relay.js) ──
 
-  function enqueue({ nonce, to, kind, text } = {}) {
+  function enqueue({ nonce, to, kind, text, relay_context, origin_lookup } = {}) {
     if (mode !== "read_write") return fail("LEDGER_READ_ONLY");
     if (!state.records[nonce]) return fail("UNKNOWN_CORRELATION");
     if (!isEndpoint(to) || typeof kind !== "string" || !KIND_RE.test(kind) || typeof text !== "string"
-        || text.length < 1 || text.length > LEDGER_LIMITS.outboxTextChars || text.includes("\u0000")) {
+        || text.length < 1 || text.length > LEDGER_LIMITS.outboxTextChars || text.includes("\u0000")
+        || !(relay_context === undefined || relay_context === null || isOutboxRelayContext(relay_context))
+        || !(origin_lookup === undefined || origin_lookup === null || isOriginLookup(origin_lookup))) {
       return fail("INVALID_ARGUMENT");
     }
     const payload = sha256hex(text);
@@ -787,6 +797,8 @@ export function openLedger(opts, seams) {
       d.outbox[key] = {
         key, nonce, kind, to: endpointOf(to), payload_sha256: payload, text, state: "queued", attempts: 0,
         created_at: at, intent_at: null, receipt: null, last_error: null, quarantine: null,
+        ...(relay_context !== undefined ? { relay_context: relay_context === null ? null : structuredClone(relay_context) } : {}),
+        ...(origin_lookup !== undefined ? { origin_lookup: origin_lookup === null ? null : { ...origin_lookup } } : {}),
       };
     });
     return r.ok ? { ok: true, key, deduplicated: false } : r;

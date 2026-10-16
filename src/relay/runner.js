@@ -9,6 +9,7 @@
  */
 
 import { relayTick } from "./relay.js";
+import { RELAY_HOP_MAX } from "./relay-context.js";
 
 export const RELAY_TICK_LIMITS = Object.freeze({ maxItems: 16, maxTickMs: 5000 });
 
@@ -76,11 +77,16 @@ export function createRelayRunner({ ledger, send, resolver, intervalMs = 0, maxI
 // Fail closed (#2026101110 U2): the transport injects into its LOCAL daemon only, so an item for another
 // peer is refused before any inject (never delivered to a local same-name session). A real cross-host send
 // needs a daemon-side exact remote forward (telepty#111).
+// SPEC 2026-10-12 §1.2 (U4): an item's relay_context goes into the inject body verbatim. `hop > 4` is refused
+// before any inject (RELAY_HOP_LIMIT) as a definite non-send, like PEER_UNSUPPORTED: requeued, then `failed`
+// at max_attempts.
 export function transportSendPrimitive(send, { localPeer = "local" } = {}) {
   return async (item) => {
+    if (item.relay_context && item.relay_context.hop > RELAY_HOP_MAX) return { ok: false, sent: "no", code: "RELAY_HOP_LIMIT" };
     if (item.peer_id !== localPeer) return { ok: false, sent: "no", code: "PEER_UNSUPPORTED" };
     const r = await send({
       target: item.session, text: item.text, request_id: `relay:${item.key}`, destination: { host: item.peer_id, session: item.session },
+      ...(item.relay_context ? { relay_context: item.relay_context } : {}),
     });
     if (r && r.ok === true) {
       if (r.accepted === true && typeof r.inject_id === "string") return { ok: true, transport_id: r.inject_id };
