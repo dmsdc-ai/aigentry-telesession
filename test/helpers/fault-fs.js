@@ -19,6 +19,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
 
 // ── Fault-injecting wrapper over the real fs ──
@@ -43,7 +44,7 @@ export function createFaultFs({ base = fs } = {}) {
     const out = [];
     const take = (a) => {
       if (typeof a === "string") out.push(path.resolve(a));
-      else if (a instanceof URL) out.push(path.resolve(a.pathname));
+      else if (a instanceof URL) out.push(path.resolve(fileURLToPath(a)));
       else if (Buffer.isBuffer(a) && op !== "writeSync" && op !== "writeFileSync" && op !== "appendFileSync") out.push(path.resolve(a.toString()));
       else if (typeof a === "number" && fdPaths.has(a)) out.push(fdPaths.get(a));
     };

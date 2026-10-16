@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { generateKeyPairSync, sign, createHash } from "node:crypto";
 import { canonicalJson, RECEIPT_SIG_DOMAIN, verifyReceiptSig, keyIdOf } from "../src/relay/receipt-sig.js";
 import { createRouteResolver, RouteError } from "../src/relay/route.js";
@@ -942,7 +943,7 @@ test("C1 compat: an 8016f25 ledger (no new fields) opens under U1 code; a U1 led
 });
 
 test("§5 guard: no file in the repository working tree contains a PEM private-key header (keys are generated in-test only)", () => {
-  const root = path.join(path.dirname(new URL(import.meta.url).pathname), "..");
+  const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
   const pem = new RegExp("-----BEGIN [A-Z ]*" + "PRIVATE KEY-----");
   const hits = [];
   const walk = (dir) => {
