@@ -89,6 +89,10 @@ End-to-end delivery protocol (spec `docs/specs/2026-10-11-e2e-delivery-protocol.
 - Unit runner list (#6): `test:unit` now names every test file that runs without a real daemon (16 files,
   was 4), including the fake-adapter full-route proof (`test:e2e` still runs it alone); `test:real-daemon`
   names the rest; a guard test fails on an unnamed test file.
+- Snyk Code review of 8016f25: the inbox receiver is plain HTTP by design and binds `127.0.0.1` only; a new
+  test proves it refuses connections on `::1`, `127.0.0.2` (Linux) and every non-loopback interface (it fails
+  on a `0.0.0.0` or `::` bind). The daemon URL stays loopback-only by config. The test-only raw HTTP helper
+  now refuses any non-loopback URL. No src change.
 
 ### Spec change (for the spec owner)
 

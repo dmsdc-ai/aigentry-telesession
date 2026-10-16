@@ -7,6 +7,8 @@ import { describe, test, before, after, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { pathToFileURL } from "node:url";
@@ -23,10 +25,11 @@ function transportFor(origin, token, targets = ["target-1"], inboxPrefix = "tst"
   return createTeleptyTransport(normalizeConfig({ teleptyUrl: origin, token, targets, inboxPrefix }));
 }
 
-// Raw request (lets a test set Host / Origin / chunking, which fetch forbids).
+// Raw request (lets a test set Host / Origin / chunking, which fetch forbids). Loopback fixtures only.
 function rawRequest(url, { method = "POST", headers = {}, body, chunks } = {}) {
   return new Promise((resolve) => {
     const u = new URL(url);
+    if (u.protocol !== "http:" || u.hostname !== "127.0.0.1") throw new Error("rawRequest: loopback fixtures only");
     const req = http.request({ host: u.hostname, port: u.port, path: u.pathname + u.search, method, headers, agent: false }, (res) => {
       res.resume();
       res.on("end", () => resolve({ status: res.statusCode }));
@@ -308,6 +311,28 @@ describe("HTTP client and receiver limits (recording stub daemon)", () => {
     assert.equal(final.reply, "not_observed");
     assert.equal(final.pending_candidates, 0);
     assert.deepEqual(final.quarantined, { audit_unmatched: 64 });
+  });
+
+  // Snyk 73c8977b (cleartext HTTP server, src/transports/telepty.js createReceiver): the receiver is
+  // plain HTTP by design and must therefore be bound to 127.0.0.1 exactly — never a wildcard (0.0.0.0, ::).
+  test("receiver listens on 127.0.0.1 only: refused on ::1, on 127.0.0.2 (Linux) and on every non-loopback interface", async (t) => {
+    const stub = await startStubDaemon();
+    const tr = transportFor(stub.origin, freshToken());
+    t.after(async () => { await tr.close(); await stub.close(); });
+    assert.equal((await tr.send({ target: "target-1", text: "x" })).accepted, true);
+    const port = Number(new URL(stub.state.registerEndpoint).port);
+    const connects = (host) => new Promise((resolve) => {
+      const sock = net.connect({ host, port });
+      sock.setTimeout(2000, () => { sock.destroy(); resolve(false); });
+      sock.once("connect", () => { sock.destroy(); resolve(true); });
+      sock.once("error", () => resolve(false));
+    });
+    assert.equal(await connects("127.0.0.1"), true, "control: reachable on 127.0.0.1");
+    const others = ["::1", ...(process.platform === "linux" ? ["127.0.0.2"] : [])];
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const a of list || []) if (!a.internal) others.push(a.address);
+    }
+    for (const host of others) assert.equal(await connects(host), false, `receiver reachable on ${host}`);
   });
 
   test("bounded issued nonces (16), daemon restart observation, owned close and TRANSPORT_CLOSING", async (t) => {
