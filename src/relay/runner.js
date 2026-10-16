@@ -24,7 +24,14 @@ export function createRelayRunner({ ledger, send, resolver, intervalMs = 0, maxI
 
   async function run() {
     try {
-      if (typeof ledger.sweepOutbox === "function") ledger.sweepOutbox();
+      // A failed sweep leaves expired/retired items unquarantined: no claim or send on top of it (TS2).
+      if (typeof ledger.sweepOutbox === "function") {
+        const sw = ledger.sweepOutbox();
+        if (!sw || sw.ok !== true) {
+          lastResult = { error: "RELAY_SWEEP_FAILED" };
+          return { ok: false, code: "RELAY_SWEEP_FAILED" };
+        }
+      }
       const out = await relayTick({ ledger, send, resolver, maxItems, deadlineAt: now() + maxTickMs, now });
       lastResult = Object.fromEntries(BUCKETS.map((k) => [k, out[k].length]));
       return { ok: true, ...out };
@@ -74,6 +81,10 @@ export function createRelayRunner({ ledger, send, resolver, intervalMs = 0, maxI
 // transport.send record → relay contract. The relay key is the transport idempotency key, so a resend of
 // the same item can never inject twice. Refusals before any inject are definite non-sends ("no"). The
 // route's peer travels as `destination` (the same session name may exist on several hosts).
+// Durable attempt key (Mac re-review TS3): the ledger counts an attempt only after a proven non-send
+// (sent:"no"), so each such attempt gets its own request_id and is a new POST, never the transport's
+// persisted refusal of the previous attempt. Attempt 0 keeps `relay:<key>`; intent/uncertain/sent items
+// are never sent again, so an ambiguous or accepted attempt is never retried.
 // Fail closed (#2026101110 U2): the transport injects into its LOCAL daemon only, so an item for another
 // peer is refused before any inject (never delivered to a local same-name session). A real cross-host send
 // needs a daemon-side exact remote forward (telepty#111).
@@ -85,7 +96,7 @@ export function transportSendPrimitive(send, { localPeer = "local" } = {}) {
     if (item.relay_context && item.relay_context.hop > RELAY_HOP_MAX) return { ok: false, sent: "no", code: "RELAY_HOP_LIMIT" };
     if (item.peer_id !== localPeer) return { ok: false, sent: "no", code: "PEER_UNSUPPORTED" };
     const r = await send({
-      target: item.session, text: item.text, request_id: `relay:${item.key}`, destination: { host: item.peer_id, session: item.session },
+      target: item.session, text: item.text, request_id: item.attempt > 0 ? `relay:${item.key}:${item.attempt}` : `relay:${item.key}`, destination: { host: item.peer_id, session: item.session },
       ...(item.relay_context ? { relay_context: item.relay_context } : {}),
     });
     if (r && r.ok === true) {

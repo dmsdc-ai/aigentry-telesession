@@ -139,6 +139,55 @@ test("restart: an intent left by a dead process is uncertain on reopen; the runn
   assert.equal(l2.outbox()[0].state, "uncertain");
 });
 
+// Mac re-review TS2: the tick iterates a snapshot across an awaited send; each claim must re-check the CURRENT
+// item (still queued, not quarantined, correlation live and before its deadline) and send its current payload.
+test("TS2 suspended send: an item quarantined (payload_changed, text dropped) meanwhile is not claimed or sent", async (t) => {
+  const { l, runner } = setup(t);
+  const a = l.enqueue(item("a")).key;
+  const b = l.enqueue(item("b")).key;
+  const texts = [];
+  const send = async (x) => {
+    texts.push(x.text);
+    if (x.kind === "a") assert.equal(l.enqueue(item("b", { text: "p-b2" })).deduplicated, false);
+    return { ok: true, transport_id: `inj-${texts.length}` };
+  };
+  const out = await runner({ ledger: l, send }).tick();
+  assert.deepEqual(texts, ["p-a"], "the quarantined item's stale text is never sent");
+  assert.deepEqual([out.sent, out.skipped], [[a], [b]]);
+  const ob = l.outbox().find((o) => o.key === b);
+  assert.deepEqual([ob.state, ob.quarantine.reason, ob.text], ["queued", "payload_changed", null]);
+});
+
+test("TS2 suspended send: an item whose correlation passed its deadline meanwhile is not claimed or sent", async (t) => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "telesession-runner-ts2-"));
+  let clock = Date.now();
+  const l = openLedger({ dir: path.join(base, "ledger"), resolver, now: () => clock });
+  t.after(() => { l.close(); fs.rmSync(base, { recursive: true, force: true }); });
+  l.createRequest({
+    nonce: NONCE, request_id: null, origin: { host: "peer-d", session: "inbox" }, destination: { host: "peer-d", session: "w" },
+    reply_to: { host: "peer-d", session: "inbox" }, generation: "g1", payload_sha256: sha("p"), deadline_ms: 60000,
+  });
+  const keys = { "p-a": l.enqueue(item("a")).key, "p-b": l.enqueue(item("b")).key };
+  const texts = [];
+  const send = async (x) => { texts.push(x.text); clock += 61000; return { ok: true, transport_id: "inj-a" }; };
+  const out = await createRelayRunner({ ledger: l, send, resolver }).tick();
+  assert.equal(texts.length, 1, "only the item claimed before the deadline is sent");
+  const other = texts[0] === "p-a" ? "p-b" : "p-a";
+  assert.deepEqual([out.sent, out.skipped], [[keys[texts[0]]], [keys[other]]]);
+  assert.equal(l.outbox().find((o) => o.key === keys[other]).state, "queued", "left for the next sweep (past_deadline)");
+});
+
+test("TS2 sweep failure aborts the tick before any claim or send", async (t) => {
+  const { l } = setup(t);
+  l.enqueue(item("a"));
+  let sends = 0;
+  const failing = { ...l, sweepOutbox: () => ({ ok: false, code: "LEDGER_WRITE_FAILED" }) };
+  const r = createRelayRunner({ ledger: failing, send: async () => { sends += 1; return { ok: true, transport_id: "x" }; }, resolver });
+  assert.deepEqual(await r.tick(), { ok: false, code: "RELAY_SWEEP_FAILED" });
+  assert.equal(sends, 0);
+  assert.equal(l.outbox()[0].state, "queued");
+});
+
 test("enabled interval: start() ticks on its own timer; stop() ends it", async (t) => {
   const { l, runner } = setup(t);
   l.enqueue(item("a"));
@@ -228,6 +277,51 @@ describe("relay runner inside the transport and the one-shot CLI (loopback fake 
     assert.equal(o.receipt.transport_id, fake.injectsTo("target-1").at(-1).inject_id);
     assert.ok(fake.sessions.get("target-1").delivered.at(-1).prompt.endsWith("\nrelayed hop text"));
     assert.equal((await tr.health()).relay.last_result.sent, 1);
+  });
+
+  // Mac re-review TS3: a definite non-send (connection refused at the inject POST) must be retried with a new
+  // POST on the next tick, not answered from the transport's persisted refusal; an ambiguous one never is.
+  const refused = () => new TypeError("fetch failed", { cause: Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }) });
+  const isInject = (url, init) => init && init.method === "POST" && /\/inject$/.test(String(url));
+
+  test("TS3 connection refused at the inject: requeued, then the next tick POSTs again and is sent once", async (t) => {
+    const { fake, ledger, tr } = await transportSetup(t);
+    const s = await tr.send({ target: "target-1", text: "origin job" });
+    assert.equal(s.ok, true, JSON.stringify(s));
+    const { key } = ledger.enqueue({ nonce: s.nonce, to: { host: "local", session: "target-1" }, kind: "relay", text: "relayed hop text" });
+    const realFetch = globalThis.fetch;
+    let refuseNext = true;
+    t.mock.method(globalThis, "fetch", async (url, init) => {
+      if (refuseNext && isInject(url, init)) { refuseNext = false; throw refused(); }
+      return realFetch(url, init);
+    });
+    const before = fake.injectArrivals.length;
+    const one = await tr.relayTick();
+    assert.deepEqual(one.requeued, [key], JSON.stringify(one));
+    assert.equal(fake.injectArrivals.length, before, "the refused POST never reached the daemon");
+    const two = await tr.relayTick();
+    assert.deepEqual(two.sent, [key], JSON.stringify(two));
+    assert.equal(fake.injectArrivals.length, before + 1, "exactly one new POST");
+    const o = ledger.outbox().find((x) => x.key === key);
+    assert.deepEqual([o.state, o.attempts, o.receipt.transport_id], ["sent", 1, fake.injectsTo("target-1").at(-1).inject_id]);
+  });
+
+  test("TS3 control: an inject whose response is lost is uncertain and never POSTed again", async (t) => {
+    const { fake, ledger, tr } = await transportSetup(t);
+    const s = await tr.send({ target: "target-1", text: "origin job" });
+    const { key } = ledger.enqueue({ nonce: s.nonce, to: { host: "local", session: "target-1" }, kind: "relay", text: "relayed hop text" });
+    const realFetch = globalThis.fetch;
+    let loseNext = true;
+    t.mock.method(globalThis, "fetch", async (url, init) => {
+      const res = await realFetch(url, init);
+      if (loseNext && isInject(url, init)) { loseNext = false; await res.arrayBuffer(); throw new TypeError("fetch failed"); }
+      return res;
+    });
+    const before = fake.injectArrivals.length;
+    assert.deepEqual((await tr.relayTick()).uncertain, [key]);
+    assert.deepEqual((await tr.relayTick()).uncertain, [key]);
+    assert.equal(fake.injectArrivals.length, before + 1, "one POST in total");
+    assert.equal(ledger.outbox().find((x) => x.key === key).state, "uncertain");
   });
 
   test("relay enabled by config ticks on its own inside the transport and stops on close", async (t) => {

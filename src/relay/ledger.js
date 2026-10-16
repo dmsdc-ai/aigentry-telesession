@@ -820,6 +820,22 @@ export function openLedger(opts, seams) {
     return r.ok ? { ok: true } : r;
   }
 
+  // CLAIM + INTENT in one commit (Mac re-review TS2): re-reads the CURRENT item, never a caller's snapshot.
+  // Only a queued, unquarantined item whose correlation is live and before its deadline becomes `intent`;
+  // the claimed item (its current payload) is returned for the send.
+  function outboxClaim(key) {
+    const t = now();
+    const r = commit((d) => {
+      const o = d.outbox[key];
+      if (!o || o.state !== "queued" || o.quarantine || typeof o.text !== "string") return fail("OUTBOX_STATE_CHANGED");
+      const rec = d.records[o.nonce];
+      if (!rec || rec.retired_at || t > rec.retain_until_ms || t > rec.deadline_ms) return fail("OUTBOX_NOT_LIVE");
+      Object.assign(o, { state: "intent", intent_at: iso(t) });
+      return structuredClone(o);
+    });
+    return r.ok ? { ok: true, item: r.value } : r;
+  }
+
   // §11: queued/uncertain items whose record is retired or gone (no_live_correlation) or past its deadline
   // (past_deadline) are quarantined. Runs on open and before every relay tick; idempotent.
   function sweepOutbox() {
@@ -856,7 +872,7 @@ export function openLedger(opts, seams) {
     get mode() { return mode; },
     createRequest, reserve, release, recordEvent, appendReply, readReplies, status, find, has, record,
     holdLate, latePending, readLateText, promoteLate, dropLate,
-    enqueue, outbox, outboxTransition, sweepOutbox, prunable,
+    enqueue, outbox, outboxClaim, outboxTransition, sweepOutbox, prunable,
     close() {
       if (closed) return;
       try { releaseLock(); } catch { /* owner-matched only */ }

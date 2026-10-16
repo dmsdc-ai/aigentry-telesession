@@ -119,6 +119,7 @@ test("a failed receipt commit is reported in commit_failed, not sent; reopen →
   const { key } = l.enqueue(item());
   const failing = {
     outbox: () => l.outbox(),
+    outboxClaim: (k) => l.outboxClaim(k),
     outboxTransition: (k, from, fields) => (from === "intent" ? { ok: false, code: "LEDGER_WRITE_FAILED" } : l.outboxTransition(k, from, fields)),
   };
   let sends = 0;

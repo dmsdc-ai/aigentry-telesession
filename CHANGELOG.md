@@ -35,13 +35,6 @@
 
 ### Fixed
 
-- Relay sends to another host fail closed (#2026101110 U2). The transport injects only into its local telepty
-  daemon, and telepty has no daemon-side forward to an exact remote session (telepty#111). Before this fix, a relay
-  item routed to another peer was injected into the local session that had the same name. Such an item is now
-  refused before any inject with `PEER_UNSUPPORTED` (`sent: "no"`, so the existing requeue and quarantine rules apply).
-  The transport's default resolver now reports a non-local destination as `PEER_UNKNOWN` instead of
-  `ROUTE_UNRESOLVED`. Local relay items and an origin `send` with a remote `destination` (the relayed model through
-  the local leg-1 target) are unchanged.
 - Snyk Code review of 1391aaf/904d7c8: the U1 test helper `daemonCall` (`test/relay-receipt-binding.test.js`) now
   refuses anything but the loopback fake daemon's origin and an `/api/` path. Test-only; no src change.
 
@@ -95,6 +88,23 @@ End-to-end delivery protocol (spec `docs/specs/2026-10-11-e2e-delivery-protocol.
   test proves it refuses connections on `::1`, `127.0.0.2` (Linux) and every non-loopback interface (it fails
   on a `0.0.0.0` or `::` bind). The daemon URL stays loopback-only by config. The test-only raw HTTP helper
   now refuses any non-loopback URL. No src change.
+- Relay sends to another host fail closed (#2026101110 U2, Mac re-review TS1). The transport injects only into its local telepty
+  daemon, and telepty has no daemon-side forward to an exact remote session (telepty#111). Before this fix, a relay
+  item routed to another peer was injected into the local session that had the same name. Such an item is now
+  refused before any inject with `PEER_UNSUPPORTED` (`sent: "no"`, so the existing requeue and quarantine rules apply).
+  The transport's default resolver now reports a non-local destination as `PEER_UNKNOWN` instead of
+  `ROUTE_UNRESOLVED`. Local relay items and an origin `send` with a remote `destination` (the relayed model through
+  the local leg-1 target) are unchanged.
+- Relay claim (Mac re-review TS2): a tick claimed items from a snapshot taken before earlier awaited sends, so an
+  item quarantined meanwhile (`payload_changed`, text dropped) or past its correlation deadline was still sent with
+  the stale text, and a failed outbox sweep was ignored. The ledger now claims the current item in one commit
+  (`outboxClaim`: queued, not quarantined, correlation live and before its deadline) and the send uses that
+  item's payload; a refused claim is `skipped`. A failed sweep ends the tick with `RELAY_SWEEP_FAILED` before any
+  send.
+- Relay retry after a proven non-send (Mac re-review TS3): a connection refused at the inject requeued the item,
+  but the next tick reused the request id, got the transport's stored refusal back and failed the item without a
+  new POST. Each attempt after a proven non-send now uses its own request id (`relay:<key>:<attempt>`; attempt 0
+  keeps `relay:<key>`). Intent, uncertain and sent items are still never sent again.
 
 ### Spec change (for the spec owner)
 

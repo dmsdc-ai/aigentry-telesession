@@ -35,28 +35,30 @@ export async function relayTick({ ledger, send, resolver, maxItems = Infinity, d
       settle(item.key, "queued", { last_error: route.code }, out.unresolved);
       continue;
     }
-    // CLAIM + INTENT: durable before the send; the ledger lock is the claim.
-    const intent = ledger.outboxTransition(item.key, "queued", { state: "intent", intent_at: new Date().toISOString() });
-    if (!intent.ok) { out.skipped.push(item.key); continue; }
+    // CLAIM + INTENT: durable before the send; the ledger lock is the claim. `item` is a snapshot taken before
+    // earlier awaited sends, so the claim re-checks the current item and the send uses its current payload.
+    const claim = ledger.outboxClaim(item.key);
+    if (!claim.ok) { out.skipped.push(item.key); continue; }
+    const cur = claim.item;
     attempted += 1;
     let r;
     try {
-      r = await send({ key: item.key, nonce: item.nonce, kind: item.kind, peer_id: route.peer_id, locator: route.locator, session: route.session, text: item.text,
-        ...(item.relay_context ? { relay_context: item.relay_context } : {}) });
+      r = await send({ key: cur.key, nonce: cur.nonce, kind: cur.kind, peer_id: route.peer_id, locator: route.locator, session: route.session, text: cur.text,
+        attempt: cur.attempts, ...(cur.relay_context ? { relay_context: cur.relay_context } : {}) });
     } catch {
       r = { ok: false, sent: "unknown", code: "SEND_THREW" };
     }
     if (r && r.ok === true && typeof r.transport_id === "string" && TRANSPORT_ID_RE.test(r.transport_id)) {
       settle(item.key, "intent", { state: "sent", receipt: { transport_id: r.transport_id, at: new Date().toISOString() }, last_error: null }, out.sent);
     } else if (r && r.ok === false && r.sent === "no") {
-      const attempts = item.attempts + 1;
+      const attempts = cur.attempts + 1;
       const done = attempts >= LEDGER_LIMITS.sendAttempts;
       settle(item.key, "intent", {
         state: done ? "failed" : "queued", attempts, intent_at: null, last_error: codeOf(r),
         ...(done ? { quarantine: { reason: "max_attempts", at: new Date().toISOString() } } : {}),
       }, done ? out.failed : out.requeued);
     } else if (r && r.ok === false && r.sent === "yes") {
-      settle(item.key, "intent", { state: "failed", attempts: item.attempts + 1, last_error: codeOf(r) }, out.failed);
+      settle(item.key, "intent", { state: "failed", attempts: cur.attempts + 1, last_error: codeOf(r) }, out.failed);
     } else {
       settle(item.key, "intent", { state: "uncertain", last_error: r && r.ok === true ? "RECEIPT_MALFORMED" : codeOf(r) }, out.uncertain);
     }
