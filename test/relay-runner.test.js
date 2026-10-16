@@ -143,18 +143,25 @@ test("restart: an intent left by a dead process is uncertain on reopen; the runn
 // item (still queued, not quarantined, correlation live and before its deadline) and send its current payload.
 test("TS2 suspended send: an item quarantined (payload_changed, text dropped) meanwhile is not claimed or sent", async (t) => {
   const { l, runner } = setup(t);
-  const a = l.enqueue(item("a")).key;
-  const b = l.enqueue(item("b")).key;
+  // The outbox order is not enqueue order (same-millisecond items tie-break on key): the first send, whichever
+  // item it is, quarantines the other, still-queued item.
+  const keys = { a: l.enqueue(item("a")).key, b: l.enqueue(item("b")).key };
   const texts = [];
+  let first = null;
   const send = async (x) => {
     texts.push(x.text);
-    if (x.kind === "a") assert.equal(l.enqueue(item("b", { text: "p-b2" })).deduplicated, false);
+    if (first === null) {
+      first = x.kind;
+      const other = first === "a" ? "b" : "a";
+      assert.equal(l.enqueue(item(other, { text: `p-${other}2` })).deduplicated, false);
+    }
     return { ok: true, transport_id: `inj-${texts.length}` };
   };
   const out = await runner({ ledger: l, send }).tick();
-  assert.deepEqual(texts, ["p-a"], "the quarantined item's stale text is never sent");
-  assert.deepEqual([out.sent, out.skipped], [[a], [b]]);
-  const ob = l.outbox().find((o) => o.key === b);
+  const other = first === "a" ? "b" : "a";
+  assert.deepEqual(texts, [`p-${first}`], "the quarantined item's stale text is never sent");
+  assert.deepEqual([out.sent, out.skipped], [[keys[first]], [keys[other]]]);
+  const ob = l.outbox().find((o) => o.key === keys[other]);
   assert.deepEqual([ob.state, ob.quarantine.reason, ob.text], ["queued", "payload_changed", null]);
 });
 
