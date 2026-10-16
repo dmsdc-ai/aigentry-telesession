@@ -365,7 +365,8 @@ Isolated proof: `test/e2e-full-route.test.js` (fakes in `test/helpers/fake-recei
 that the telepty APIs exist.
 Relayed receipts (0.2.0: refused, issue #8): binding protocol — `origin_inject_id` + `correlation_id` echoed
 in a final-daemon-signed receipt, trust boundary, schema deltas, fixture contract — in the companion spec
-`2026-10-12-relayed-receipt-binding.md`. The direct-record rule above is unchanged.
+`2026-10-12-relayed-receipt-binding.md`. The direct-record rule above is unchanged for local direct
+records. A cross-host direct record (telepty#111) uses the companion's signed path.
 
 ## 10. Relay tick, in-process runner and one-shot CLI
 
