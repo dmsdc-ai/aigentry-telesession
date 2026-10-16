@@ -107,7 +107,8 @@ export function transportSendPrimitive(send, { localPeer = "local" } = {}) {
     const e = (r && r.error) || {};
     const code = typeof e.code === "string" ? e.code : "SEND_FAILED";
     if (e.accepted === false && e.http_status != null) return { ok: false, sent: "yes", code };
-    if (e.accepted === "unknown" || code === "TRANSPORT_INTERNAL") return { ok: false, sent: "unknown", code };
+    // REQUEST_IN_FLIGHT: a same-id send may still deliver; not a proven non-send, so never a new attempt key (B-1).
+    if (e.accepted === "unknown" || code === "TRANSPORT_INTERNAL" || code === "REQUEST_IN_FLIGHT") return { ok: false, sent: "unknown", code };
     return { ok: false, sent: "no", code };
   };
 }

@@ -105,6 +105,9 @@ End-to-end delivery protocol (spec `docs/specs/2026-10-11-e2e-delivery-protocol.
   but the next tick reused the request id, got the transport's stored refusal back and failed the item without a
   new POST. Each attempt after a proven non-send now uses its own request id (`relay:<key>:<attempt>`; attempt 0
   keeps `relay:<key>`). Intent, uncertain and sent items are still never sent again.
+- Relay retry, round 2 review B-1: `REQUEST_IN_FLIGHT` (a send with the same request id still in flight) was
+  treated as a proven non-send, so the next attempt's new request id escaped the same-id dedupe and the text was
+  delivered twice. It is now `sent: "unknown"`: the item goes `uncertain` and is never sent again.
 
 ### Spec change (for the spec owner)
 
