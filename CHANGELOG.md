@@ -22,6 +22,16 @@
   `receipt_keys` are pinned. Production completion needs telepty#100/#111/#113 and the operator approval in spec
   §2.5/§4.4. The tests run only against synthetic fixtures (`test/helpers/fake-receipts.js`, `fake-telepty.js`,
   `relay-context.js`).
+- Relay intake on the relaying side (#2026101110 U4, #2, #8; spec §1.2, §7). The transport gains `relayIntake` (not an
+  MCP tool). It parses the leg-1 wire header and looks up the origin inject I at its own daemon. The lookup is by
+  arrival window (interim §1.2(b), the default) or by `correlation_id` with the stored leg-1 context (T-1 §1.2(a),
+  `extensions.originLookup: "t1"`). Either way it keeps only rows whose verified sender is the reply-to inbox. Exactly
+  one row gives a final `relay_context` (C and I copied verbatim, `hop` = inbound + 1). Anything else is
+  `ORIGIN_INJECT_AMBIGUOUS`, recorded on the outbox item, and the work is still forwarded, without `relay_context`.
+  Outbox items gain the optional fields `relay_context` and `origin_lookup` (`LEDGER_VERSION` stays `1`). The relay send
+  puts `relay_context` into the inject body verbatim and refuses `hop > 4` before any inject with `RELAY_HOP_LIMIT`.
+  Like `PEER_UNSUPPORTED`, that refusal is a definite non-send: the item is requeued, then `failed` at max_attempts.
+  Cross-host relay sends stay fail-closed (U2).
 
 ### Fixed
 
