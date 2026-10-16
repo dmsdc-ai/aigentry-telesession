@@ -477,9 +477,15 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
   const provenanceAdapter = ext.provenance || DEFAULT_PROVENANCE;
   // SPEC 2026-10-11 §10: the relay runner lives in the process that owns the ledger lock. It sends with
   // this transport's own send (local peer only unless a resolver is passed); no timer unless configured.
+  // #2026101110 U2: the default resolver knows only this host; any other destination is PEER_UNKNOWN.
+  const localRoutes = createRouteResolver([{ peer_id: LOCAL, locators: [LOCAL] }]);
+  const defaultResolver = Object.freeze({ ...localRoutes, resolve(e) {
+    const r = localRoutes.resolve(e);
+    return !r.ok && r.code === "ROUTE_UNRESOLVED" ? { ok: false, code: "PEER_UNKNOWN" } : r;
+  } });
   const relay = ledger ? createRelayRunner({
-    ledger, resolver: ext.resolver || createRouteResolver([{ peer_id: LOCAL, locators: [LOCAL] }]),
-    intervalMs: ledger.mode === "read_write" ? cfg.relayIntervalMs : 0, send: transportSendPrimitive((a) => send(a)),
+    ledger, resolver: ext.resolver || defaultResolver,
+    intervalMs: ledger.mode === "read_write" ? cfg.relayIntervalMs : 0, send: transportSendPrimitive((a) => send(a), { localPeer: LOCAL }),
   }) : null;
 
   function putText(nonce, sha256, text, receivedAt) {
