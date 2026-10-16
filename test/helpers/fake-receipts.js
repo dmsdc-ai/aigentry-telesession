@@ -94,12 +94,14 @@ export function createFakeReceiptSeam({ mode = "proven", host = "remote-peer", b
   }
 
   // The delivering daemon's inject route for a local session (T-2 applied; nothing minted on refusal).
-  function inject({ sid, prompt, relay_context }) {
+  // `J` (U4 rows, RC2): adopt the inject id a daemon in front of the seam already minted, instead of minting one.
+  function inject({ sid, prompt, relay_context, J: minted }) {
     const c = credentials.get(sid);
     if (!c) return { ok: false, code: "SESSION_NOT_FOUND" };
     const v = validateRelayContext(relay_context, { resolvedSid: sid, role: "deliver" });
     if (!v.ok) return v;
-    const J = randomUUID();
+    if (minted !== undefined && (typeof minted !== "string" || finals.has(minted))) return { ok: false, code: "INJECT_ID_INVALID" };
+    const J = minted ?? randomUUID();
     finals.set(J, Object.freeze({
       J, relay_context: relay_context ? Object.freeze(structuredClone(relay_context)) : null, variant: v.variant, session: sid,
       epoch: c.epoch, generation: c.generation, delivered_payload_sha256: sha256(String(prompt)),

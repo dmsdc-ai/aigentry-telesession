@@ -12,7 +12,8 @@ import { canonicalJson, RECEIPT_SIG_DOMAIN, verifyReceiptSig, keyIdOf } from "..
 import { createRouteResolver, RouteError } from "../src/relay/route.js";
 import { openLedger, LEDGER_VERSION, APPLIED_RECEIPTS_MAX } from "../src/relay/ledger.js";
 import { applyReceipts, createProvenanceAdapter } from "../src/relay/adapters.js";
-import { createRelayRunner } from "../src/relay/runner.js";
+import { createRelayRunner, transportSendPrimitive } from "../src/relay/runner.js";
+import { nextRelayContext } from "../src/relay/relay-context.js";
 import { normalizeConfig, createTeleptyTransport } from "../src/index.js";
 import { makeSandbox, readJson, writeStateDir } from "./helpers/fault-fs.js";
 import { startFakeTelepty } from "./helpers/fake-telepty.js";
@@ -839,19 +840,19 @@ describe("§6 rows: binding through the synthetic F (isolated)", { skip: NO_LOOP
     assert.deepEqual(apply([B.attest(Jb, "processing_completed")]), OUT({ applied: 1 }));
   });
 
-  // L2 (stand-in): R's relay intake (§1.2, the verbatim copy and RELAY_HOP_LIMIT) is U4; here R's relay send is a
-  // test-side model that refuses to build hop 5 before sending, so only relay.js's outbox handling is src code.
+  // L2: R's next context (src nextRelayContext, verbatim copy, hop + 1) and the send's RELAY_HOP_LIMIT (src
+  // transportSendPrimitive) are U4 src code; the transport-level row is in test/relay-intake.test.js.
   test("L2 hop limit: an inbound hop-4 context re-relayed → RELAY_HOP_LIMIT before sending; outbox failed; nothing reaches F", async (t) => {
     const w = world(t);
     const R = tmpLedger(t);
     record(R.l, { nonce: NONCE, correlation_id: CID, origin_inject_id: "I-1", via: null, destination: { host: R_F, session: "w" }, generation: "E1" });
-    const inbound = finalCtx({ hop: 4 });
-    const key = R.l.enqueue({ nonce: NONCE, to: { host: R_F, session: "w" }, kind: "relay", text: envText("w") }).key;
-    const send = async (item) => {
-      const next = { ...inbound, final_session: item.session, hop: inbound.hop + 1 };
-      if (next.hop > 4) return { ok: false, sent: "no", code: "RELAY_HOP_LIMIT" };
-      return w.D.send({ ...item, relay_context: next });
-    };
+    const next = nextRelayContext({ inbound: finalCtx({ hop: 4 }), correlationId: CID, originInjectId: "I-1", finalSession: "w" });
+    assert.deepEqual(next, finalCtx({ hop: 5 }));
+    const key = R.l.enqueue({ nonce: NONCE, to: { host: R_F, session: "w" }, kind: "relay", text: envText("w"), relay_context: next }).key;
+    const send = transportSendPrimitive(async (a) => {
+      const r = await w.D.send({ session: a.target, text: a.text, relay_context: a.relay_context });
+      return r.ok ? { ok: true, accepted: true, inject_id: r.transport_id } : { ok: false, error: { code: r.code } };
+    }, { localPeer: R_F });
     const runner = createRelayRunner({ ledger: R.l, send, resolver: createRouteResolver([{ peer_id: R_F, locators: [R_F] }]) });
     for (let i = 0; i < 3; i++) await runner.tick();
     const item = R.l.outbox().find((o) => o.key === key);

@@ -304,9 +304,11 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
       const s = sessions.get(fromSid);
       return processInject(to, { prompt: text, from, exact_target: true }, bearer !== undefined ? bearer : s && s.bearer);
     },
-    // Another holder of a valid token (e.g. a different session's bearer) injecting anything. `ts` places
-    // the audit row in time (e.g. inside a recovery probe window).
-    injectAs(bearer, to, prompt, from, { ts } = {}) { return processInject(to, { prompt, from, exact_target: true }, bearer, { ts }); },
+    // Another holder of a valid token (e.g. a different session's bearer) injecting anything, optionally with a
+    // relay_context (U4 rows). `ts` places the audit row in time (e.g. inside a recovery probe window).
+    injectAs(bearer, to, prompt, from, { ts, relay_context } = {}) {
+      return processInject(to, { prompt, from, exact_target: true, ...(relay_context ? { relay_context } : {}) }, bearer, { ts });
+    },
     addAuditRow(row, { observe = true } = {}) {
       const full = {
         ts: new Date().toISOString(), inject_id: randomUUID(), kind: "inject", source: "inject", claimed_from: null,
