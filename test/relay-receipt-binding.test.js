@@ -6,6 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { generateKeyPairSync, sign, createHash } from "node:crypto";
 import { canonicalJson, RECEIPT_SIG_DOMAIN, verifyReceiptSig, keyIdOf } from "../src/relay/receipt-sig.js";
+import { createRouteResolver, RouteError } from "../src/relay/route.js";
 
 const b64url = (buf) => buf.toString("base64url");
 function keyPair() {
@@ -57,4 +58,40 @@ test("step 1 verifyReceiptSig: ok under the pinned key; KEY_UNKNOWN for an unpin
   assert.deepEqual(verifyReceiptSig({ ...r, seq: 1.5 }, pinned), { ok: false, code: "SIGNATURE_INVALID" });
   // Fields outside the signed body (inject_id, role, auth_basis, sig) are not part of the signed bytes.
   assert.deepEqual(verifyReceiptSig({ ...r, auth_basis: "x" }, pinned), { ok: true });
+});
+
+// ── §7 step 2: src/relay/route.js receipt_keys, receiptKeys, peerOfKey ──
+
+test("step 2 resolver: receipt_keys pinned per peer → receiptKeys(host) map (any locator form) and peerOfKey(key_id); none pinned → empty map", () => {
+  const a = keyPair();
+  const b = keyPair();
+  const r = createRouteResolver([
+    { peer_id: "local", locators: ["local"] },
+    { peer_id: "mac", locators: ["mac", "10.0.0.9"], receipt_keys: [{ key_id: a.keyId, public_key_spki_b64: a.spki }, { key_id: b.keyId, public_key_spki_b64: b.spki }] },
+  ]);
+  assert.deepEqual([...r.receiptKeys("mac")], [[a.keyId, a.spki], [b.keyId, b.spki]]);
+  assert.deepEqual([...r.receiptKeys("10.0.0.9")], [[a.keyId, a.spki], [b.keyId, b.spki]]);
+  assert.deepEqual([...r.receiptKeys("local")], []);
+  assert.deepEqual([...r.receiptKeys("nowhere")], []);
+  assert.equal(r.peerOfKey(a.keyId), "mac");
+  assert.equal(r.peerOfKey("ed25519:" + "x".repeat(43)), null);
+  assert.equal(r.canonical("10.0.0.9"), "mac", "existing resolver behaviour unchanged");
+});
+
+test("N-3 key_id ≠ fingerprint of its SPKI, one key_id under two peers, and malformed receipt_keys → ROUTE_TABLE_INVALID at construction", () => {
+  const a = keyPair();
+  const b = keyPair();
+  const peer = (id, keys) => ({ peer_id: id, locators: [id], receipt_keys: keys });
+  const bad = [
+    [peer("mac", [{ key_id: b.keyId, public_key_spki_b64: a.spki }])],
+    [peer("mac", [{ key_id: a.keyId, public_key_spki_b64: a.spki }]), peer("linux", [{ key_id: a.keyId, public_key_spki_b64: a.spki }])],
+    [peer("mac", [{ key_id: a.keyId, public_key_spki_b64: a.spki }, { key_id: a.keyId, public_key_spki_b64: a.spki }])],
+    [peer("mac", [{ key_id: "rsa:abc", public_key_spki_b64: a.spki }])],
+    [peer("mac", [{ key_id: a.keyId, public_key_spki_b64: a.spki + "A".repeat(128) }])],
+    [peer("mac", Array.from({ length: 5 }, () => { const k = keyPair(); return { key_id: k.keyId, public_key_spki_b64: k.spki }; }))],
+    [peer("mac", "not-a-list")],
+    [peer("mac", [null])],
+  ];
+  for (const table of bad) assert.throws(() => createRouteResolver(table), (e) => e instanceof RouteError && e.code === "ROUTE_TABLE_INVALID");
+  assert.doesNotThrow(() => createRouteResolver([peer("mac", [{ key_id: a.keyId, public_key_spki_b64: a.spki }]), peer("linux", [])]));
 });
