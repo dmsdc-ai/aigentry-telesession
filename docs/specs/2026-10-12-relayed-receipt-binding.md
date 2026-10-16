@@ -1,7 +1,8 @@
 # SPEC — relayed-receipt binding protocol (task #2026101110, plan unit U1; issues #8, #7, #2)
 
-Status: draft, revision 4 (answers independent review 3, verdict REVISE,
-orchestrator `state/reviews/1110/2026-10-17-u1-review3.md`; revision 3 answered review 2,
+Status: draft, revision 5 (answers independent review 4, verdict REVISE,
+orchestrator `state/reviews/1110/2026-10-17-u1-review4.md`; revision 4 answered review 3,
+`…-u1-review3.md`; revision 3 answered review 2,
 `…-u1-review2.md`; revision 2 answered review 1, `…-u1-review.md`). Companion to
 `2026-10-11-e2e-delivery-protocol.md` (the "base spec"); its §9.1 points here. Nothing in the base spec is
 changed except that pointer: the direct-record rule of `8016f25` stays as it is for local direct records
@@ -25,6 +26,10 @@ class) counts as a peer for both the route scope and the mark (§2.2, §2.4, §2
 R3-BLK-2 when R's lookup gives I = null, R forwards the work **without** `relay_context`. The work is
 delivered, no v2 receipt can exist, and O's record stays pending → unknown (§1.2, §3, RS-11, row L1).
 N3-a…f are applied inline (§1.2(a), §1.2.2, P-1 citation, downgrade, §4.4, mark granularity).
+Revision 5 changes: R4-BLK-1 "local" is a token value, and today peer hosts hold that value. So enabling
+P-1 for the first time includes replacing F's local daemon token before any mark is set, and that token
+is never given to a peer or shared as another host's `TELEPTY_AUTH_TOKEN` (§2.5 P-1, "Achievability
+today", RS-9, §4.4, §5, row X9e). N4-a…c are applied inline (§1.2 R → F, P-1 WS site, row X9d).
 Measured basis: this repository at `8016f25` (release/0.2.0 candidate) and telepty at `db2f532` (wt-107),
 both read from source on 2026-10-13. Nothing was measured against a live daemon, a second host or a real
 key. De-identified: no hostnames, addresses, session ids or tokens.
@@ -49,8 +54,11 @@ the origin only knows its own leg-1 inject. Nothing in base §9.1 links the two.
      build of every daemon on the path;
    - P-2 (telepty#110) is on every forwarding host;
    - P-5 (the peer-table source with `receipt_keys`, telesession) exists, and F's key is pinned at O;
+   - F's local daemon token was replaced when P-1 was first enabled, before any mark was set, and no
+     other host's `TELEPTY_AUTH_TOKEN` equals it (§2.5 P-1, review R4-BLK-1);
    - the §4.4 enablement approval is given.
-   Sessions registered on F before P-1 also have to be re-registered (§2.5 P-1 cost).
+   Sessions registered on F before P-1 also have to be re-registered (§2.5 P-1 cost), and every peer of F
+   has to be re-provisioned with a scoped peer token (the old token stops working at F).
 3. Until then, the only signal is the unproven leg-1 addendum on relayed records. On cross-host direct
    there is no signal at all.
 This is an open item owned upstream (telepty#100/#110/#111/#113) plus P-5 in telesession (§2.5).
@@ -143,8 +151,11 @@ nothing at another (review BLK-1). Host identity is carried by F's signing key i
   `origin_inject_id` is the I that R's lookup found when the inbound context is an origin context, and
   the inbound `origin_inject_id` copied verbatim when it is a final context (a chain with several Rs).
   If the lookup found I = null, R sends **no** `relay_context` at all (§1.2(b), R3-BLK-2), never a final
-  context with a null I. A null I can arise only at the first R: an inbound final context always carries
-  a string I (§1.2.2). C and I are immutable along the route. `final_session` = the exact session id of R's outbox destination. That is F's own session id
+  context with a null I. An inbound **direct-final** context (`origin_inject_id: null`, `hop: 0`) is
+  treated as "no I": R forwards the work without `relay_context`, as for I = null (review N4-a). An honest
+  O never sends one to an R, but copying its null I with hop 1 would be the refused mixed form and lose
+  the work. Otherwise an inbound final context carries a string I (§1.2.2), so a null I arises only at
+  the first R. C and I are immutable along the route. `final_session` = the exact session id of R's outbox destination. That is F's own session id
   (`exact_target` own-property match, `daemon.js:4742-4747`), so it means the same thing at every node.
   R's name for F's host is used only for R's routing and is never echoed. `hop > 4` is refused by R
   (`RELAY_HOP_LIMIT`, outbox `failed`). The relay envelope text stays the work payload. The relay context
@@ -403,7 +414,7 @@ value two operators compare.
 | structured relay context on an inject | **no**: inject body destructures `prompt, no_enter, auto_submit, thread_id, reply_expected, from, reply_to, exact_target, ref_path` (`daemon.js:4745-4751`, `ref_path` at `:4790`; the route also reads `req.body.deliberation_session_id`, `:4967`); `relay_context` is not read | T-2: optional `relay_context`, with the three variants and their rules exactly as in §1.2.2, stored immutably on the inject's record. Origin contexts: no session check, not receipt-eligible. Final/direct-final contexts: refused unless `final_session` is the resolved session |
 | final session posting a stage with its own bearer | **no** route | T-3: `POST /api/injects/:J/receipts {stage}` with D's bearer; refuse unless the bearer's sid+epoch = J's session+epoch; refuse `NOT_RECEIPT_ELIGIBLE` unless J carries a final or direct-final context (§1.2.2) |
 | host identity | **self-asserted only**: `MACHINE_ID` (`daemon.js:77`), `/api/meta.host`/`machine_id` (`daemon.js:3858-3867`), audit `origin_host` (`daemon.js:4790`). No daemon key exists (searched `db2f532`: no `generateKeyPair`/`ed25519`) | T-4: host receipt key pair (Ed25519); export the public key (SPKI DER, base64) and `key_id` = `"ed25519:" + base64url(sha256(SPKI DER))` exactly; private key never leaves F |
-| peer/daemon token scope | **two** credential branches, no scope (review R3-BLK-1): every `/api/*` route sits behind one auth middleware (`daemon.js:395`). It passes (1) `x-telepty-token` (or `?token=`) equal to the daemon token `EXPECTED_TOKEN`, **or** (2) `Authorization: Bearer <JWT>`, any HS256 token signed with `TELEPTY_JWT_SECRET` (`src/protocol/http-auth.js:6-20`, `:190-198`; wired whenever that env is set, `daemon.js:381`, `:395`). A peer's stored token is the target's daemon token. `POST /api/sessions/:id/kill` (`daemon.js:5279-5283`) and non-owned `DELETE /api/sessions/:id` (`:5338-5347`) need no session credential. Registering an id the daemon does not hold mints a fresh credential (`issueSessionCredential`, defined `daemon.js:343`, called only at `:3665`) | P-1 (§2.5, telepty#113 + #100): scoped peer tokens; JWT bearers classed as peers |
+| peer/daemon token scope | **two** credential branches, no scope (review R3-BLK-1): every `/api/*` route sits behind one auth middleware (`daemon.js:395`). It passes (1) `x-telepty-token` (or `?token=`) equal to the daemon token `EXPECTED_TOKEN`, **or** (2) `Authorization: Bearer <JWT>`, any HS256 token signed with `TELEPTY_JWT_SECRET` (`src/protocol/http-auth.js:6-20`, `:190-198`; wired whenever that env is set, `daemon.js:381`, `:395`). A peer's stored token is the target's daemon token. `POST /api/sessions/:id/kill` (`daemon.js:5279-5283`) and non-owned `DELETE /api/sessions/:id` (`:5338-5347`) need no session credential. Registering an id the daemon does not hold mints a fresh credential (`issueSessionCredential`, defined `daemon.js:343`, called only at `:3665`) | P-1 (§2.5, telepty#113 + #100): scoped peer tokens; JWT bearers classed as peers; F's local token replaced at first enablement (R4-BLK-1) |
 | signed receipt | **no**. `src/audit/provenance.js:14-21` is a nonce banner and explicitly not a signature | T-5: build + sign body §2.2 (incl. the per-credential `session_guard`, §2.5 P-1), only for injects carrying a final or direct-final context; receipts are immutable once signed (no re-signing after key rotation, §2.3); serve `GET /api/requests/:C/receipts` (base §9.1 proposed) on F, and deliver/forward to O (T-6) |
 | receipt transport back to O | **no** | T-6: F pushes signed receipts to O's daemon over the existing peer link, or O's daemon pulls them. Any path works: signatures make the carrier untrusted |
 | capability advertisement | `/api/meta.capabilities` exists (`daemon.js:3867`); no receipt capability | T-7: capability `final-receipts-v2` |
@@ -432,7 +443,7 @@ written. If the orchestrator picks channel attestation, only B5/B6 and §5's key
 
 | id | owner / issue | exact requirement | gates |
 |---|---|---|---|
-| **P-1** | telepty#113 (filed by the reviewer), as a telepty#100 requirement | F issues **peer tokens distinct from its local daemon token**, and the local daemon token is not given to any peer. A peer token authorises only `POST /api/sessions/:id/inject` (with `exact_target`, `relay_context`) and the receipt read/forward routes of T-5/T-6. It **cannot** kill, delete, rename or register any session, and cannot read `/api/peers`. **Principal classes (R3-BLK-1):** "local" means exactly one class: a request authenticated by `x-telepty-token`/`?token=` equal to F's local daemon token (`EXPECTED_TOKEN`, `http-auth.js:190-191`). **Every other credential class is a peer**, for both the route scope above and the mark below. That includes a JWT bearer (`http-auth.js:196-198`; its design intent is per-node remote identity, telepty `docs/adr/2026-06-08-cross-machine-relay-broker.md:143`, `:253`) and any class added later. Disabling the JWT branch under P-1 is then optional, not required. **Per-credential mark (R2-BLK-1, option (a)):** when F issues a session credential (the single issuance at first registration: `issueSessionCredential`, defined at `daemon.js:343`, called only at `:3665`, in the branch for an id the daemon does not hold; rationale comment `:318-332`), it persists, next to the verifier on the session record (`sessionEpoch`/`credentialVerifier`, `daemon.js:3699-3700`), the mark `peer_scope_v1: true` iff P-1 is enforced at that moment **and** the registration was authenticated as "local". **Granularity (N3-f):** the mark belongs to that issued (sid, epoch) credential and is reloaded with it on restart. It is never keyed by sid alone, so a new epoch for the same sid starts unmarked unless its own issuance qualifies. A credential record without the field (written by a pre-P-1 build) counts as unmarked. **Downgrade (N3-d):** a pre-P-1 build that rewrites the session store may drop the field. The credential is then unmarked after an upgrade again (fail-closed; the G2 re-register applies). That is expected, not a bug. The mark is never added later; only a new issuance carries it. F signs `session_guard:"peer-scope-v1"` only for a credential with the mark, and only while it enforces P-1 (§2.2). **Cost:** every destination session registered before P-1 was first enforced, or during an off period, is not receipt-eligible until it is destroyed and re-registered (re-spawned). Its v2 receipts are refused `F_GUARD_ABSENT` (row G2). That is an availability cost on F's existing sessions only, and new sessions need nothing. **Why not (b), revoking every older credential when P-1 is enabled:** wrapped children carry the bearer in their spawn-time env (`daemon.js:329-332` comment), so (b) breaks every live session on F at once, not only the destinations. It also needs a revocation on every off→on switch, and it depends on the switch being recorded across restarts. (a) needs neither, and it is fail-closed by default for old stores. (Considered and not recommended: F signs a credential-issuance time that O bounds. It depends on F's clock vs O's (RS-6), and it misses a squat registered **before** O's send while D is offline.) | every v2 receipt (B6g `F_GUARD_ABSENT`), per destination credential |
+| **P-1** | telepty#113 (filed by the reviewer), as a telepty#100 requirement | F issues **peer tokens distinct from its local daemon token**, and the local daemon token is not given to any peer. **Rotation at first enablement (R4-BLK-1):** on `db2f532` every peer host of F already holds F's local token (a peer entry stores it and sends it as `x-telepty-token`, `cross-machine.js:496-497`, `:533-534`), and F's local token is `TELEPTY_AUTH_TOKEN || config.authToken` (`daemon.js:66`, `:76`), so a host that runs with the same `TELEPTY_AUTH_TOKEN` holds it too. "Local" below is a token **value**, so P-1 is meaningful only after that value has left every other host. Enabling P-1 for the first time therefore **includes replacing F's local daemon token** (a new `config.authToken`, and F's `TELEPTY_AUTH_TOKEN` unset or set to the new value). The replacement comes **before** P-1 is enforced: F sets no mark while the pre-P-1 token is valid, so there is no window of marked credentials issued to an off-host holder of the old token. Telepty#113 makes the P-1 switch perform the replacement itself, or refuses to enforce P-1 until it has happened; which of the two is #113's contract to state. After that, the token is never given to a peer (peers are re-provisioned only with scoped peer tokens), and it is never used as another host's `TELEPTY_AUTH_TOKEN` (that env is both the other host's own local token and its outbound token, `:533`). If F's local token is ever exposed off-host again, it is replaced again, and every destination session registered since the exposure is treated like one registered during an off period: re-registered before it counts (F cannot tell such credentials apart). Not chosen: defining "local" as token **and** loopback/same-host origin. The middleware has no such check (`http-auth.js:176-198`), and `isAllowedPeer` only narrows reachability. A peer token authorises only `POST /api/sessions/:id/inject` (with `exact_target`, `relay_context`) and the receipt read/forward routes of T-5/T-6. It **cannot** kill, delete, rename or register any session, and cannot read `/api/peers`. **Principal classes (R3-BLK-1):** "local" means exactly one class: a request authenticated by `x-telepty-token`/`?token=` equal to F's local daemon token (`EXPECTED_TOKEN`, `http-auth.js:190-191`). **Every other credential class is a peer**, for both the route scope above and the mark below. That includes a JWT bearer (`http-auth.js:196-198`; its design intent is per-node remote identity, telepty `docs/adr/2026-06-08-cross-machine-relay-broker.md:143`, `:253`) and any class added later. Disabling the JWT branch under P-1 is then optional, not required. The rule covers **both** auth sites: the HTTP middleware (`http-auth.js:190-198`) and the WebSocket upgrade (`src/transport/websocket.js:738-739`, which accepts the same two branches for `/api/sessions/*` and `/api/bus`). A peer principal is refused at the WS upgrade, since those are not inject or receipt routes (review N4-b). The WS site issues no session credential, so it does not affect the mark. **Per-credential mark (R2-BLK-1, option (a)):** when F issues a session credential (the single issuance at first registration: `issueSessionCredential`, defined at `daemon.js:343`, called only at `:3665`, in the branch for an id the daemon does not hold; rationale comment `:318-332`), it persists, next to the verifier on the session record (`sessionEpoch`/`credentialVerifier`, `daemon.js:3699-3700`), the mark `peer_scope_v1: true` iff P-1 is enforced at that moment **and** the registration was authenticated as "local". **Granularity (N3-f):** the mark belongs to that issued (sid, epoch) credential and is reloaded with it on restart. It is never keyed by sid alone, so a new epoch for the same sid starts unmarked unless its own issuance qualifies. A credential record without the field (written by a pre-P-1 build) counts as unmarked. **Downgrade (N3-d):** a pre-P-1 build that rewrites the session store may drop the field. The credential is then unmarked after an upgrade again (fail-closed; the G2 re-register applies). That is expected, not a bug. The mark is never added later; only a new issuance carries it. F signs `session_guard:"peer-scope-v1"` only for a credential with the mark, and only while it enforces P-1 (§2.2). **Cost:** every destination session registered before P-1 was first enforced, or during an off period, is not receipt-eligible until it is destroyed and re-registered (re-spawned). Its v2 receipts are refused `F_GUARD_ABSENT` (row G2). That is an availability cost on F's existing sessions only, and new sessions need nothing. **Why not (b), revoking every older credential when P-1 is enabled:** wrapped children carry the bearer in their spawn-time env (`daemon.js:329-332` comment), so (b) breaks every live session on F at once, not only the destinations. It also needs a revocation on every off→on switch, and it depends on the switch being recorded across restarts. (a) needs neither, and it is fail-closed by default for old stores. (Considered and not recommended: F signs a credential-issuance time that O bounds. It depends on F's clock vs O's (RS-6), and it misses a squat registered **before** O's send while D is offline.) | every v2 receipt (B6g `F_GUARD_ABSENT`), per destination credential |
 | **P-2** | telepty#110 | `GET /api/peers` (`daemon.js:3921-3927` → raw `peers.json`, `cross-machine.js:401-403`) no longer returns stored tokens | operator enablement (§4.4): without it, every local-token holder on a forwarding host holds F's (scoped) peer token. Under P-1 that widens RS-1 only, not completion |
 | **P-3** | telepty#100 T-1…T-7 (Mac, task 1229) | §2.4 rows, with the exact `key_id` derivation and the §2.2 body | any v2 receipt existing at all |
 | **P-4** | telepty#111 | daemon-side forward for an exact remote target: returns the remote inject id + a routing receipt; forwards `relay_context` verbatim; mints no receipt for F. For a cross-host leg 1 (O → R), the audit row at R's daemon must carry a verified sender that R can compare with O's reply-to inbox for the §1.2(a)/(b) filter (review N3-a). The form of that field is #111's contract to state. Until it is agreed, R's lookup finds no verified row and forwards without context | every cross-host telesession path (relayed R → F, and cross-host direct O → F). Until then U2 stays fail-closed |
@@ -549,7 +560,12 @@ Residuals (accepted, named):
   forever. → X9b. A holder of a JWT valid at F (`TELEPTY_JWT_SECRET` set) is in the same class as a
   peer-token holder: on `db2f532` it can squat, and after P-1 it can neither kill/register nor obtain a
   marked credential (R3-BLK-1). → X9d. **Remains after P-1:** a holder of F's **local** daemon token on F's own host, and
-  F's operator, can still squat. That is treated like F compromise (RS-3), the analogue of the
+  F's operator, can still squat. That holds only once F's local token has been replaced at P-1's first
+  enablement (§2.5 P-1, review R4-BLK-1). Until that replacement, "local" also includes **every off-host
+  holder of the pre-P-1 token**: every peer host whose `peers.json` holds it, every local-token holder
+  there via #110, and every host whose `TELEPTY_AUTH_TOKEN` equals it. P-1 requires the replacement
+  before any mark is set, so that set gets no marked credential; P-2 does not help, because it removes
+  only the `/api/peers` disclosure, not the token on disk or in env. → X9e. That is treated like F compromise (RS-3), the analogue of the
   same-uid-on-O exclusion. **Who that is, by default (review N-d):** every agent session and every
   telesession on F's host, because each holds F's local daemon token (telesession sends
   `x-telepty-token: cfg.token`, `telepty.js:95`). This is not an exotic compromise. It is accepted as
@@ -636,7 +652,10 @@ records only.
   exception is an enablement that pins keys only under `local` (same-host relayed records): it requires
   P-1, P-3 and P-5 only (§2.5, N3-e). Pinning any remote peer's key is a cross-host enablement and
   requires all of P-1…P-5. P-1 is also checked per receipt (B6g); P-2 is checked only
-  at approval. Until then **v2 stays off**.
+  at approval. The approval also checks, for every F whose key is pinned (review R4-BLK-1): "F's local
+  daemon token has been replaced since any peer held it, the replacement came before P-1 was first
+  enforced (or since the last off-host exposure), and no other host's `TELEPTY_AUTH_TOKEN` equals it."
+  B6g cannot see this, because F marks by token value. Until then **v2 stays off**.
 
 ### 4.5 Rule 47 items (cited, not decided)
 
@@ -647,7 +666,7 @@ records only.
 | key rotation / revocation | a list of `key_id`s per peer; pin the new key before F switches; removing a key_id revokes it for future evaluation only (receipts under it → `KEY_UNKNOWN`; applied ones stay); F never re-signs (§2.3 Rotation) |
 | retention of `applied_receipts` / refusals | lives and retires with the record (7 days, base §6.1) |
 | auth scope of `POST /api/injects/:J/receipts` | D's own bearer only; no operator or peer token |
-| peer-token scope on F (P-1) | inject + receipt routes only; no kill/delete/rename/register, no `/api/peers`; every credential class other than F's local daemon token (JWT included) is a peer; per-credential `peer_scope_v1` issuance mark persisted with the verifier, set only for a local-token registration |
+| peer-token scope on F (P-1) | inject + receipt routes only; no kill/delete/rename/register, no `/api/peers`; every credential class other than F's local daemon token (JWT included) is a peer; per-credential `peer_scope_v1` issuance mark persisted with the verifier, set only for a local-token registration; F's local token replaced at first enablement, before any mark, and never shared with a peer or as another host's `TELEPTY_AUTH_TOKEN` |
 | out-of-band exchange of F's public key | operator copies the SPKI and compares the `key_id` fingerprint on both ends |
 
 ---
@@ -657,9 +676,11 @@ records only.
 The fixture stands in for telepty#100 T-1…T-7 on F. It MUST NOT be taken as evidence that those exist.
 
 **Keys.** `createFakeReceiptSeam({mode, selfLabel, keys, guard = "peer-scope-v1", guardScope =
-"credential", markRule = "local-only"})`. `guardScope:"daemon"` models revision 2's daemon-wide guard,
+"credential", markRule = "local-only", rotateOnEnable = true})`. `guardScope:"daemon"` models revision 2's daemon-wide guard,
 and exists only as the control of row X9b. `markRule:"non-peer"` marks every principal except `"peer"`
-(revision 3's literal rule), and exists only as the control of row X9d. When `keys` is
+(revision 3's literal rule), and exists only as the control of row X9d. `rotateOnEnable:false` models
+revision 4's enablement, where P-1 is switched on without replacing the local token, and exists only as
+the control of row X9e. When `keys` is
 absent, the seam calls `generateKeyPairSync("ed25519")` once per seam instance, **in the test process**.
 Keys are never written to disk, never read from the environment or the filesystem, and never shared
 across seams. `key_id` is the §2.2 fingerprint. The seam exports only `keyId()` and
@@ -689,11 +710,20 @@ fixture asserts that the three strings differ.
   immutably.
 - **Credentials (R2-BLK-1).** The seam keeps a credential table `sid → {epoch, peer_scope_v1}`, the
   model of §2.5 P-1's issuance mark, keyed per issued (sid, epoch). `register(sid,
-  {principal:"local"|"peer"|"jwt"})` issues a fresh epoch. `"jwt"` models a JWT bearer and is classed
-  as a peer (R3-BLK-1). The mark is `true` iff the seam's guard is `"peer-scope-v1"` at that moment and
+  {principal:"local"|"peer"|"jwt"|"old-local"})` issues a fresh epoch. `"jwt"` models a JWT bearer and is classed
+  as a peer (R3-BLK-1). `"old-local"` is defined under "Local-token rotation" below; before the
+  replacement it counts as `"local"` everywhere in this section. The mark is `true` iff the seam's guard is `"peer-scope-v1"` at that moment and
   `principal === "local"` (positive rule: every other value is unmarked). `finalDaemon({sid, epoch})` registers D with `principal:"local"` at construction.
   `setGuard(g)` switches the seam's P-1 state at runtime (upgrade, or off → on). It never touches
   existing marks.
+  **Local-token rotation (R4-BLK-1).** The seam keeps `localTokenReplaced` (initially `true` iff the
+  seam is constructed with `guard:"peer-scope-v1"`, else `false`). The first `setGuard("peer-scope-v1")`
+  sets it to `true` when `rotateOnEnable` is `true`, before any later `register` is evaluated. The
+  principal `"old-local"` models an **off-host** holder of the pre-P-1 local token (a peer host's
+  `peers.json`, or a shared `TELEPTY_AUTH_TOKEN`). While `localTokenReplaced` is `false` it is
+  indistinguishable from `"local"` (same token value) and is treated exactly as `"local"`, including the
+  mark. Once it is `true`, `register`/`squat` with `"old-local"` are refused `UNAUTHORIZED` (the token no
+  longer equals F's local token, the 401 of `http-auth.js:190-198`), and nothing is issued or minted.
 - `attest(J, stage, opts)`: builds the §2.2 body from the stored J record (never from caller input). It
   refuses `NOT_RECEIPT_ELIGIBLE` for an inject with an origin context or with no context. It sets
   `session_guard = "peer-scope-v1"` iff the current guard is `"peer-scope-v1"` **and** the credential of
@@ -701,7 +731,8 @@ fixture asserts that the three strings differ.
   `seq` is per J. `opts.forceSign:true` (test-only, row V2) skips the eligibility refusal to model a
   buggy daemon.
 - `observe(...)` unchanged.
-- `squat({sid, prompt, relay_context, principal = "peer"})` (X9, X9b, X9d): models RS-9. While the
+- `squat({sid, prompt, relay_context, principal = "peer"})` (X9, X9b, X9d, X9e): models RS-9. A
+  refused `"old-local"` principal (above) is refused `UNAUTHORIZED` first. While the
   guard is `"peer-scope-v1"`, a squat with any principal other than `"local"` (`"peer"`, `"jwt"`) is
   refused `PEER_SCOPE_DENIED` (P-1 forbids peer kill/register), so no J′ is minted. Otherwise it revokes `sid`'s credential, re-registers `sid` with a
   fresh epoch through `register(sid, {principal})` (unmarked under `guard:null`), mints J′ with the
@@ -761,7 +792,8 @@ Unit / isolated rows (U1, U5) live in `test/e2e-full-route.test.js` and `test/re
 | X9 | session-name squatting (RS-9, BLK-2) | seam with `guard:null`: `squat({sid:"w"})` with the copied (I, C), then `attest(J′, "processing_completed")`. Then the same with `guard:"peer-scope-v1"` | `guard:null` → `F_GUARD_ABSENT`, pending, not completed (v2 off without P-1). `peer-scope-v1` → `squat` refused `PEER_SCOPE_DENIED` at the seam, no J′; the real D's receipt completes |
 | X9b | squat before P-1 survives the upgrade (R2-BLK-1) | seam with `guard:null`; `squat({sid:"w", principal:"peer"})` with the copied (I, C) → J′; then `setGuard("peer-scope-v1")` (F upgrades to P-1 and restarts; credential table kept); then `attest(J′, "processing_completed")` | the signed body has `session_guard:null` (credential unmarked); O refuses `F_GUARD_ABSENT`; pending, not completed. Control: on a build without the per-credential mark (seam option `guardScope:"daemon"`, revision 2's rule) the same steps reach `completed`. That shows the row tests the fix |
 | X9c | P-1 switched off and on | seam starts `peer-scope-v1`; `setGuard(null)`; `squat({sid:"w", principal:"peer"})` → J′; `setGuard("peer-scope-v1")`; `attest(J′, …)` | `F_GUARD_ABSENT`; pending |
-| X9d | JWT principal under P-1 (R3-BLK-1) | seam `guard:"peer-scope-v1"`; `squat({sid:"w", principal:"jwt"})` with the copied (I, C); separately, `register("w2", {principal:"jwt"})` then an inject + `attest` for `w2` | squat refused `PEER_SCOPE_DENIED`, no J′, the real D's receipt completes. The `w2` credential is unmarked: its signed body has `session_guard:null` → `F_GUARD_ABSENT`. Control: a seam variant that marks every non-`"peer"` principal (the literal revision-3 rule) marks `w2` and the `w2` receipt passes B6g. That shows the row tests the positive rule |
+| X9d | JWT principal under P-1 (R3-BLK-1) | seam `guard:"peer-scope-v1"`; `squat({sid:"w", principal:"jwt"})` with the copied (I, C); separately, `register("w2", {principal:"jwt"})` then an inject + `attest` for `w2` | squat refused `PEER_SCOPE_DENIED`, no J′, the real D's receipt completes. The `w2` credential is unmarked: its signed body has `session_guard:null` → `F_GUARD_ABSENT`. Control: a seam variant that marks every non-`"peer"` principal (the literal revision-3 rule) marks `w2` and the `w2` receipt passes B6g. That shows the row tests the positive rule. The control also stands for "a JWT holder registers under P-1 and gets a marked credential", so U5 keeps X9d as its own row and does not fold it into X9 (review N4-c) |
+| X9e | off-host holder of the pre-P-1 local token (R4-BLK-1) | seam `guard:null`; `setGuard("peer-scope-v1")` (first enablement, `rotateOnEnable:true`: local token replaced); then `squat({sid:"w", principal:"old-local"})` with the copied (I, C); separately, `register("w3", {principal:"old-local"})` | squat refused `UNAUTHORIZED`, no J′, the real D's receipt (D re-registered under P-1 as `"local"`, as G2) completes; `register("w3")` refused `UNAUTHORIZED`, no credential. Control: the same steps on a seam with `rotateOnEnable:false` (revision 4's enablement): the squat succeeds, J′'s credential is marked, the J′ receipt signs `session_guard:"peer-scope-v1"`, and O records `completed` with no work by D. That documents the residual the replacement closes and shows the row tests it |
 | G1 | F without P-1, honest flow | B-R1 with `guard:null` | `F_GUARD_ABSENT ×2`; pending (I-8) |
 | G2 | honest D registered before P-1 (cost of option (a)) | seam `guard:null`; D registers (`principal:"local"`, unmarked); `setGuard("peer-scope-v1")`; B-R1 flow | `F_GUARD_ABSENT ×2`; pending. Then D is re-registered under P-1 (marked) and the request is re-sent: `completed` |
 | V1 | leg 1 carries the origin context (R2-BLK-2) | O → R on `fake-telepty` with `{v:2, leg:"origin", correlation_id:C}`; R's session is not D | accepted (no `final_session` check); audit row stores the context; T-1 lookup `correlation_id=C` returns exactly I |
@@ -880,7 +912,7 @@ Order (each step lands with its failing-first tests from §6):
    `localPeer: LOCAL`. `requestStatus` attaches `receipt_refusals` from the last pull. No remote-post
    code path is added (BLK-4).
 6. **`test/helpers/fake-receipts.js` / `fake-telepty.js` / `relay-context.js`** (new, the shared
-   §1.2.2 validator): §5. **Tests**: §6 rows B-*, N-*, X* (incl. X6b, X9b, X9c, X9d), G1, G2, V1–V7,
+   §1.2.2 validator): §5. **Tests**: §6 rows B-*, N-*, X* (incl. X6b, X9b, X9c, X9d, X9e), G1, G2, V1–V7,
    DX1–DX4 (with the fake #111 in `fake-telepty.js`, which tests `applyReceipts` path S on a
    destination ≠ local record; the transport-level DX run is U2), S1, L2, H4, RC1, C1 (U1). L1, L3, RS1,
    RS2, RC2 are U4. U6 is the harness.
