@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Relayed-receipt binding, origin side (#2026101110 U1, #8, #7; spec `docs/specs/2026-10-12-relayed-receipt-binding.md`).
+  Receipts are checked by record type. A local direct record keeps the 0.2.0 rule unchanged. A relayed or cross-host
+  direct record ("path S") accepts only a v2 receipt from the final daemon. That receipt must be signed (Ed25519,
+  verified with `node:crypto`; there is no signing code in `src/`) with a key pinned in the route resolver's new
+  optional per-peer `receipt_keys`, under the origin's own name for the destination. It is then checked in the
+  B0–B9 order: correlation, origin inject, key, signature, `session_guard`, final session, stage rules, and
+  a once-only receipt identity. A refused receipt is counted with its code. It changes no state, sets no marker and
+  is never evaluated as v1 or unproven. A relayed v1 receipt is now refused `SIGNATURE_REQUIRED` instead of
+  `INJECT_MISMATCH`; the outcome (refused) is the same.
+- The ledger record gains two optional fields, `origin_inject_id` and `applied_receipts` (bounded at 16; at the bound a
+  new identity is refused with `RECEIPT_LIMIT` and nothing is evicted). `LEDGER_VERSION` stays `1`, so a 0.2.0 build
+  still opens the ledger. A direct record now stays bound through `origin_inject_id` after the store purges its request.
+- `telesession_request_status` gains an optional `receipt_refusals` field holding the refusals from the last receipt
+  pull, omitted when there are none.
+- Nothing changes in a live deployment by default. The default receipt adapter stays `NO_RECEIPTS` and no
+  `receipt_keys` are pinned. Production completion needs telepty#100/#111/#113 and the operator approval in spec
+  §2.5/§4.4. The tests run only against synthetic fixtures (`test/helpers/fake-receipts.js`, `fake-telepty.js`,
+  `relay-context.js`).
+- Relay intake on the relaying side (#2026101110 U4, #2, #8; spec §1.2, §7). The transport gains `relayIntake` (not an
+  MCP tool). It parses the leg-1 wire header and looks up the origin inject I at its own daemon. The lookup is by
+  arrival window (interim §1.2(b), the default) or by `correlation_id` with the stored leg-1 context (T-1 §1.2(a),
+  `extensions.originLookup: "t1"`). Either way it keeps only rows whose verified sender is the reply-to inbox. Exactly
+  one row gives a final `relay_context` (C and I copied verbatim, `hop` = inbound + 1). Anything else is
+  `ORIGIN_INJECT_AMBIGUOUS`, recorded on the outbox item, and the work is still forwarded, without `relay_context`.
+  Outbox items gain the optional fields `relay_context` and `origin_lookup` (`LEDGER_VERSION` stays `1`). The relay send
+  puts `relay_context` into the inject body verbatim and refuses `hop > 4` before any inject with `RELAY_HOP_LIMIT`.
+  Like `PEER_UNSUPPORTED`, that refusal is a definite non-send: the item is requeued, then `failed` at max_attempts.
+  Cross-host relay sends stay fail-closed (U2).
+
+### Fixed
+
+- Snyk Code review of 1391aaf/904d7c8: the U1 test helper `daemonCall` (`test/relay-receipt-binding.test.js`) now
+  refuses anything but the loopback fake daemon's origin and an `/api/` path. Test-only; no src change.
+
 ## 0.2.0 — 2026-10-12
 
 End-to-end delivery protocol (spec `docs/specs/2026-10-11-e2e-delivery-protocol.md`).

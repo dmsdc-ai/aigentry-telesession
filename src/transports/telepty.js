@@ -20,6 +20,7 @@ import { openStore, StoreError, STORE_LIMITS } from "../store.js";
 import { createRouteResolver } from "../relay/route.js";
 import { createRelayRunner, transportSendPrimitive } from "../relay/runner.js";
 import { DEFAULT_PROVENANCE, NO_RECEIPTS, applyReceipts, applyConsumption } from "../relay/adapters.js";
+import { relayContextVariant, nextRelayContext } from "../relay/relay-context.js";
 
 export const REQUIRED_CAPABILITIES = Object.freeze(["inject-exact-target", "register-create-only", "delete-owned-session"]);
 
@@ -40,6 +41,7 @@ const RECEIVER_BODY_CAP = 64 * 1024;
 const RECEIVER_TIMEOUT_MS = 5000;
 const RECEIVER_MAX_CONNECTIONS = 32;
 const STORE_MAX = 64;
+const REFUSALS_MAX = 64;
 const ISSUED_MAX = 16;
 const ISSUED_TTL_MS = 15 * 60 * 1000;
 const RETIRED_MAX = 256;
@@ -53,6 +55,10 @@ const CANDIDATES_MAX = 4;            // per durable record (state schema v1)
 const RECEIVED_MAX = 1024;
 const PROBE_BEFORE_MS = 2000;
 const PROBE_AFTER_MS = 12000;
+// SPEC 2026-10-12 §1.2(b): R's interim I lookup window around the arrival of the leg-1 prompt.
+const ORIGIN_LOOKUP_BEFORE_MS = 300000;
+const ORIGIN_LOOKUP_AFTER_MS = 5000;
+const WIRE_RE = /^\[telesession nonce=([0-9a-f]{32}) reply-to=([A-Za-z0-9._-]{1,128}) correlation=([0-9a-f]{32})\]\n([\s\S]*)$/;
 
 // ── HTTP client ──
 // One AbortSignal covers headers and body. Errors are sanitized to a code; daemon text, URLs and
@@ -484,8 +490,12 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     const r = localRoutes.resolve(e);
     return !r.ok && r.code === "ROUTE_UNRESOLVED" ? { ok: false, code: "PEER_UNKNOWN" } : r;
   } });
+  // SPEC 2026-10-12 §2.3: path-S receipt keys are the ones pinned in this resolver (none by default → KEY_UNKNOWN).
+  const routes = ext.resolver || defaultResolver;
+  // §4.1 receipt_refusals: the refusals of the last pull per nonce (bounded, in memory; not a health counter).
+  const lastRefusals = new Map();
   const relay = ledger ? createRelayRunner({
-    ledger, resolver: ext.resolver || defaultResolver,
+    ledger, resolver: routes,
     intervalMs: ledger.mode === "read_write" ? cfg.relayIntervalMs : 0, send: transportSendPrimitive((a) => send(a), { localPeer: LOCAL }),
   }) : null;
 
@@ -1148,13 +1158,16 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     });
   });
 
-  const send = guarded(async ({ target, text, request_id, destination }) => {
+  // `relay_context` (U4, not an MCP argument): the R → F final context of a relay item, sent verbatim in the
+  // inject body (SPEC 2026-10-12 §1.2); its final_session must be the target.
+  const send = guarded(async ({ target, text, request_id, destination, relay_context }) => {
     if (typeof target !== "string" || !SID_RE.test(target)
         || typeof text !== "string" || text.length < 1 || text.length > TEXT_MAX || text.includes("\u0000")
         || (request_id !== undefined && (typeof request_id !== "string" || !REQUEST_ID_RE.test(request_id)))
         || (destination !== undefined && (destination === null || typeof destination !== "object"
           || typeof destination.host !== "string" || !HOST_RE.test(destination.host)
-          || typeof destination.session !== "string" || !SID_RE.test(destination.session)))) {
+          || typeof destination.session !== "string" || !SID_RE.test(destination.session)))
+        || (relay_context !== undefined && (relayContextVariant(relay_context) !== "final" || relay_context.final_session !== target))) {
       return fail("INVALID_ARGUMENT");
     }
     if (!cfg.targets.includes(target)) return fail("TARGET_NOT_ALLOWED");
@@ -1186,14 +1199,14 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       return fail(slot.code, { accepted: false });
     }
     try {
-      return await sendNew(target, text, requestId, bodySha, key, destination, slot ? slot.reservation : undefined);
+      return await sendNew(target, text, requestId, bodySha, key, destination, slot ? slot.reservation : undefined, relay_context);
     } finally {
       if (key !== null) inflight.delete(key);
       if (slot) ledger.release(slot.reservation);
     }
   });
 
-  async function sendNew(target, text, requestId, bodySha, key, destination, reservation) {
+  async function sendNew(target, text, requestId, bodySha, key, destination, reservation, relayContext) {
     if (closing) return fail("TRANSPORT_CLOSING");
     if (noteLock()) return fail("STORE_LOCK_LOST");
     if (!flushHeld()) return fail(noteLock() ? "STORE_LOCK_LOST" : "STORE_DEGRADED");
@@ -1241,7 +1254,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     if (!reserve.ok) return fail(reserve.code, reserve.errno ? { errno: reserve.errno } : {});
 
     const r = await client.post(`/api/sessions/${encodeURIComponent(target)}/inject`, {
-      prompt: wire, from: inboxId, reply_to: inboxId, exact_target: true,
+      prompt: wire, from: inboxId, reply_to: inboxId, exact_target: true, ...(relayContext ? { relay_context: relayContext } : {}),
     }, { sessionToken: bearer, timeoutMs: WRITE_TIMEOUT_MS });
     const settle = (fields) => persistOrHold((d) => { const q = d.requests[rkey]; if (q) Object.assign(q, fields); });
 
@@ -1293,7 +1306,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
         nonce: q.nonce, correlation_id: null, reconstructed: true, request_id: q.request_id, origin: { host: LOCAL, session: q.reply_to },
         destination: { host: "unknown", session: q.target }, via: leg1, via_generation: q.target_epoch,
         reply_to: { host: LOCAL, session: q.reply_to }, generation: null, payload_sha256: q.payload_sha256,
-        deadline_ms: Math.max(0, q.expires_at - Date.now()),
+        deadline_ms: Math.max(0, q.expires_at - Date.now()), origin_inject_id: q.inject_id,
       });
       if (!c.ok) { if (c.code === "LEDGER_FULL") ledgerStats.ledger_full += 1; else if (c.code !== "NONCE_RETIRED") ledgerStats.write_failed += 1; continue; }
       ledger.recordEvent({
@@ -1312,7 +1325,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       destination: relayed ? { host: destination.host, session: destination.session } : leg1,
       via: relayed ? leg1 : null, via_generation: relayed ? rec.target_epoch : null,
       reply_to: { host: LOCAL, session: rec.reply_to }, generation: relayed ? null : rec.target_epoch,
-      payload_sha256: rec.payload_sha256, deadline_ms: rec.expires_at - rec.sent_at, reservation,
+      payload_sha256: rec.payload_sha256, deadline_ms: rec.expires_at - rec.sent_at, reservation, origin_inject_id: rec.inject_id,
     });
     if (!c.ok) { ledgerStats[c.code === "LEDGER_FULL" ? "ledger_full" : "write_failed"] += 1; return; }
     ledger.recordEvent({
@@ -1420,10 +1433,17 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     try {
       const list = await receiptAdapter.fetch(lr.correlation_id);
       const q = byNonce(nonce);
-      // The injects this origin knows carried the request: its own inject + its relay receipts for the nonce.
-      const injectIds = [q && q.inject_id, ...ledger.outbox().filter((o) => o.nonce === nonce && o.receipt).map((o) => o.receipt.transport_id)]
+      // The injects this origin knows carried the request: its own inject (the ledger's I outlives the store
+      // record, SPEC 2026-10-12 §1.1) + its relay receipts for the nonce.
+      const injectIds = [lr.origin_inject_id ?? (q && q.inject_id), ...ledger.outbox().filter((o) => o.nonce === nonce && o.receipt).map((o) => o.receipt.transport_id)]
         .filter((x) => typeof x === "string");
-      if (Array.isArray(list) && list.length) applyReceipts({ ledger, nonce, receipts: list, provenance: provenanceAdapter, injectIds });
+      const out = Array.isArray(list) && list.length
+        ? applyReceipts({ ledger, nonce, receipts: list, provenance: provenanceAdapter, injectIds, pinnedKeys: routes, localPeer: LOCAL }) : null;
+      lastRefusals.delete(nonce);
+      if (out && Object.keys(out.refused).length) {
+        lastRefusals.set(nonce, out.refused);
+        while (lastRefusals.size > REFUSALS_MAX) lastRefusals.delete(lastRefusals.keys().next().value);
+      }
       if (lr.via === null && q && q.inject_id && lr.stages.agent_consumed === null) {
         applyConsumption({ ledger, nonce, observation: await receiptAdapter.consumption(q.inject_id) });
       }
@@ -1450,8 +1470,10 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     if (st.lifecycle === undefined) return { ...st, ledger: { mode: ledger.mode, ...ledgerStats } };
     const q = byNonce(st.nonce);
     const live = Boolean(q) && isLive(q, Date.now());
+    const refusals = lastRefusals.get(st.nonce);
     return {
       ...st, ...(live ? {} : { status_reasons: [...st.status_reasons, "TRANSPORT_NONCE_EXPIRED"] }), transport_nonce: live ? "live" : "expired",
+      ...(refusals ? { receipt_refusals: { ...refusals } } : {}),
       ...ledgerReplies(st.nonce, cursor), ledger: { mode: ledger.mode, ...ledgerStats },
     };
   });
@@ -1461,6 +1483,57 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     if (!relay) return ledgerOpenCode ? fail("LEDGER_UNAVAILABLE", { ledger_code: ledgerOpenCode }) : fail("LEDGER_NOT_CONFIGURED");
     const r = await relay.tick();
     return r.ok ? { ...r, completion_fact: null } : fail(r.code);
+  });
+
+  // SPEC 2026-10-12 §1.2 (U4): R's relay intake (not an MCP tool). `prompt` is the leg-1 prompt R's session
+  // `session` (R's own session id at this daemon) received at `arrival_ms`; `to` is R's route to F ({host: R's own
+  // name for F's host, session: D}); `text` the work to forward (default: the prompt without its wire header).
+  // R looks I up at its OWN daemon, keeping only rows whose verified sender is the prompt's reply-to inbox:
+  // interim §1.2(b) by the arrival window (default), or T-1 §1.2(a) by correlation_id with the stored leg-1
+  // context (extensions.originLookup "t1"). Anything but exactly one row is ORIGIN_INJECT_AMBIGUOUS (I = null):
+  // the work is still enqueued, without relay_context. A failed audit read enqueues nothing (typed code; retry).
+  // The item is recorded under the inbound nonce (a re-intake is deduplicated); the relay runner sends it.
+  const relayIntake = guarded(async ({ prompt, session, to, text, arrival_ms }) => {
+    const m = typeof prompt === "string" ? WIRE_RE.exec(prompt) : null;
+    if (!m || typeof session !== "string" || !SID_RE.test(session)
+        || to === null || typeof to !== "object" || typeof to.host !== "string" || !HOST_RE.test(to.host)
+        || typeof to.session !== "string" || !SID_RE.test(to.session)
+        || (text !== undefined && (typeof text !== "string" || text.length < 1 || text.length > TEXT_MAX || text.includes("\u0000")))
+        || (arrival_ms !== undefined && !Number.isSafeInteger(arrival_ms))) {
+      return fail("INVALID_ARGUMENT");
+    }
+    if (!ledger) return ledgerOpenCode ? fail("LEDGER_UNAVAILABLE", { ledger_code: ledgerOpenCode }) : fail("LEDGER_NOT_CONFIGURED");
+    if (ledger.mode !== "read_write") return fail("LEDGER_READ_ONLY");
+    const [, nonce, replyTo, correlationId, payload] = m;
+    const arrival = arrival_ms === undefined ? Date.now() : arrival_ms;
+    const t1 = ext.originLookup === "t1";
+    const q = t1 ? `?to=${encodeURIComponent(session)}&correlation_id=${correlationId}&limit=200`
+      : `?to=${encodeURIComponent(session)}&since=${encodeURIComponent(iso(arrival - ORIGIN_LOOKUP_BEFORE_MS))}`
+        + `&until=${encodeURIComponent(iso(arrival + ORIGIN_LOOKUP_AFTER_MS))}&limit=200`;
+    const r = await client.get(`/api/injects${q}`, { timeoutMs: READ_TIMEOUT_MS });
+    if (!r.ok) return fail(r.code, { http_status: r.http_status ?? null });
+    // A truncated page cannot show that one row is the only one: ambiguous.
+    const complete = Array.isArray(r.body.injects) && r.body.next_cursor == null;
+    const rows = complete ? r.body.injects.filter((row) => row && row.to === session && row.verified_sender_sid === replyTo
+      && (t1 ? relayContextVariant(row.relay_context) !== null && row.relay_context.correlation_id === correlationId
+        : Date.parse(row.ts) >= arrival - ORIGIN_LOOKUP_BEFORE_MS && Date.parse(row.ts) <= arrival + ORIGIN_LOOKUP_AFTER_MS)) : [];
+    const one = rows.length === 1 && typeof rows[0].inject_id === "string" && INJECT_ID_RE.test(rows[0].inject_id) ? rows[0] : null;
+    const relayContext = one ? nextRelayContext({ inbound: t1 ? one.relay_context : null, correlationId, originInjectId: one.inject_id, finalSession: to.session }) : null;
+    const lookup = one ? null : { code: "ORIGIN_INJECT_AMBIGUOUS", candidates: complete ? rows.length : null };
+    const c = ledger.createRequest({
+      nonce, correlation_id: correlationId, request_id: null, origin: { host: LOCAL, session: replyTo }, destination: { host: to.host, session: to.session },
+      via: null, reply_to: { host: LOCAL, session: replyTo }, generation: null, payload_sha256: sha256hex(prompt), deadline_ms: ISSUED_TTL_MS,
+      ...(relayContext ? { origin_inject_id: relayContext.origin_inject_id } : {}),
+    });
+    if (!c.ok) return fail(c.code);
+    const e = ledger.enqueue({ nonce, to: { host: to.host, session: to.session }, kind: "relay", text: text === undefined ? payload : text, relay_context: relayContext, origin_lookup: lookup });
+    if (!e.ok) return fail(e.code);
+    const item = ledger.outbox().find((o) => o.key === e.key);
+    const ctx = item && item.relay_context ? item.relay_context : null;
+    return ok({
+      key: e.key, deduplicated: e.deduplicated, nonce, correlation_id: correlationId, origin_inject_id: ctx ? ctx.origin_inject_id : null, relay_context: ctx,
+      ...(item && item.origin_lookup ? { origin_lookup: item.origin_lookup } : {}), completion_fact: null,
+    });
   });
 
   // Graceful close only: own listener + at most one owned DELETE with the current bearer. Durable:
@@ -1515,6 +1588,6 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
 
   return Object.freeze({
     get inboxId() { return S.inbox.id; },
-    health, listAllowedTargets, send, receipt, readReply, requestStatus, relayTick: relayTickNow, close,
+    health, listAllowedTargets, send, receipt, readReply, requestStatus, relayTick: relayTickNow, relayIntake, close,
   });
 }

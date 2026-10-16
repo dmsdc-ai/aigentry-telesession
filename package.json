@@ -19,7 +19,7 @@
   },
   "scripts": {
     "test": "node --test test/",
-    "test:unit": "node --test --test-reporter=tap test/config.test.js test/store.test.js test/tunnel-child.test.js test/tunnel-child-independent.test.js test/relay-ledger.test.js test/relay-outbox.test.js test/relay-retention.test.js test/relay-route.test.js test/relay-runner.test.js test/transport-durable.test.js test/transport-ledger.test.js test/transport-postexpiry.test.js test/transport-reconcile.test.js test/transport-telepty.test.js test/test-runners.test.js test/transport-crosshost.test.js test/e2e-full-route.test.js test/transport-uncertain-1238.test.js",
+    "test:unit": "node --test --test-reporter=tap test/config.test.js test/store.test.js test/tunnel-child.test.js test/tunnel-child-independent.test.js test/relay-ledger.test.js test/relay-outbox.test.js test/relay-retention.test.js test/relay-route.test.js test/relay-runner.test.js test/transport-durable.test.js test/transport-ledger.test.js test/transport-postexpiry.test.js test/transport-reconcile.test.js test/transport-telepty.test.js test/test-runners.test.js test/transport-crosshost.test.js test/e2e-full-route.test.js test/relay-receipt-binding.test.js test/relay-intake.test.js test/transport-uncertain-1238.test.js",
     "test:real-daemon": "node --test --test-reporter=tap test/real-daemon-restart.test.js test/transport-telepty.test.js test/mcp.test.js",
     "test:e2e": "node --test --test-reporter=tap test/e2e-full-route.test.js",
     "check:pack": "npm pack --dry-run --ignore-scripts"

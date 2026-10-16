@@ -21,10 +21,21 @@
  * Hooks let a test act at precise points: beforeInject / afterInject (e.g. SIGKILL a child, then
  * "hang" or "reset" the connection), onRegister ("reset" after creating = lost response), onDelete
  * ({status} override), beforeDelivery ("fail" = receiver unreachable for that attempt).
+ *
+ * SPEC 2026-10-12 §5 (models PROPOSED telepty#100 T-1/T-2 and telepty#111; not evidence they exist):
+ *   - `relay_context` on POST …/inject is validated with test/helpers/relay-context.js (role "deliver" for a local
+ *     target); a refusal is 400 RELAY_CONTEXT_INVALID with no inject id and no audit row; the context (or null)
+ *     is stored on the audit row; GET /api/injects gains the `correlation_id` filter (T-1);
+ *   - capability `final-receipts-v2` only with {receiptsV2:true} (absent by default, as on db2f532);
+ *   - {forward111:true|"strip"|"rewrite", peers:{<peer>: final daemon}}: a fake #111. An inject to `sid@<peer>`
+ *     (this fake daemon's own peer name) is validated with role "forward" and passed to that peer's final daemon
+ *     with `relay_context` verbatim (or stripped / origin_inject_id rewritten, row H3); the answer is the remote
+ *     inject id + a routing receipt (hop evidence only). Without forward111, `sid@<peer>` is 404 as on db2f532.
  */
 
 import http from "node:http";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { validateRelayContext } from "./relay-context.js";
 
 export const FAKE_CAPABILITIES = Object.freeze(["sessions", "inject-exact-target", "register-create-only", "delete-owned-session"]);
 
@@ -62,7 +73,8 @@ function postJson(endpoint, body, timeoutMs = 5000) {
   });
 }
 
-export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs = [1000, 2000], capabilities = FAKE_CAPABILITIES } = {}) {
+export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs = [1000, 2000], capabilities = FAKE_CAPABILITIES,
+  receiptsV2 = false, forward111 = false, peers = {} } = {}) {
   const token = hex(24);
   const sessions = new Map();          // id → {id, type, epoch, generation, bearer, endpoint, delivered[]}
   const audit = [];                    // audit rows (persist across restartDaemon, like the audit file)
@@ -73,6 +85,7 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
   const injects = [];                  // injects the daemon PROCESSED (audited or 404)
   const registrations = [];
   const deletes = [];
+  const forwards = [];                 // fake #111: {to, peer, relay_context (as forwarded), status, inject_id}
   const hooks = {};
   const timers = new Set();
   let generationSeq = 0;
@@ -128,6 +141,10 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
     const record = { to: id, prompt, from, sessionToken: sessionToken || null, status: null, inject_id: null };
     injects.push(record);
     if (!session) { record.status = 404; return { status: 404, body: { code: "SESSION_NOT_FOUND" } }; }   // F3a
+    if (!validateRelayContext(body.relay_context, { resolvedSid: id, role: "deliver" }).ok) {
+      record.status = 400;
+      return { status: 400, body: { code: "RELAY_CONTEXT_INVALID" } };
+    }
     const p = principalFor(sessionToken);
     const inject_id = randomUUID();
     let strategy = "direct";
@@ -147,11 +164,34 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
       to: id, to_alias: null, origin: "trusted-local",
       spoof_suspected: !!(from && p && from !== p.sid),
       payload_sha256: sha256(prompt), delivery_result: "success",
+      relay_context: body.relay_context ? structuredClone(body.relay_context) : null,
     });
     observations.set(inject_id, { inject_id, session_id: id, session_epoch: session.epoch, tracking_state: "tracked" });
     record.status = 200;
     record.inject_id = inject_id;
     return { status: 200, body: { success: true, inject_id, exact_target: body.exact_target === true, session_id: id, strategy } };
+  }
+
+  // Fake #111: forward an exact remote target to the final daemon this fake daemon knows under `peer`.
+  async function forwardInject(id, body) {
+    const at = id.lastIndexOf("@");
+    const sid = id.slice(0, at);
+    const peer = id.slice(at + 1);
+    const target = Object.prototype.hasOwnProperty.call(peers, peer) ? peers[peer] : null;
+    const entry = { to: sid, peer, relay_context: undefined, status: null, inject_id: null };
+    forwards.push(entry);
+    if (!target) { entry.status = 404; return { status: 404, body: { code: "PEER_NOT_FOUND" } }; }
+    if (!validateRelayContext(body.relay_context, { role: "forward" }).ok) { entry.status = 400; return { status: 400, body: { code: "RELAY_CONTEXT_INVALID" } }; }
+    let ctx = body.relay_context === undefined || body.relay_context === null ? undefined : structuredClone(body.relay_context);
+    if (forward111 === "strip") ctx = undefined;
+    else if (forward111 === "rewrite" && ctx) ctx = { ...ctx, origin_inject_id: "rewritten-by-forwarder" };
+    entry.relay_context = ctx ?? null;
+    const r = await target.send({ session: sid, text: typeof body.prompt === "string" ? body.prompt : "", relay_context: ctx });
+    if (!r || r.ok !== true) { entry.status = 502; return { status: 502, body: { code: (r && r.code) || "FORWARD_FAILED" } }; }
+    entry.status = 200;
+    entry.inject_id = r.transport_id;
+    return { status: 200, body: { success: true, inject_id: r.transport_id, exact_target: true, session_id: id,
+      routing_receipt: { stage: "transport_accepted", forwarded_to: peer, inject_id: r.transport_id } } };
   }
 
   function send(res, status, body) {
@@ -174,7 +214,7 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
     const ctx = { req, res, body, entry };
 
     if (req.method === "GET" && url.pathname === "/api/meta") {
-      return send(res, 200, { name: "fake-telepty", version: "0.0.0-fake", pid, capabilities: [...capabilities] });
+      return send(res, 200, { name: "fake-telepty", version: "0.0.0-fake", pid, capabilities: [...capabilities, ...(receiptsV2 ? ["final-receipts-v2"] : [])] });
     }
     if (req.method === "GET" && url.pathname === "/api/sessions") {
       return send(res, 200, [...sessions.values()].map((s) => ({ id: s.id, type: s.type })));
@@ -203,6 +243,7 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
       if (pre === "hang") return undefined;
       if (pre === "reset") { req.socket.destroy(); return undefined; }
       if (pre && typeof pre === "object") return send(res, pre.status, pre.body);
+      if (forward111 && id.includes("@")) { const fw = await forwardInject(id, body || {}); return send(res, fw.status, fw.body); }
       const out = processInject(id, body || {}, sessionToken);
       const post = hooks.afterInject ? await hooks.afterInject({ ...ctx, id, out }) : undefined;
       if (post === "hang") return undefined;
@@ -222,6 +263,7 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
       const limit = Math.min(Number(q.limit) || 200, 1000);
       const rows = audit.filter((r) => (!q.to || r.to === q.to)
         && (!q.from || r.claimed_from === q.from || r.verified_sender_sid === q.from)
+        && (!q.correlation_id || (r.relay_context && r.relay_context.correlation_id === q.correlation_id))
         && (flags.ignoreWindow || (Date.parse(r.ts) >= since && Date.parse(r.ts) <= until))).slice(0, limit);
       return send(res, 200, { injects: rows, next_cursor: flags.forceNextCursor ? "cursor-2" : null });
     }
@@ -252,7 +294,7 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
   const origin = `http://127.0.0.1:${server.address().port}`;
 
   return {
-    origin, token, sessions, audit, observations, mailbox, requests, injectArrivals, injects, registrations, deletes, hooks, flags,
+    origin, token, sessions, audit, observations, mailbox, requests, injectArrivals, injects, registrations, deletes, forwards, hooks, flags,
     get pid() { return pid; },
     // Only POST …/inject requests the daemon processed, optionally for one target.
     injectsTo: (id) => injects.filter((r) => r.to === id),
@@ -262,9 +304,11 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
       const s = sessions.get(fromSid);
       return processInject(to, { prompt: text, from, exact_target: true }, bearer !== undefined ? bearer : s && s.bearer);
     },
-    // Another holder of a valid token (e.g. a different session's bearer) injecting anything. `ts` places
-    // the audit row in time (e.g. inside a recovery probe window).
-    injectAs(bearer, to, prompt, from, { ts } = {}) { return processInject(to, { prompt, from, exact_target: true }, bearer, { ts }); },
+    // Another holder of a valid token (e.g. a different session's bearer) injecting anything, optionally with a
+    // relay_context (U4 rows). `ts` places the audit row in time (e.g. inside a recovery probe window).
+    injectAs(bearer, to, prompt, from, { ts, relay_context } = {}) {
+      return processInject(to, { prompt, from, exact_target: true, ...(relay_context ? { relay_context } : {}) }, bearer, { ts });
+    },
     addAuditRow(row, { observe = true } = {}) {
       const full = {
         ts: new Date().toISOString(), inject_id: randomUUID(), kind: "inject", source: "inject", claimed_from: null,

@@ -26,8 +26,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
+import http from "node:http";
 import { createTeleptyTransport, normalizeConfig, REQUIRED_CAPABILITIES } from "../src/index.js";
-import { HAS_TELEPTY, TELEPTY_DIR, listSessionIds, startRestartableTeleptyDaemon, startTeleptyBridge, waitFor } from "./helpers.js";
+import { openLedger } from "../src/relay/ledger.js";
+import { createRouteResolver } from "../src/relay/route.js";
+import { HAS_TELEPTY, TELEPTY_DIR, listSessionIds, registerAterm, startAtermEndpoint, startRestartableTeleptyDaemon, startTeleptyBridge, waitFor } from "./helpers.js";
+import { createFakeReceiptSeam, assertDistinctNames } from "./helpers/fake-receipts.js";
 
 const CHILD = path.join(TELEPTY_DIR, "test-support", "restart-credential-child-1215.js");
 const TARGET = "orchestrator";
@@ -201,4 +205,142 @@ test("RC5 telesession across a real daemon restart: wrapped target replies with 
     daemon_restart: s2.daemon_restart, reply_route: rr.reply_route, wrapper_alive: bridge.isAlive(),
   })}`);
   assert.equal(bridge.isAlive(), true, "the wrapped target survived the restart");
+});
+
+// RC2 (SPEC 2026-10-12 §6, U4) — R's relay intake across a REAL telepty daemon restart (RC5-style; harness daemon
+// only, from TELESESSION_TEST_TELEPTY_DIR). O, R ("orchestrator", a real wrapped session) and D ("w", an aterm
+// registered after the restart) share one daemon: a same-host relayed record (§2.5 N-c, F's key pinned at O under
+// `local`; O calls the host "mac", R "macbook"). The real daemon does not read relay_context (db2f532), so a
+// loopback recording proxy in front of it captures the body of R's inject to D, and the synthetic F seam
+// (fake-receipts.js, the "harness receipt shim" role of §6 U6) adopts that J with that context and signs. Pass is
+// origin-side evidence against a shim only, not evidence that telepty#100 exists.
+test("RC2 relay intake across a real daemon restart: I and C unchanged; the wrapped R keeps its epoch; R's final context reaches F's inject body; O completes from F's signed receipt", { timeout: CASE_TIMEOUT_MS }, async (t) => {
+  assert.equal(HAS_TELEPTY, true, `RC2 needs the candidate telepty tree at ${TELEPTY_DIR} (a missing fixture is a FAIL, not a skip)`);
+  assert.ok(fs.existsSync(CHILD), `RC2 fixture child missing at ${CHILD}`);
+  assert.notEqual(process.platform, "win32", "RC2 is POSIX-only (node-pty bridge)");
+  assertDistinctNames("mac", "macbook", "host-m");
+
+  const sbO = makeStateSandbox();
+  const sbR = makeStateSandbox();
+  let d = null;
+  let bridge = null;
+  let aterm = null;
+  let proxy = null;
+  const open = [];
+  t.after(async () => {
+    for (const o of open) { try { await o.tr.close(); } catch { /* best effort */ } o.l.close(); }
+    if (proxy) await new Promise((r) => { proxy.closeAllConnections(); proxy.close(() => r()); });
+    if (aterm) await aterm.close();
+    if (bridge) await bridge.stop();
+    if (d) await d.stop();
+    sbO.remove();
+    sbR.remove();
+  });
+  const until = async (check, opts) => {
+    try {
+      return await waitFor(async () => { try { return await check(); } catch { return null; } }, opts);
+    } catch (err) {
+      throw new Error(`${err.message}\n${redact(`bridge log (tail):\n${bridge ? bridge.readLog().slice(-1500) : ""}\ndaemon log (tail):\n${d ? d.readLog().slice(-2500) : ""}`, d && d.token)}`);
+    }
+  };
+  const activeClients = async (sid) => {
+    const r = await d.request(`/api/sessions/${encodeURIComponent(sid)}`);
+    return r.status === 200 && r.body && typeof r.body.active_clients === "number" ? r.body.active_clients : 0;
+  };
+  const epochOf = async (injectId) => (await d.request(`/api/inject-observations/${encodeURIComponent(injectId)}`)).body.session_epoch;
+
+  // Peer-lane policy (harness daemon only): D "w" is named an orchestrator sid next to R, so R's telesession inbox
+  // may inject to it (otherwise PEER_INJECT_BLOCKED, as measured). O → R uses the built-in "orchestrator" as RC5.
+  d = await startRestartableTeleptyDaemon({ orchestratorSids: `${TARGET} w` });
+  bridge = startTeleptyBridge(d, { sid: TARGET, script: CHILD });
+  await until(async () => (await activeClients(TARGET)) >= 1 && /RC-CHILD-READY has_sid=true/.test(bridge.readLog()),
+    { timeoutMs: 30000, description: "the wrapped R owns its session" });
+
+  // F stand-in: synthetic key (in-test only), pinned at O under O's own name for the host (`local`, locator "mac").
+  const F = createFakeReceiptSeam({ selfLabel: "host-m", mode: "unproven" });
+  const node = (sb, targets, resolver, origin, ext = {}) => {
+    const l = openLedger({ dir: path.join(sb.stateDir, "..", "ledger") });
+    const tr = createTeleptyTransport(normalizeConfig({ teleptyUrl: origin, token: d.token, targets, inboxPrefix: "rc2", stateDir: sb.stateDir }),
+      sb.seam(), { ledger: l, resolver, ...ext });
+    open.push({ tr, l });
+    return { tr, l };
+  };
+  const O = node(sbO, [TARGET], createRouteResolver([F.publicPeerEntry("local", ["local", "mac"])]), d.origin, { receipts: F.adapter });
+
+  // ── Leg 1 accepted before the restart ──
+  const text = "rc2 relayed work";
+  const s = await O.tr.send({ target: TARGET, text, destination: { host: "mac", session: "w" } });
+  assert.equal(s.ok, true, `leg-1 send: ${redact(JSON.stringify(s), d.token)}`);
+  const wire = `[telesession nonce=${s.nonce} reply-to=${s.reply_to} correlation=${s.correlation_id}]\n${text}`;
+  await until(() => bridge.readLog().includes(wire.split("\n")[0]), { timeoutMs: 15000, description: "the leg-1 prompt reached R's PTY" });
+  const arrival = Date.now();
+  const epochBefore = await epochOf(s.inject_id);
+  // The audit writer flushes asynchronously (TELEPTY_AUDIT_FLUSH_MS, default 250 ms); R's lookup reads that audit,
+  // so the leg-1 row must be on disk before the restart (measured: a row not yet flushed was absent after it).
+  await until(async () => (await d.request(`/api/injects?to=${TARGET}&limit=1000`)).body.injects.some((x) => x.inject_id === s.inject_id),
+    { timeoutMs: 10000, description: "the leg-1 audit row is written" });
+  assert.equal(typeof epochBefore, "string");
+
+  // ── Restart: same HOME, same port ──
+  assert.deepEqual(await d.restart({ signal: "SIGTERM" }), { code: 0, signal: null });
+  await until(async () => (await activeClients(TARGET)) >= 1, { timeoutMs: 45000, description: "the wrapped R reconnects" });
+  aterm = await startAtermEndpoint();
+  const D = await registerAterm(d, "w", aterm.endpoint);
+  F.finalDaemon({ sid: "w", epoch: D.epoch });
+  // R's child posts with its SPAWN-TIME bearer; the audit's verified epoch is R's epoch after the restart (the
+  // leading newline submits the unsubmitted last line of the leg-1 prompt still pending in the child).
+  const tag = `rc2-${randomBytes(4).toString("hex")}`;
+  assert.equal((await d.request(`/api/sessions/${TARGET}/inject`, { method: "POST", body: { prompt: `\nRCSEND w ${tag}` } })).status, 200);
+  await until(() => new RegExp(`RC-SENT ${tag} status=200`).test(bridge.readLog()), { timeoutMs: 20000, description: "R's child posted with its spawn-time bearer" });
+  const rRow = await until(async () => (await d.request("/api/injects?to=w&limit=1000")).body.injects.find((x) => x.verified_sender_sid === TARGET),
+    { timeoutMs: 15000, description: "the audit row of R's post" });
+  assert.equal(rRow.verified_sender_epoch, epochBefore, "the wrapped R keeps its epoch across the restart");
+
+  // R's telesession talks to the restarted daemon through a recording proxy (bodies of injects to "w").
+  const toW = [];
+  proxy = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks);
+      const up = http.request({ host: "127.0.0.1", port: d.port, path: req.url, method: req.method, headers: req.headers }, (ur) => {
+        const out = [];
+        ur.on("data", (c) => out.push(c));
+        ur.on("end", () => {
+          const resBody = Buffer.concat(out);
+          if (req.method === "POST" && req.url === "/api/sessions/w/inject") {
+            try { toW.push({ request: JSON.parse(body.toString("utf8")), response: JSON.parse(resBody.toString("utf8")) }); } catch { /* recorded only when JSON */ }
+          }
+          res.writeHead(ur.statusCode, ur.headers);
+          res.end(resBody);
+        });
+      });
+      up.on("error", () => { res.writeHead(502); res.end(); });
+      up.end(body);
+    });
+  });
+  await new Promise((r) => proxy.listen({ host: "127.0.0.1", port: 0 }, r));
+  const R = node(sbR, ["w"], createRouteResolver([{ peer_id: "local", locators: ["local", "macbook"] }]), `http://127.0.0.1:${proxy.address().port}`);
+
+  // ── R's intake after the restart: I from the restarted daemon's audit (interim lookup), C from the wire ──
+  const r = await R.tr.relayIntake({ prompt: wire, session: TARGET, to: { host: "macbook", session: "w" }, arrival_ms: arrival });
+  assert.equal(r.ok, true, redact(JSON.stringify(r), d.token));
+  assert.deepEqual([r.origin_inject_id, r.correlation_id, r.origin_lookup], [s.inject_id, s.correlation_id, undefined], "I and C unchanged across the restart");
+  const tick = await R.tr.relayTick();
+  assert.deepEqual(tick.sent, [r.key], redact(JSON.stringify([tick, R.l.outbox().find((o) => o.key === r.key)]), d.token));
+  const J = R.l.outbox().find((o) => o.key === r.key).receipt.transport_id;
+  assert.equal(toW.length, 1);
+  assert.deepEqual([toW[0].response.inject_id, toW[0].request.relay_context],
+    [J, { v: 2, leg: "final", correlation_id: s.correlation_id, origin_inject_id: s.inject_id, final_session: "w", hop: 1 }], "R's final context in F's inject body");
+  await until(() => aterm.received.some((x) => x.body && String(x.body.text).endsWith(text)), { timeoutMs: 15000, description: "J delivered to D" });
+
+  // ── F (shim) adopts J with the context it received and signs D's stages ──
+  assert.equal(F.inject({ J, sid: "w", prompt: toW[0].request.prompt, relay_context: toW[0].request.relay_context }).ok, true);
+  F.attest(J, "agent_consumed");
+  F.attest(J, "processing_completed");
+  const st = await O.tr.requestStatus({ nonce: s.nonce });
+  assert.deepEqual([st.stage, st.receipt_refusals, st.replies[0].attestation], ["origin_ack_received", undefined, "destination"], redact(JSON.stringify(st), d.token));
+  assert.equal((await O.tr.requestStatus({ nonce: s.nonce, cursor: st.next_cursor })).status, "completed");
+  t.diagnostic(`RC-SUMMARY ${JSON.stringify({ case: "RC2", i_unchanged: true, c_unchanged: true, r_epoch_kept: true, completed: true,
+    evidence: "origin-side against the harness receipt shim (fake-receipts.js), not telepty#100" })}`);
 });
