@@ -123,7 +123,8 @@ function createHttpClient(cfg) {
       const code = parsed && typeof parsed.code === "string" && DAEMON_CODE_RE.test(parsed.code)
         ? parsed.code
         : `DAEMON_HTTP_${res.status}`;
-      return { ok: false, http_status: res.status, code, sent: "yes" };
+      // An explicit uncertain outcome is not a refusal, even with HTTP error headers.
+      return { ok: false, http_status: res.status, code, sent: code === "DELIVERY_UNCERTAIN" ? "unknown" : "yes" };
     }
     if (parsed === null || typeof parsed !== "object") {
       return { ok: false, http_status: res.status, code: "DAEMON_BAD_RESPONSE", sent: "unknown" };
@@ -277,7 +278,7 @@ export function mapReceipt(body) {
   let receipt = "unknown";
   if (b.consumption && b.consumption.status === "observed") receipt = "consumption_observed";
   else if (b.observation && b.observation.kind === "inject_parked") receipt = "queued";
-  else if (trackingState === "aborted") receipt = "refused";
+  // Tracking termination alone does not prove that delivery was refused.
   return { receipt, tracking_state: trackingState };
 }
 
@@ -1263,7 +1264,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       return fail(r.code, r.sent === "yes" ? { http_status: r.http_status, accepted: false, ...degraded } : { accepted: false, ...degraded });
     }
     if (!r.ok) {
-      // No usable response: the bytes may or may not have been accepted. Never re-sent.
+      // No definitive outcome: the bytes may or may not have been accepted. Never re-sent.
       settle({ state: "uncertain", uncertain_reason: "no_response", error_code: r.code });
       return ok({
         accepted: "unknown", inject_id: null, target, nonce, correlation_id: correlationId, delivery: "unknown", reason: r.code, reply: "not_observed",
