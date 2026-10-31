@@ -139,8 +139,11 @@ security triage of the launcher were still ongoing at this snapshot.
 ## Relay and `destination` (unsupported in 0.2.0)
 The relay runner, the `telesession-relay-tick` CLI and `telesession_send.destination` ship in 0.2.0
 but are **unsupported and default-off**, and no request can complete through them:
-- Non-local routes are refused with `PEER_UNSUPPORTED`. A daemon-side exact remote forward does not
-  exist yet (telepty#111).
+- `destination` is experimental metadata and is not routed end to end. An origin `telesession_send`
+  with a `destination` still injects the allowlisted `target` on the local daemon (a real effect). Only
+  the correlation record names the destination, and it can remain `pending`.
+- `PEER_UNSUPPORTED` applies to relay items for another peer, which are refused before any inject. It
+  does not refuse an origin send. A daemon-side exact remote forward does not exist yet (telepty#111).
 - The outbox is not wired: `ledger.enqueue()` has no caller in the shipped processes, so the runner
   has nothing to send.
 - Relayed receipts cannot be bound to the origin inject and are refused (`INJECT_MISMATCH`, #8).

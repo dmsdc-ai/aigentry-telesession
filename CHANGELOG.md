@@ -24,8 +24,10 @@ The 0.2.0 release line (`704200d`) now includes the reviewed Linux follow-up (`9
   are unchanged.
 - License notice: the MIT `LICENSE` file (2026 dmsdc) is now included and packed. The license terms are
   unchanged. `test:pack` asserts the exact packed file set.
-- Release validation: the new manual `compatibility.yml` workflow runs the full suite, `test:pack` and (Linux/macOS)
-  installed-tarball acceptance against one exact Telepty commit (40-hex input) on ubuntu/macos/windows. It does not
+- Release validation: the new `compatibility.yml` workflow, called by `release-check.yml` when its optional
+  `telepty_ref` input is set (`workflow_call`; direct dispatch only once the file is on the default branch), runs the
+  full suite, `test:pack` and (Linux/macOS) installed-tarball acceptance against one exact Telepty commit (40-hex
+  input) on ubuntu/macos/windows. The release gate fails unless that run passed on the requested SHA. It does not
   replace the cross-host Mac/Linux live communication gate required before Telepty publication.
 - Tests: `test:pack` (packed file list, including all four bins) and `test:installed` (installed-artifact
   acceptance, 6 tools). The RC5 restart child is consumer-owned (`test-support/restart-credential-child-1215.cjs`).

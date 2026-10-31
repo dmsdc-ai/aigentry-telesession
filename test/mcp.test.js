@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import {
@@ -16,18 +17,35 @@ import {
 const TOOLS = ["telesession_health", "telesession_list_targets", "telesession_read_reply", "telesession_receipt", "telesession_request_status", "telesession_send"];
 const UNUSED_LOOPBACK = "http://127.0.0.1:47999";   // never the telepty default port; nothing listens here
 
-function sdkVersion() {
-  let dir = path.dirname(fileURLToPath(import.meta.resolve("@modelcontextprotocol/sdk/client/index.js")));
+// The package.json (and its path) of `name`, found upward from one of its resolved module files.
+function installedPackage(file, name) {
+  let dir = path.dirname(file);
   for (;;) {
     const p = path.join(dir, "package.json");
     if (fs.existsSync(p)) {
       const pkg = JSON.parse(fs.readFileSync(p, "utf8"));
-      if (pkg.name === "@modelcontextprotocol/sdk") return pkg.version;
+      if (pkg.name === name) return { pkg, file: p };
     }
     const up = path.dirname(dir);
     if (up === dir) return null;
     dir = up;
   }
+}
+
+// Only the range forms these manifests use: `^X`, `^X.Y`, `^X.Y.Z`, joined by `||`. Anything else fails loudly.
+function satisfiesCaret(version, range) {
+  const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
+  assert.ok(m, `installed version ${version} is not a plain release X.Y.Z`);
+  const v = m.slice(1).map(Number);
+  return range.split("||").map((s) => s.trim()).some((alt) => {
+    const r = /^\^(\d+)(?:\.(\d+))?(?:\.(\d+))?$/.exec(alt);
+    assert.ok(r, `unsupported range form "${alt}" in "${range}"`);
+    const floor = r.slice(1).map((x) => Number(x || 0));
+    assert.ok(floor[0] > 0, `unsupported ^0.x range "${alt}" (stricter caret semantics)`);
+    if (v[0] !== floor[0]) return false;
+    for (let i = 1; i < 3; i += 1) if (v[i] !== floor[i]) return v[i] > floor[i];
+    return true;
+  });
 }
 
 async function connectMcp(env, name) {
@@ -80,13 +98,22 @@ const cfgEnv = (origin, extra = {}) => ({
   TELESESSION_TELEPTY_URL: origin, TELESESSION_TELEPTY_TOKEN: freshToken(), ...extra,
 });
 
-test("installed MCP SDK version vs declared ^1.26.0", (t) => {
-  const v = sdkVersion();
+// No literal versions: the manifests are the contract. The SDK checked is the one this file's MCP caller
+// (Client + StdioClientTransport, exercised by the tests below) imports.
+test("installed MCP SDK satisfies the declared range, and its own declared zod peer range is met", (t) => {
+  const sdk = installedPackage(fileURLToPath(import.meta.resolve("@modelcontextprotocol/sdk/client/index.js")), "@modelcontextprotocol/sdk");
+  assert.ok(sdk, "installed @modelcontextprotocol/sdk package.json not found");
   const declared = JSON.parse(fs.readFileSync(path.join(PACKAGE_DIR, "package.json"), "utf8")).dependencies["@modelcontextprotocol/sdk"];
-  t.diagnostic(`@modelcontextprotocol/sdk installed ${v}, declared ${declared}`);
-  assert.equal(declared, "^1.26.0");
-  const [maj, min] = v.split(".").map(Number);
-  assert.ok(maj === 1 && min >= 26, `installed ${v} satisfies ${declared}`);
+  t.diagnostic(`@modelcontextprotocol/sdk installed ${sdk.pkg.version}, declared ${declared}`);
+  assert.equal(typeof declared, "string", "package.json declares @modelcontextprotocol/sdk");
+  assert.ok(satisfiesCaret(sdk.pkg.version, declared), `installed SDK ${sdk.pkg.version} satisfies ${declared}`);
+
+  const peer = sdk.pkg.peerDependencies && sdk.pkg.peerDependencies.zod;
+  assert.equal(typeof peer, "string", "the installed SDK declares a zod peer range");
+  const zod = installedPackage(createRequire(sdk.file).resolve("zod"), "zod");
+  assert.ok(zod, "zod as resolved by the installed SDK not found");
+  t.diagnostic(`zod resolved by the SDK ${zod.pkg.version}, SDK peer range ${peer}`);
+  assert.ok(satisfiesCaret(zod.pkg.version, peer), `zod ${zod.pkg.version} satisfies the SDK's own peer range ${peer}`);
 });
 
 test("telesession-mcp refuses invalid config: exit 2, one code-only stderr line, no secret", async () => {

@@ -108,10 +108,13 @@ automatic replay when space returns. No exactly-once, application-consumption or
 task-completion guarantee is made; completion_fact remains null.
 
 The relay runner (`TELESESSION_RELAY_INTERVAL_MS`), `telesession-relay-tick` and
-`telesession_send.destination` are unsupported in 0.2.0. Non-local routes are refused
-(`PEER_UNSUPPORTED`), and the outbox, relayed-receipt and remote-provenance wiring is
-incomplete. A destination request stays `pending`, which is never completed remote
-delivery. See the README.
+`telesession_send.destination` are unsupported in 0.2.0. `destination` is experimental
+metadata and is not routed end to end. An origin send with a `destination` still injects
+the allowlisted `target` on the local daemon (a real effect). Only the correlation record
+names the destination, and it can remain `pending`. That is never cross-host delivery or
+completion. `PEER_UNSUPPORTED` refuses relay items for non-local peers before any inject;
+it does not refuse an origin send. The outbox, relayed-receipt and remote-provenance
+wiring is incomplete. See the README.
 
 Closing the MCP client ends stdin and invokes owned cleanup. SIGINT/SIGTERM and
 supported SIGHUP also request graceful close. Only the created inbox and its current

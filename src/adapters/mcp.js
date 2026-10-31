@@ -52,8 +52,9 @@ export function registerMcpTools(server, transport) {
       destination: z.object({
         host: z.string().regex(HOST_RE).describe("Final destination host (peer id or locator form)"),
         session: z.string().regex(SID_RE).describe("Final destination session id"),
-      }).strict().optional().describe("Optional final destination beyond the target (relayed request); its ACK stays unproven "
-        + "until host provenance exists"),
+      }).strict().optional().describe("Experimental metadata in 0.2.0, not routed end to end: the target is still injected "
+        + "and only the record names this destination, which can remain pending; its ACK stays unproven until host "
+        + "provenance exists. Not cross-host delivery or completion"),
     }).strict(),
   }, call(({ target, text, request_id, destination }) => transport.send({ target, text, request_id, destination })));
 

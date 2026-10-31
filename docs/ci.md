@@ -76,7 +76,8 @@ It proves that, on each hosted OS with Node 20.20.0:
 - config normalization/loading, the durable store (real filesystem plus child-process crash cases) and the
   tunnel-child launcher (pure plan construction plus lifecycle driven by an injected fake spawn) pass, minus the
   skips listed above;
-- the package tarball contents resolve (`npm pack --dry-run`, Linux only).
+- the package tarball contents resolve to the exact public file set (`test/package-layout.test.js`, an
+  `npm pack --dry-run` assertion, runs in `test:unit` on all three OSes and again in the Linux `pack` job).
 
 It does **not** prove any of the following:
 

@@ -17,7 +17,8 @@
 // The target id is `orchestrator` under telepty's DEFAULT peer-lane policy (AIGENTRY_ORCHESTRATOR_SIDS
 // empty → built-in sids): the D → orchestrator → D route with no widened policy.
 //
-// No skip: a missing telepty tree or fixture child FAILS. Nothing here reads, prints or stores the
+// No skip on POSIX: a missing telepty tree or fixture child FAILS (Windows: declared NOTRUN, see
+// RC5_SKIP). Nothing here reads, prints or stores the
 // target's bearer; the telesession inbox bearer stays inside the transport as in production.
 
 import { test } from "node:test";
@@ -55,10 +56,16 @@ function makeStateSandbox() {
   };
 }
 
-test("RC5 telesession across a real daemon restart: wrapped target replies with its spawn-time bearer → trusted, verified epoch == pre-restart target_epoch, inbox re-created create_only", { timeout: CASE_TIMEOUT_MS }, async (t) => {
+// POSIX precondition, declared at registration: the target is a node-pty `cli.js allow` bridge, and the
+// restart asserts an exit through the daemon's SIGTERM handler, which Windows `kill("SIGTERM")`
+// (TerminateProcess) never runs. A missing telepty tree or fixture child still FAILS on POSIX.
+const RC5_SKIP = process.platform === "win32"
+  ? "NOTRUN on Windows: RC5 is POSIX-only (node-pty bridge + SIGTERM-handler restart); not Windows coverage, native Windows restart gate unmeasured"
+  : false;
+
+test("RC5 telesession across a real daemon restart: wrapped target replies with its spawn-time bearer → trusted, verified epoch == pre-restart target_epoch, inbox re-created create_only", { timeout: CASE_TIMEOUT_MS, skip: RC5_SKIP }, async (t) => {
   assert.equal(HAS_TELEPTY, true, `RC5 needs the candidate telepty tree at ${TELEPTY_DIR} (a missing fixture is a FAIL, not a skip)`);
   assert.ok(fs.existsSync(CHILD), `RC5 fixture child missing at ${CHILD}`);
-  assert.notEqual(process.platform, "win32", "RC5 is POSIX-only (node-pty bridge)");
 
   const sandbox = makeStateSandbox();
   let d = null;
