@@ -1,9 +1,16 @@
 # Release verification gate. Runs the reusable CI first; nothing below runs unless it passes.
-# It creates no release, publishes nothing to npm and deploys nothing. See docs/ci.md.
+# An optional telepty_ref (manual runs) also runs compatibility.yml against that exact Telepty commit
+# before the gate. It creates no release, publishes nothing to npm and deploys nothing. See docs/ci.md.
 name: Release check
 
 on:
   workflow_dispatch:
+    inputs:
+      telepty_ref:
+        description: "Optional dmsdc-ai/aigentry-telepty commit (exactly 40 lowercase hex). Set: compatibility.yml must pass against it. Empty: compatibility NOT requested and NOT established."
+        required: false
+        type: string
+        default: ""
   push:
     tags: ["v*"]
 
@@ -20,12 +27,73 @@ jobs:
     permissions:
       contents: read
 
+  # Empty (always on tag pushes) = not requested. Anything else must be a 40-hex SHA or the run fails.
+  compat-request:
+    name: compatibility request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      requested: ${{ steps.check.outputs.requested }}
+      telepty_ref: ${{ steps.check.outputs.telepty_ref }}
+    steps:
+      - name: Validate telepty_ref (before any checkout)
+        id: check
+        shell: bash
+        env:
+          TELEPTY_REF: ${{ inputs.telepty_ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TELEPTY_REF" ]; then
+            echo "requested=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::telepty_ref not supplied: Telepty compatibility is NOT requested and NOT established by this run"
+          elif [[ "$TELEPTY_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            { echo "requested=true"; echo "telepty_ref=$TELEPTY_REF"; } >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::telepty_ref must be empty or exactly 40 lowercase hex characters (immutable commit SHA)"
+            exit 1
+          fi
+
+  compatibility:
+    needs: [ci, compat-request]
+    if: needs.compat-request.outputs.requested == 'true'
+    uses: ./.github/workflows/compatibility.yml
+    with:
+      telepty_ref: ${{ needs.compat-request.outputs.telepty_ref }}
+    permissions:
+      contents: read
+
   release-gate:
     name: release gate
-    needs: [ci]
+    needs: [ci, compat-request, compatibility]
+    # Runs unless cancelled so an unmet precondition fails the run instead of being a silent skip.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Preconditions (CI passed; a requested compatibility run passed on the exact SHA)
+        shell: bash
+        env:
+          CI_RESULT: ${{ needs.ci.result }}
+          REQUEST_RESULT: ${{ needs.compat-request.result }}
+          REQUESTED: ${{ needs.compat-request.outputs.requested }}
+          REQUESTED_REF: ${{ needs.compat-request.outputs.telepty_ref }}
+          COMPAT_RESULT: ${{ needs.compatibility.result }}
+          COMPAT_SHA: ${{ needs.compatibility.outputs.telepty_sha }}
+        run: |
+          set -euo pipefail
+          [ "$CI_RESULT" = success ] || { echo "::error::ci: $CI_RESULT"; exit 1; }
+          [ "$REQUEST_RESULT" = success ] || { echo "::error::compatibility request: $REQUEST_RESULT"; exit 1; }
+          case "$REQUESTED" in
+            true)
+              [ "$COMPAT_RESULT" = success ] || { echo "::error::compatibility: $COMPAT_RESULT"; exit 1; }
+              [ "$COMPAT_SHA" = "$REQUESTED_REF" ] || { echo "::error::compatibility verified '$COMPAT_SHA', requested '$REQUESTED_REF'"; exit 1; }
+              ;;
+            false)
+              [ "$COMPAT_RESULT" = skipped ] || { echo "::error::compatibility ran without a request: $COMPAT_RESULT"; exit 1; }
+              ;;
+            *) echo "::error::compatibility request state unknown"; exit 1 ;;
+          esac
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
@@ -53,12 +121,19 @@ jobs:
 
       - name: Ready summary
         shell: bash
+        env:
+          REQUESTED: ${{ needs.compat-request.outputs.requested }}
+          COMPAT_SHA: ${{ needs.compatibility.outputs.telepty_sha }}
         run: |
           {
             echo "### release check: verification passed"
             echo "- CI unit matrix (ubuntu/macos/windows, Node 20.20.0): passed"
             echo "- npm pack --dry-run: passed (file layout only; it does not publish and does not imply publication readiness or authorization)"
-            echo "- NOT released: no GitHub release, npm publish or deployment was performed by this workflow."
-            echo "- NOT proven here: real telepty daemon, Dot/꼬마 connection, native PTY, restart/recovery (see compatibility.yml)."
+            if [ "$REQUESTED" = true ]; then
+              echo "- Telepty compatibility (compatibility.yml, ubuntu/macos/windows): passed against dmsdc-ai/aigentry-telepty@$COMPAT_SHA on GitHub runners only"
+            else
+              echo "- Telepty compatibility: NOT REQUESTED, NOT RUN and NOT established (no telepty_ref). Not proven here: real telepty daemon, Dot/꼬마 connection, native PTY, restart/recovery."
+            fi
+            echo "- NOT released: no GitHub release, npm publish or deployment was performed by this workflow. This result authorizes no tag or publication."
             echo "- Still required before publication: the cross-host Mac/Linux live communication gate (before Telepty publication). See docs/ci.md."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -93,23 +93,59 @@ Node lines are not claimed until they are added to the matrix and pass.
 
 ## `release-check.yml` — release verification gate
 
-Triggers: `workflow_dispatch` and pushes of tags matching `v*`.
+Triggers: `workflow_dispatch`, with an optional string input `telepty_ref`, and pushes of tags matching `v*`.
 
 1. `ci` calls `ci.yml` (the full matrix plus pack).
-2. `release-gate` runs only after `ci` succeeds (`needs: [ci]`). On tag pushes it checks that the tag equals
-   `v` + `package.json` `version`. It then runs `npm pack --dry-run --ignore-scripts` and writes a ready summary.
+2. `compat-request` reads `telepty_ref`. If it is empty (it always is on tag pushes), compatibility is not
+   requested. If it is exactly 40 lowercase hex characters, compatibility is requested. Any other value fails
+   the run before any checkout.
+3. `compatibility` runs only when compatibility is requested and `ci` passed. It calls `compatibility.yml`
+   (`workflow_call`) with that SHA. Because the call goes through `release-check.yml`, the compatibility run
+   works on a named branch before `compatibility.yml` exists on the default branch. A `workflow_dispatch`
+   workflow cannot run for the first time until it is on the default branch.
+4. `release-gate` first checks its preconditions and fails the run if one is not met. A failed precondition
+   is never a silent skip:
+   - `ci` passed;
+   - the request was valid;
+   - if compatibility was requested, `compatibility` passed and its verified Telepty HEAD (`telepty_sha`
+     output) equals the requested SHA;
+   - if compatibility was not requested, `compatibility` was skipped.
+
+   On tag pushes it then checks that the tag equals `v` + `package.json` `version`. It runs
+   `npm pack --dry-run --ignore-scripts` and writes a ready summary. The summary names the verified Telepty
+   SHA, or says that compatibility was **not requested, not run and not established**.
 
 It creates no GitHub release, runs no `npm publish` and performs no deployment. Since 0.2.0 `package.json`
 no longer has `"private": true` and declares `publishConfig.access: "public"`, so npm would **not** refuse a
 publish: publication control rests on credentials and the separate authorized publication step.
 A passing pack check (`check:pack` dry-run or `test:pack`) proves the tarball file layout only. It
 publishes nothing and does not imply that the package is ready or authorized for publication.
+No result of this workflow, including a passing compatibility run, authorizes a tag or a publication.
+
+Controller invocation (the candidate branch must contain this `release-check.yml`; `<branch>` is a branch
+name, `<sha40>` is the selected Telepty commit):
+
+```
+gh workflow run release-check.yml --repo dmsdc-ai/aigentry-telesession --ref <branch> -f telepty_ref=<sha40>
+gh run list --repo dmsdc-ai/aigentry-telesession --workflow release-check.yml --branch <branch> --event workflow_dispatch --limit 1 --json databaseId,headSha,status,conclusion
+gh run watch <run-id> --repo dmsdc-ai/aigentry-telesession --exit-status
+gh run view <run-id> --repo dmsdc-ai/aigentry-telesession --json headSha,conclusion,jobs
+gh run download <run-id> --repo dmsdc-ai/aigentry-telesession --pattern 'compatibility-*'
+```
+
+Accept a run only if `headSha` is the exact Telesession candidate, its conclusion is `success`, the
+`compatibility (…)` jobs ran on all three OSes, and every `provenance.json` shows `telepty.sha` = `<sha40>`.
 
 ## `compatibility.yml` — exact-candidate validation against one Telepty commit
 
-Trigger: `workflow_dispatch` only, with the required input `telepty_ref`. It must be exactly 40 lowercase hex
-characters, an immutable commit of the public `dmsdc-ai/aigentry-telepty`. A branch, tag or short SHA is
-refused before any checkout, and the checked-out HEAD is compared with the input again afterwards.
+Triggers: `workflow_call`, which `release-check.yml` uses (the supported path before this file is on the
+default branch), and `workflow_dispatch` (only once the file is on the default branch). Both take the required
+input `telepty_ref`. It must be exactly 40 lowercase hex characters, an immutable commit of the public
+`dmsdc-ai/aigentry-telepty`. A branch, tag or short SHA is refused before any checkout, and the checked-out
+HEAD is compared with the input again afterwards.
+- A Telepty tree without `daemon.js` fails the job. So does a full-suite TAP that reports a real-daemon
+  suite skipped as `NOTRUN: telepty source not found`.
+- The output `telepty_sha` is set only after the HEAD check passes. `release-gate` compares it with the request.
 
 - Matrix: `ubuntu-latest`, `macos-latest`, `windows-latest` × Node `20.20.0`, `fail-fast: false`, 20 min.
 - Telesession (this ref) and Telepty (the exact SHA) are checked out read-only into separate directories

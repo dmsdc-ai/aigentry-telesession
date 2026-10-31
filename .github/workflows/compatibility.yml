@@ -1,5 +1,6 @@
 # Exact-candidate compatibility validation against one immutable Telepty commit.
-# Manual only. Read-only token, no secrets, no login, no tag, no publish. See docs/ci.md.
+# Manual or called by release-check.yml (workflow_call; usable before this file is on the default branch).
+# Read-only token, no secrets, no login, no tag, no publish. See docs/ci.md.
 # GitHub runners do NOT establish the cross-host Mac/Linux live communication gate.
 name: Compatibility
 
@@ -10,6 +11,16 @@ on:
         description: "dmsdc-ai/aigentry-telepty commit (exactly 40 lowercase hex characters; no branch, tag or short SHA)"
         required: true
         type: string
+  workflow_call:
+    inputs:
+      telepty_ref:
+        description: "dmsdc-ai/aigentry-telepty commit (exactly 40 lowercase hex characters; no branch, tag or short SHA)"
+        required: true
+        type: string
+    outputs:
+      telepty_sha:
+        description: "Telepty HEAD verified equal to telepty_ref after checkout (set only after that check passed)"
+        value: ${{ jobs.compatibility.outputs.telepty_sha }}
 
 permissions:
   contents: read
@@ -40,6 +51,8 @@ jobs:
     needs: [validate-ref]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    outputs:
+      telepty_sha: ${{ steps.ident.outputs.telepty_sha }}
     strategy:
       fail-fast: false
       matrix:
@@ -83,6 +96,9 @@ jobs:
           set -euo pipefail
           actual="$(git -C telepty rev-parse HEAD)"
           if [ "$actual" != "$TELEPTY_REF" ]; then echo "::error::telepty HEAD $actual != requested $TELEPTY_REF"; exit 1; fi
+          # Without daemon.js the real-daemon suites would only skip (NOTRUN); refuse instead.
+          if [ ! -f telepty/daemon.js ]; then echo "::error::telepty/daemon.js missing at $actual"; exit 1; fi
+          echo "telepty_sha=$actual" >> "$GITHUB_OUTPUT"
           COMPAT="$RUNNER_TEMP/compat"
           mkdir -p "$COMPAT/child-logs" "$COMPAT/npm-cache" "$COMPAT/pack" "$COMPAT/prefix"
           : > "$COMPAT/empty-npmrc"
@@ -224,6 +240,10 @@ jobs:
               if [ "${pass:-0}" -eq 0 ]; then echo "::error::$t: no passing tests recorded"; status=1; fi
             fi
           done
+          # A real-daemon suite skipped for a missing Telepty tree is not compatibility evidence.
+          if [ -s "$COMPAT/full.tap" ] && grep -q 'NOTRUN: telepty source not found' "$COMPAT/full.tap"; then
+            echo "::error::full: real-daemon suites skipped (telepty source not found)"; status=1
+          fi
           exit $status
 
       - name: Upload raw evidence
