@@ -1,4 +1,4 @@
-# telesession (0.1.0 candidate — work in progress, not released)
+# telesession 0.2.0 (release candidate — not yet published)
 
 telesession is a generic, terminal-independent **remote session connection layer**: an MCP adapter and
 a request/reply transport that sit on top of a local telepty daemon.
@@ -12,24 +12,29 @@ current credential.
   consumer; there is no product-specific code path.
 - **Plain Node ≥ 20** (no shell, no OS GUI API), intended for macOS, Linux and Windows.
 
-> **Status: candidate, not released.** `package.json` keeps `"private": true` and nothing is published
-> to npm. Real Dot, tunnel, real-daemon and native cross-OS acceptance are **NOTRUN**. See
-> [`docs/status.md`](docs/status.md) for exactly what has and has not been verified. This work is
-> tracked under task 1215 for the next aigentry release.
+> **Status: 0.2.0 release candidate, not yet published.** The package is prepared for public npm
+> publication as `@dmsdc-ai/telesession` (`publishConfig.access: "public"`). Publication is a separate,
+> gated step. The integrated 0.2.0 source has **not yet been tested** as a whole. Earlier Linux
+> private-daemon and local-tarball runs covered pre-integration lines only. Real Dot, remote gateway/tunnel
+> and native macOS/Windows acceptance are **NOTRUN**. See [installation](docs/install.md).
 
 ## Requirements and prerequisites
 telesession refuses to start sending unless the telepty daemon advertises three opt-in capabilities in
 `GET /api/meta`: `inject-exact-target`, `register-create-only` and `delete-owned-session`.
-**The existing telepty 0.8.5 baseline does not provide them**, so the stock npm telepty package does not
-work with this candidate. A telepty build carrying the candidate daemon change is a prerequisite; it is
-not part of this repository and has not been released.
+**Telepty 0.10.0 is the prerequisite for supported 0.2.0 behaviour.** It is not yet published. The
+earlier Telepty 0.9.1 and 0.8.5 do not provide these capabilities. Version numbers alone do not establish
+compatibility: the daemon must advertise all three capabilities. Its inject delivery-uncertainty answer
+must also match: a non-2xx with `delivery_uncertain: true` or code `DELIVERY_UNCERTAIN`, and an audit
+`failed:DELIVERY_UNCERTAIN` row. No installed or runtime proof of this candidate with Telepty 0.10.0
+exists yet. This package never upgrades or restarts Telepty automatically.
 
-There is no one-command install. To try the candidate locally you need:
+Once published, `npm install @dmsdc-ai/telesession@0.2.0` installs it without a source build.
+[Installation and MCP configuration](docs/install.md) describes the flow. You need:
 1. Node ≥ 20.
-2. A clone of this repository and `npm install` for its two dependencies
-   (`@modelcontextprotocol/sdk`, `zod`).
-3. A local telepty daemon built from the candidate change (the three capabilities above), listening on
-   loopback, with its auth token available in a file.
+2. The package installed with its two dependencies (`@modelcontextprotocol/sdk` ^1.29.0, `zod`
+   ^3.25.76), or a source checkout installed from its lockfile.
+3. A local Telepty 0.10.0 daemon (the three capabilities above), listening on loopback, with its auth
+   token available in a file.
 4. An exact target session that the daemon's existing `AIGENTRY_ORCHESTRATOR_SIDS` policy treats as a
    true orchestrator (configured by the operator, outside telesession).
 
@@ -42,7 +47,7 @@ There is no one-command install. To try the candidate locally you need:
 | `TELESESSION_TELEPTY_TOKEN` **or** `TELESESSION_TELEPTY_TOKEN_FILE` | exactly one. The file must be an absolute path to a regular file ≤ 64 KiB holding either the bare token or a telepty `config.json` (`{"authToken": "..."}`) | `CONFIG_TOKEN_SOURCE_CONFLICT`, `CONFIG_TOKEN_MISSING`, `CONFIG_TOKEN_FILE_INVALID`, `CONFIG_TOKEN_INVALID` |
 | `TELESESSION_STATE_DIR` (optional) | absolute, normalized, 1–512 chars, no control chars, no trailing separator (win32: no UNC/device/drive-relative). Private app state, e.g. `~/.local/state/telesession`; never home/cwd itself, a project dir or telepty's own state | `CONFIG_STATE_DIR_INVALID`; at open `STORE_PATH_FORBIDDEN`, `STORE_PERMISSIONS_INVALID`, `STORE_LOCKED`, `STORE_CORRUPT`, … |
 | `TELESESSION_PERSIST_INBOX_CREDENTIAL` (optional) | unset/`0` or `1`; `1` requires a state dir and verified POSIX permissions (refused on Windows) | `CONFIG_PERSIST_INVALID`, `CONFIG_STATE_DIR_REQUIRED`, `STORE_CREDENTIAL_PLATFORM_UNSUPPORTED` |
-| `TELESESSION_RELAY_INTERVAL_MS` (optional) | unset/`0` = relay runner off (default); otherwise an integer 1000–3600000 ms, requires a state dir. Turning it on in a live deployment is a separate approval (spec §10). One tick on demand: `telesession-relay-tick` (refuses a held ledger lock, exit 3) | `CONFIG_RELAY_INTERVAL_INVALID`, `CONFIG_STATE_DIR_REQUIRED` |
+| `TELESESSION_RELAY_INTERVAL_MS` (optional, **unsupported in 0.2.0** — see [Relay](#relay-and-destination-unsupported-in-020)) | unset/`0` = relay runner off (default); otherwise an integer 1000–3600000 ms, requires a state dir. Turning it on in a live deployment is a separate approval (spec §10). One tick on demand: `telesession-relay-tick` (refuses a held ledger lock, exit 3) | `CONFIG_RELAY_INTERVAL_INVALID`, `CONFIG_STATE_DIR_REQUIRED` |
 
 No defaults, no `~/.telepty` lookup, no credential minting. The token never appears in tool
 arguments, results, logs or the state dir. telepty's own peer-lane guard still applies and is not
@@ -61,11 +66,12 @@ Example MCP client entry (placeholders only; never put a token value here):
 ```
 
 ## MCP tools
-`telesession_health`, `telesession_list_targets`, `telesession_send {target, text, request_id?, destination?}`,
+Six tools: `telesession_health`, `telesession_list_targets`, `telesession_send {target, text, request_id?, destination?}`,
 `telesession_receipt {inject_id}`, `telesession_read_reply {nonce, wait_ms, cursor?}`,
 `telesession_request_status {nonce | request_id | correlation_id, cursor?}` — strict schemas, JSON results, `completion_fact: null` on
 every result. `cursor`, `destination` and `request_status` use the correlation ledger (durable mode only,
-`<state dir>/ledger`); see `docs/specs/2026-10-11-e2e-delivery-protocol.md`. `request_status` turns
+`<state dir>/ledger`); see `docs/specs/2026-10-11-e2e-delivery-protocol.md`. `destination` is unsupported in
+0.2.0 (see [Relay](#relay-and-destination-unsupported-in-020)). `request_status` turns
 `completed` once your cursor covers the first final reply (`first_ack_seq`); a later final reply keeps it
 `completed` but adds `NEWER_FINAL_ACK_UNREAD` to `status_reasons` until you read it.
 After the 15-min nonce TTL, `read_reply` still answers `NONCE_EXPIRED` when nothing is stored. When the ledger
@@ -84,7 +90,10 @@ one of its first three lines (any other verified reply is an addendum). A destin
 origin prompt (or its header region) in the first three lines of a reply. `send` returns the immutable
 `correlation_id` (32 hex) that is also on the wire header. `read_reply` returns the text only after the audit check;
 otherwise counts per reason. `receipt` is a transport observation, never a reply. A send without a
-response is `accepted: "unknown"` and is never re-sent. `daemon_restart`
+response is `accepted: "unknown"` and is never re-sent. The same holds for an inject answered with HTTP 5xx,
+`delivery_uncertain: true` or code `DELIVERY_UNCERTAIN`: such a response is not proof of zero effect.
+Durable audit recovery treats a `failed:*` audit row as `recovery: "unverified"` (still uncertain), never
+as refused. A receipt with tracking state `aborted` alone is `unknown`, not `refused`. `daemon_restart`
 (`observed`/`not_observed`/`unknown`) is a pid comparison, reported only.
 
 ### Reply trust
@@ -127,6 +136,30 @@ token *value* (`TELESESSION_TELEPTY_TOKEN_FILE` is required). It is **not an OS 
 as the same user. See [`docs/tunnel-child.md`](docs/tunnel-child.md). Independent verification and
 security triage of the launcher were still ongoing at this snapshot.
 
+## Relay and `destination` (unsupported in 0.2.0)
+The relay runner, the `telesession-relay-tick` CLI and `telesession_send.destination` ship in 0.2.0
+but are **unsupported and default-off**, and no request can complete through them:
+- Non-local routes are refused with `PEER_UNSUPPORTED`. A daemon-side exact remote forward does not
+  exist yet (telepty#111).
+- The outbox is not wired: `ledger.enqueue()` has no caller in the shipped processes, so the runner
+  has nothing to send.
+- Relayed receipts cannot be bound to the origin inject and are refused (`INJECT_MISMATCH`, #8).
+  Remote sender provenance is unavailable (`REMOTE_PROVENANCE_UNAVAILABLE`, telepty#100).
+- A request with a `destination` stays `pending`/unproven. **`pending` is never completed remote
+  delivery.** Do not treat it as one.
+
+Enabling `TELESESSION_RELAY_INTERVAL_MS` in a live deployment is a separate approval.
+
+## Known limitations
+- **Silent reply rejection (#10, open).** The durable inbox rejects a verified-format reply with 503 when
+  a request already holds 4 reply candidates or the store holds 64 reply texts. Only the generic
+  `inbox_rejected` counter changes: there is no per-reason counter, and the request is not marked.
+  With Telepty 0.10.0 a receiver 503 is dead-lettered as `unknown` and not retried, so that reply is
+  lost unless the replier sends it again. The minimum follow-up is separate reason counters (for example
+  `candidates_full` and `store_full`) and marking the affected request.
+- Uncertain sends (`accepted: "unknown"`) release their ledger reservation and have no ledger record
+  until durable audit recovery reconstructs them.
+
 ## Lifetime
 The inbox belongs to the process that created it. `close()` (the MCP command calls it on stdin
 end/close, SIGINT, SIGTERM and, where the platform delivers it, SIGHUP) closes the listener and makes
@@ -135,10 +168,12 @@ Crash/SIGKILL or a lost registration response leaves an inbox record for operato
 
 ## Not provided yet
 Automatic unlock after an abrupt crash, native-Windows credential storage, exactly-once delivery,
-outbound HTTPS relay, remote auth route/hosting, events/webhooks (unsolicited orchestrator → client).
+remote/multi-hop relay delivery, outbound HTTPS relay, remote auth route/hosting, events/webhooks (unsolicited orchestrator → client).
 A local stdio MCP server does not by itself establish a remote ChatGPT/Dot connection.
 
 ## More
-- [`docs/status.md`](docs/status.md) — verification status and limits of this snapshot
+- [`docs/install.md`](docs/install.md) — installation and MCP client configuration
+- [`docs/specs/2026-10-11-e2e-delivery-protocol.md`](docs/specs/2026-10-11-e2e-delivery-protocol.md) — correlation/ledger protocol
+- [`CHANGELOG.md`](CHANGELOG.md) — changes per version
 - [`docs/architecture.md`](docs/architecture.md) — boundary, modules, telepty HTTP surface used
 - [`API-CONTRACT-TELESESSION.md`](API-CONTRACT-TELESESSION.md) — API contract

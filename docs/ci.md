@@ -1,6 +1,6 @@
 # CI and release verification
 
-Two workflows live in `.github/workflows/`. Both run on GitHub-hosted runners with a read-only token
+Three workflows live in `.github/workflows/`. All run on GitHub-hosted runners with a read-only token
 (`permissions: contents: read`), use no secrets, check out with `persist-credentials: false`, and never
 publish, release or deploy anything.
 
@@ -11,7 +11,7 @@ Triggers: pushes to `main`, pull requests, `workflow_dispatch`, and `workflow_ca
 | Job | Runners | What it runs |
 |---|---|---|
 | `unit` | `ubuntu-latest`, `macos-latest`, `windows-latest` × Node `20.20.0` (`fail-fast: false`, 15 min timeout) | `npm ci --ignore-scripts --no-audit --no-fund`, then `npm run --silent test:unit` |
-| `pack` | `ubuntu-latest`, Node `20.20.0` (10 min timeout) | `npm run --silent check:pack` (`npm pack --dry-run --ignore-scripts`) |
+| `pack` | `ubuntu-latest`, Node `20.20.0` (10 min timeout) | `npm run --silent test:pack` (`test/package-layout.test.js`: `npm pack --dry-run` file-list assertions) |
 
 Pull-request runs for the same ref cancel older ones; `main` pushes run to completion.
 
@@ -23,9 +23,8 @@ Actions are pinned by commit SHA:
 
 ### Exact unit command
 
-```
-node --test --test-reporter=tap test/config.test.js test/store.test.js test/tunnel-child.test.js test/tunnel-child-independent.test.js
-```
+`npm run test:unit`, i.e. the explicit file list in `package.json` `scripts.test:unit` (`test/test-runners.test.js`
+fails when a test file is named by no runner).
 
 The files are listed explicitly. CI does **not** use `npm test` (`node --test test/`), because auto-discovery
 also picks up suites that need a telepty source checkout or the MCP SDK end to end.
@@ -100,8 +99,48 @@ Triggers: `workflow_dispatch` and pushes of tags matching `v*`.
 2. `release-gate` runs only after `ci` succeeds (`needs: [ci]`). On tag pushes it checks that the tag equals
    `v` + `package.json` `version`. It then runs `npm pack --dry-run --ignore-scripts` and writes a ready summary.
 
-It creates no GitHub release, runs no `npm publish` and performs no deployment. `package.json` keeps
-`"private": true`, so npm would refuse a publish anyway.
+It creates no GitHub release, runs no `npm publish` and performs no deployment. Since 0.2.0 `package.json`
+no longer has `"private": true` and declares `publishConfig.access: "public"`, so npm would **not** refuse a
+publish: publication control rests on credentials and the separate authorized publication step.
+A passing pack check (`check:pack` dry-run or `test:pack`) proves the tarball file layout only. It
+publishes nothing and does not imply that the package is ready or authorized for publication.
+
+## `compatibility.yml` — exact-candidate validation against one Telepty commit
+
+Trigger: `workflow_dispatch` only, with the required input `telepty_ref`. It must be exactly 40 lowercase hex
+characters, an immutable commit of the public `dmsdc-ai/aigentry-telepty`. A branch, tag or short SHA is
+refused before any checkout, and the checked-out HEAD is compared with the input again afterwards.
+
+- Matrix: `ubuntu-latest`, `macos-latest`, `windows-latest` × Node `20.20.0`, `fail-fast: false`, 20 min.
+- Telesession (this ref) and Telepty (the exact SHA) are checked out read-only into separate directories
+  (`persist-credentials: false`). The pinned actions are the same three as `ci.yml`. It has no secrets and
+  no login, and it never tags or publishes.
+- Both trees run `npm ci --ignore-scripts` from their own lockfiles. The single reviewed exception is
+  `npm rebuild node-pty` in the Telepty tree. node-pty is the native PTY addon that Telepty's bridge
+  (`cli.js allow`, used by the RC5 restart test) loads, and `--ignore-scripts` skips its binary setup.
+  Only node-pty's own scripts run; Telepty's root `postinstall`/`preuninstall` never run.
+- `TELESESSION_TEST_TELEPTY_DIR` points at the exact Telepty tree. Gates:
+  1. the full `npm test`;
+  2. `npm run test:pack`;
+  3. Linux/macOS only: `npm pack` of the candidate, an install of that tarball into a fresh private prefix
+     (the `docs/install.md` recipe), then `npm run test:installed` with
+     `TELESESSION_TEST_INSTALLED_PACKAGE=<prefix>/node_modules/@dmsdc-ai/telesession`.
+- A failing gate fails the job. Later gates still run where their inputs exist, so every outcome is
+  recorded.
+- npm cache, npmrc, child logs, pack output and the install prefix live under the runner's `RUNNER_TEMP`.
+  Test fixtures use their own temp HOME and ephemeral loopback daemons. No real user's HOME, data or
+  service is used.
+- Evidence artifact (14 days): `provenance.json` (Telesession SHA/version, Telepty SHA/version, OS, arch,
+  Node, npm, run id), raw `full.tap`, `pack-test.tap`, `pack.json`, `tarball.json` (filename, sha256), the
+  tarball, `install.log`, `installed.log`, `node-pty-rebuild.log` and child logs. The job summary lists
+  counts per suite and every skipped test by name; skips are never counted as passes.
+
+What it does **not** establish: the cross-host Mac/Linux live communication gate. Both directions
+(Mac→Linux request with a matching Linux→Mac ACK, and the reverse) need the exact final candidates on both
+hosts, a real Telepty route, actual target session input, a matching semantic ACK and no duplicate
+execution. Daemon acceptance alone, `consumption=unknown` or native Codex input API delivery are
+insufficient. This gate is mandatory **before Telepty publication**, and it blocks npm publication and any
+release tag. GitHub runners cannot provide it.
 
 The real-daemon gate workflow is held in PR #3 pending repository workflow permission; until it lands, the
 real-daemon set is run locally before a release (command below) and its counts are recorded in the release notes.
@@ -140,8 +179,10 @@ was the verified telepty `package-lock.json` (sha256 `9b07cbb07d6f7b52c554798753
 - Optional peers are not added: `@cfworker/json-schema` is absent, and `ajv` is already a regular dependency.
 - Each package entry is copied verbatim: `version`, `resolved`, `integrity`, `license`, `engines` and every other field.
 - Telepty-only roots and dev packages are left out.
-- The root entry mirrors `package.json`: name, version, license, the unchanged ranges `^1.26.0` and `^3.24.0`,
-  both bins, and engines. npm does not record `private` in lockfiles.
+- The root entry mirrors `package.json`: name, version, license, the ranges, the bins and engines. npm does not
+  record `private` in lockfiles. Originally the ranges were `^1.26.0` and `^3.24.0` with two bins. In 0.2.0 only
+  the root entry was hand-aligned: the ranges were raised to the tested floors `^1.29.0` and `^3.25.76`, and all
+  four bins are listed. No package resolution changed.
 
 The result is 91 packages plus the root. Every `resolved` URL is on `https://registry.npmjs.org/`, every entry has a
 sha512 `integrity`, and there are no install scripts and no os/cpu restrictions. Running the derivation twice gives
@@ -168,7 +209,10 @@ and the telepty source lock does not carry them.
 
 Before any npm publish, someone must:
 
-1. decide to remove `"private": true`;
+1. confirm the 0.2.0 publication decision (`private` was removed and `publishConfig.access: "public"` added in 0.2.0);
 2. set up npm credentials or trusted publishing. No workflow here has them, and `id-token: write` is not granted;
-3. add a separate, reviewed publish workflow gated on `release-check.yml`;
-4. verify the real-daemon, Dot/꼬마, native PTY and restart paths outside this unit matrix.
+3. apply the existing user publication authority as a separate step after all gates. No automated release tag
+   or publish job exists, and none is added in 0.2.0;
+4. verify the real-daemon, Dot/꼬마, native PTY and restart paths outside this unit matrix: a green
+   `compatibility.yml` run on the exact candidate and Telepty SHA, then the cross-host Mac/Linux live
+   communication gate above (before Telepty publication).

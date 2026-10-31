@@ -57,7 +57,8 @@ jobs:
           {
             echo "### release check: verification passed"
             echo "- CI unit matrix (ubuntu/macos/windows, Node 20.20.0): passed"
-            echo "- npm pack --dry-run: passed"
-            echo "- NOT released: no GitHub release, npm publish or deployment was performed (package is private)."
-            echo "- NOT proven here: real telepty daemon, Dot/꼬마 connection, native PTY, restart/recovery. See docs/ci.md."
+            echo "- npm pack --dry-run: passed (file layout only; it does not publish and does not imply publication readiness or authorization)"
+            echo "- NOT released: no GitHub release, npm publish or deployment was performed by this workflow."
+            echo "- NOT proven here: real telepty daemon, Dot/꼬마 connection, native PTY, restart/recovery (see compatibility.yml)."
+            echo "- Still required before publication: the cross-host Mac/Linux live communication gate (before Telepty publication). See docs/ci.md."
           } >> "$GITHUB_STEP_SUMMARY"

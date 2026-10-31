@@ -21,6 +21,23 @@ const PKG_VERSION = (() => {
   } catch { return "0.0.0"; }
 })();
 
+// CLI questions must not initialize configuration, a durable store or MCP.
+const args = process.argv.slice(2);
+if (args.length === 1 && ["--help", "-h"].includes(args[0])) {
+  process.stdout.write("Usage: telesession-mcp [--help | --version]\nRun without arguments to serve MCP over stdio.\n" +
+    "Configure TELESESSION_TARGETS, TELESESSION_INBOX_PREFIX, TELESESSION_TELEPTY_URL, and exactly one of TELESESSION_TELEPTY_TOKEN_FILE or TELESESSION_TELEPTY_TOKEN.\n" +
+    "Requires Node >=20 and a compatible local Telepty daemon; never installs, enrolls, restarts or hosts a remote gateway.\n");
+  process.exit(0);
+}
+if (args.length === 1 && args[0] === "--version") {
+  process.stdout.write(`${PKG_VERSION}\n`);
+  process.exit(0);
+}
+if (args.length !== 0) {
+  process.stderr.write("telesession-mcp refused: ARGS_UNEXPECTED (use --help)\n");
+  process.exit(2);
+}
+
 // Fail closed BEFORE any telepty request: exit 2 with a code only (no env values, no token, no
 // state dir path). ConfigError and StoreError (e.g. STORE_LOCKED after an abrupt crash) take this path.
 let transport;

@@ -118,7 +118,12 @@ function createHttpClient(cfg) {
         ? parsed.code
         : `DAEMON_HTTP_${res.status}`;
       // An explicit uncertain outcome is not a refusal, even with HTTP error headers.
-      return { ok: false, http_status: res.status, code, sent: code === "DELIVERY_UNCERTAIN" ? "unknown" : "yes" };
+      // An inject may also have taken effect before a 5xx, or may explicitly report
+      // unknown delivery. A response is not proof of zero effect. Preserve the
+      // existing uncertain/no-resend state without changing registration/delete.
+      const injectUnknown = method === "POST" && /^\/api\/sessions\/[^/]+\/inject$/.test(path)
+        && (res.status >= 500 || parsed?.delivery_uncertain === true);
+      return { ok: false, http_status: res.status, code, sent: code === "DELIVERY_UNCERTAIN" || injectUnknown ? "unknown" : "yes" };
     }
     if (parsed === null || typeof parsed !== "object") {
       return { ok: false, http_status: res.status, code: "DAEMON_BAD_RESPONSE", sent: "unknown" };
@@ -750,7 +755,9 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     const dr = row.delivery_result;
     if (dr === "success" || dr === "queued") return { recovery: "audit_verified_match", state: "accepted", inject_id: row.inject_id };
     if (typeof dr === "string" && dr.startsWith("failed:")) {
-      return { recovery: "audit_verified_match", state: "refused", inject_id: row.inject_id, error_code: "AUDIT_DELIVERY_FAILED" };
+      // Authenticated attribution proves the attempt, not zero effect: the
+      // candidate also uses failed:* for unknown/partial delivery outcomes.
+      return { recovery: "unverified" };
     }
     if (typeof dr === "string" && dr.startsWith("blocked:")) {
       return { recovery: "audit_verified_match", state: "refused", inject_id: row.inject_id, error_code: "AUDIT_DELIVERY_BLOCKED" };

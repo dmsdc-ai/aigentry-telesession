@@ -386,7 +386,8 @@ describe("durable transport vectors (loopback fake telepty)", { skip: NO_LOOPBAC
     const variants = [
       ["exact success", (ctx) => [ctx.row()], { state: "accepted", recovery: "audit_verified_match" }],
       ["exact queued", (ctx) => [ctx.row({ delivery_result: "queued" })], { state: "accepted", recovery: "audit_verified_match" }],
-      ["exact failed", (ctx) => [ctx.row({ delivery_result: "failed:write" })], { state: "refused", recovery: "audit_verified_match" }],
+      ["exact failed cannot prove zero effect", (ctx) => [ctx.row({ delivery_result: "failed:write" })], { state: "uncertain", recovery: "unverified" }],
+      ["exact delivery unknown remains unknown", (ctx) => [ctx.row({ delivery_result: "failed:DELIVERY_UNCERTAIN" })], { state: "uncertain", recovery: "unverified" }],
       ["exact blocked", (ctx) => [ctx.row({ delivery_result: "blocked:peer_lane" })], { state: "refused", recovery: "audit_verified_match" }],
       ["no rows", () => [], { state: "uncertain", recovery: "not_found" }],
       ["two verified rows", (ctx) => [ctx.row(), ctx.row()], { state: "uncertain", recovery: "ambiguous" }],

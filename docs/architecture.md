@@ -1,4 +1,4 @@
-# telesession architecture (0.1.0 draft)
+# telesession architecture (0.2.0)
 
 ## Boundary
 | component | owns | must not |
@@ -12,11 +12,14 @@ Dependency is one-way: telesession → telepty documented HTTP API. telepty runs
 ## Modules
 ```
 bin/telesession-mcp.js   host: env → config → transport → MCP stdio; process lifetime; stderr codes only
-src/adapters/mcp.js      5 tools, strict zod schemas, maps records → MCP results (no state, no secrets)
+src/adapters/mcp.js      6 tools (incl. telesession_request_status), strict zod schemas, maps records → MCP results (no state, no secrets)
 src/index.js             core public API (no dependencies)
 src/config.js            ConfigError, normalizeConfig (pure), loadConfig (TELESESSION_* env + explicit token file, optional state dir)
 src/transports/telepty.js createTeleptyTransport → {inboxId, health, listAllowedTargets, send, receipt, readReply, close}
 src/store.js             (L1 lane) openStore → strict-lock, fsync'd state.json + replies/ + optional credential.json
+src/relay/ledger.js      correlation ledger (durable mode, <state dir>/ledger): records, events, reservations, outbox
+src/relay/relay.js, runner.js, route.js, adapters.js   relay tick/runner, routes, receipt/provenance adapters — UNSUPPORTED in 0.2.0 (default off; non-local routes PEER_UNSUPPORTED; outbox not wired)
+bin/telesession-relay-tick.js, bin/telesession-ledger-prune.js   one relay tick (unsupported) / ledger prune (--dry-run)
 ```
 Another adapter (CLI, HTTP worker) calls the same transport API; no plugin framework. Remote routes
 will be added at the telesession layer behind the same API.
@@ -29,7 +32,9 @@ will be added at the telesession layer behind the same API.
   reply_to, sender inbox id/epoch/generation} → inject → commit `accepted|refused|uncertain`. A failed
   post-inject commit is held in memory (`durability:"degraded"`, then `STORE_DEGRADED` until it commits).
 - Receiver: a reply is fsynced to `replies/` and referenced by a committed record before the 200; a
-  store failure or a lost lock answers 503 (telepty's mailbox retries, then dead-letters).
+  store failure or a lost lock answers 503. The current Telepty candidate preserves such an
+  attempted HTTP delivery as unknown in quarantine, with original payload and no automatic
+  retry, even after receiver space returns. A generic error response cannot prove zero effect.
 - Startup: `reserved → uncertain(process_restart)`. Then, on the first send/receipt/readReply: inbox
   reattach (owned DELETE with a persisted credential, then create_only of the same id) or rotation
   (old id → orphans, never touched again). Then an audit probe that accepts only exactly one row matching

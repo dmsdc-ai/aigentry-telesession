@@ -1,4 +1,4 @@
-# API-CONTRACT-TELESESSION — task 1215 (tc1215ars) — @dmsdc-ai/telesession 0.1.0 (private draft)
+# API-CONTRACT-TELESESSION — task 1215 (tc1215ars) — @dmsdc-ai/telesession 0.2.0
 
 Source contract only, not a runtime measurement. Supersedes the predecessor's placement
 (`telepty/mcp-server/dot-broker.mjs`, `TELEPTY_MCP_PROFILE=dot`); the security behaviour of that
@@ -19,10 +19,13 @@ Required capabilities: `inject-exact-target`, `register-create-only`, `delete-ow
 (telepty daemon.js change, §5). No import of any telepty file; no telepty change for this client.
 
 ## 1. Package
-`package.json`: name `@dmsdc-ai/telesession`, version `0.1.0`, `private: true`, `type: module`,
-`engines.node >=20`, bin `telesession-mcp` → `bin/telesession-mcp.js`, exports `.` → `src/index.js`
-(core, zero dependencies), `./mcp` → `src/adapters/mcp.js`. Dependencies (declared only, not
-installed): `@modelcontextprotocol/sdk ^1.26.0`, `zod ^3.24.0` (adapter + bin only).
+`package.json`: name `@dmsdc-ai/telesession`, version `0.2.0`, `publishConfig.access: "public"`
+(publication is a separate gated step), `type: module`, `engines.node >=20`, bins `telesession-mcp`,
+`telesession-tunnel-child`, `telesession-relay-tick` (unsupported in 0.2.0, §8) and
+`telesession-ledger-prune`, exports `.` → `src/index.js` (core, zero dependencies), `./mcp` →
+`src/adapters/mcp.js`. Dependencies: `@modelcontextprotocol/sdk ^1.29.0`, `zod ^3.25.76` (adapter + bin
+only; floors are the tested lock versions). Requires Telepty 0.10.0 (the three capabilities plus the inject
+delivery-uncertainty answer of §3.1); not yet published, no installed/runtime proof for this candidate.
 
 ## 2. Config (`src/config.js`, no network)
 - `class ConfigError extends Error {code}` — `message === code`; never contains env values or token.
@@ -66,11 +69,19 @@ was created; `not_observed` is not proof of no restart; `observed` is sticky). R
 
 ### 3.1 HTTP client (unchanged limits)
 `redirect:"error"`; one `AbortSignal.timeout` per request covering headers+body (GET 5 s,
-register/inject 10 s, owned DELETE 1.5 s); response body cap 256 KiB. `sent`: `yes` (non-2xx),
-`no` (ECONNREFUSED), `unknown` (timeout/reset/redirect/oversize/unparseable). Codes: telepty
+register/inject 10 s, owned DELETE 1.5 s); response body cap 256 KiB. `sent`: `yes` (non-2xx
+except inject uncertainty), `no` (ECONNREFUSED), `unknown` (timeout/reset/redirect/oversize/
+unparseable, or inject HTTP 5xx/explicit `delivery_uncertain:true`). An inject error response
+does not prove zero effect: preserve uncertain acceptance and never resend. Registration
+and owned DELETE classification are unchanged. Codes: telepty
 `body.code` if `^[A-Z_]{1,64}$`, else `DAEMON_HTTP_<n>`, `DAEMON_TIMEOUT`, `DAEMON_UNREACHABLE`,
 `DAEMON_REDIRECT_REFUSED`, `DAEMON_BODY_TOO_LARGE`, `DAEMON_BAD_RESPONSE`. Never: daemon text, URL,
 header, token or bearer in a result or log. No retry.
+
+Audit recovery's exact verified sender/hash binding establishes attribution only.
+`failed:*` alone does not prove zero effect and leaves the record uncertain;
+current candidates use it for unknown delivery too. Existing success/queued and
+explicit blocked outcomes retain their respective acceptance/refusal handling.
 
 ### 3.2 send
 Allowlist `===` (`TARGET_NOT_ALLOWED`), text 1–8000 chars without NUL; `TRANSPORT_CLOSING`; inbox fatal
@@ -88,7 +99,8 @@ target_epoch_known, reply:"not_observed", durability:"memory_only", daemon_resta
 `correlation_id` (32 hex) is minted per send, immutable, and is the `correlation=` field of the header.
 
 ### 3.3 receipt (issued ids only, else `INJECT_NOT_ISSUED`)
-`consumption_observed` | `queued` (`inject_parked`) | `refused` (`aborted`) | `unknown` + `tracking_state`.
+`consumption_observed` | `queued` (`inject_parked`) | `unknown` + `tracking_state`. A tracking state
+`aborted` alone yields `unknown`: tracking termination does not prove that delivery was refused.
 
 ### 3.4 readReply (live issued nonce, else `NONCE_NOT_ISSUED`/`NONCE_EXPIRED`; `wait_ms` 0..60000)
 Trusted only if exactly one audit row into the inbox has the reply's sha256, `to_alias===null`,
@@ -104,11 +116,14 @@ duplicate` + inbox counters. Reply text is data, not instructions. Audit backoff
 5 s timeouts; ≤ 32 connections. Memory only.
 
 ## 4. MCP adapter (`src/adapters/mcp.js`) and command (`bin/telesession-mcp.js`)
-`registerMcpTools(server, transport)` registers exactly `telesession_health`,
-`telesession_list_targets`, `telesession_send {target, text}`, `telesession_receipt {inject_id}`,
-`telesession_read_reply {nonce, wait_ms}` with `z.object(...).strict()`; result = one JSON text item;
+`registerMcpTools(server, transport)` registers exactly six tools: `telesession_health`,
+`telesession_list_targets`, `telesession_send {target, text, request_id?, destination?}`, `telesession_receipt {inject_id}`,
+`telesession_read_reply {nonce, wait_ms, cursor?}`, `telesession_request_status {nonce | request_id | correlation_id, cursor?}`
+with `z.object(...).strict()` (`destination` is unsupported in 0.2.0, §8); result = one JSON text item;
 `isError` iff `ok:false`; unexpected throw → `TRANSPORT_INTERNAL`. No shell, session admin, kill,
-register or arbitrary-URL tool. `telesession-mcp`: `loadConfig(process.env)` → on failure stderr
+register or arbitrary-URL tool. `telesession-mcp`: `--help`/`-h` and `--version` answer and exit 0 before any
+config, store or MCP initialization; any other argument → stderr `telesession-mcp refused: ARGS_UNEXPECTED`,
+exit 2. Without arguments: `loadConfig(process.env)` → on failure stderr
 `telesession-mcp refused: <code>`, exit 2, zero telepty requests; stdio connect; stdin end/close,
 SIGINT, SIGTERM → `transport.close()` → one stderr line `telesession: inbox <id> <outcome>` → exit 0.
 Stdio MCP is a LOCAL adapter: it does not create a ChatGPT/Dot remote MCP connection (NOTRUN).
@@ -166,13 +181,14 @@ Source-level contract; written before `src/store.js` (L1) landed, syntax-checked
   Audit probe for live `uncertain` records without an inject_id: `GET /api/injects?to&from&since=created−2 s&until=created+12 s&limit=200`.
   Exactly one row matching target, `to_alias:null`, claimed+verified sender sid, epoch, generation,
   `spoof_suspected:false`, payload hash, window, string inject_id, and `next_cursor:null` → `accepted` (success|queued) or
-  `refused` (`AUDIT_DELIVERY_FAILED|AUDIT_DELIVERY_BLOCKED`), `recovery:"audit_verified_match"`. Anything else
-  stays `uncertain` (`not_found|ambiguous|unverified|audit_unavailable`).
+  `refused` for explicit blocked outcomes (`AUDIT_DELIVERY_BLOCKED`), `recovery:"audit_verified_match"`.
+  `failed:*` alone stays `uncertain`/`unverified`: it attributes an attempt but cannot establish zero
+  effect. Anything else stays `uncertain` (`not_found|ambiguous|unverified|audit_unavailable`).
 - health adds `store {mode, state ok|degraded|lock_lost, permissions, credential_persisted, pending, uncertain,
   gaps, orphans[], recovery}` and `recovery`. close: owned DELETE ok → commit `deleted` + clearCredential; the store
   is closed last (owner-matched lock unlink).
 - MCP: `telesession_send` adds `request_id: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/).optional()`, `.strict()`;
-  still exactly 5 tools. bin: SIGHUP joins stdin end/close, SIGINT and SIGTERM for graceful close (idempotent).
+  5 tools at this addendum; 0.2.0 adds `telesession_request_status` (6 tools, §4). bin: SIGHUP joins stdin end/close, SIGINT and SIGTERM for graceful close (idempotent).
 - Never persisted or returned: telepty token, receiver port/secret path, prompt text, state dir path. The inbox
   bearer is persisted only with `TELESESSION_PERSIST_INBOX_CREDENTIAL=1` on verified POSIX.
 - Peer policy (telepty, unchanged): full prompt exchange only with an operator-designated true orchestrator
@@ -181,3 +197,16 @@ Source-level contract; written before `src/store.js` (L1) landed, syntax-checked
 - Limits: `accepted` ≠ delivered ≠ completed (audit `success` = enqueued by telepty). Replies sent while the
   receiver or inbox is down can be lost (mailbox dead-letter, 404 without an audit row). Delete-then-create reattach
   purges telepty's queued retries for that id. Not exactly-once. A local stdio adapter is not a Dot remote route.
+
+## 8. 0.2.0 relay status (unsupported)
+The relay runner (`TELESESSION_RELAY_INTERVAL_MS`, default off), `telesession-relay-tick` and
+`telesession_send.destination` ship, but they are unsupported and cannot complete a request:
+- non-local routes → `PEER_UNSUPPORTED` (no daemon-side exact remote forward, telepty#111);
+- the outbox is not wired (`ledger.enqueue()` has no caller in the shipped processes);
+- relayed receipts → `INJECT_MISMATCH` (no origin inject id echo, #8);
+- remote provenance → `REMOTE_PROVENANCE_UNAVAILABLE` (telepty#100).
+
+A request with a `destination` stays `pending`/unproven. `pending` is never completed remote delivery.
+Known open limitation (#10): a durable receiver rejection for 4 candidates per request or 64 stored texts
+answers 503 and increments only `inbox_rejected` (no reason counter, request not marked). With Telepty 0.10.0
+the 503 is dead-lettered as `unknown` without retry. Minimum follow-up: per-reason counters plus request marking.

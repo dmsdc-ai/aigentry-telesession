@@ -4,6 +4,46 @@
 
 End-to-end delivery protocol (spec `docs/specs/2026-10-11-e2e-delivery-protocol.md`).
 
+### Release integration (2026-10-31)
+
+The 0.2.0 release line (`704200d`) now includes the reviewed Linux follow-up (`90d88aa..91b8c9b`).
+
+- Inject uncertainty: an inject answered with HTTP 5xx, `delivery_uncertain: true` or code `DELIVERY_UNCERTAIN` is
+  `accepted: "unknown"`, kept `uncertain` and never re-sent automatically. Registration and owned DELETE
+  classification are unchanged.
+- Audit recovery: a verified `failed:*` audit row (including `failed:DELIVERY_UNCERTAIN`) stays
+  `uncertain`/`recovery: "unverified"`. It is no longer `refused`/`AUDIT_DELIVERY_FAILED`. Explicit `blocked:*`
+  remains refused.
+- Receipt: tracking state `aborted` alone is `unknown`, not `refused`.
+- CLI: `telesession-mcp --help`/`-h`/`--version` answer before any config, store or MCP initialization. Any other
+  argument is refused with `ARGS_UNEXPECTED` (exit 2).
+- Package: `API-CONTRACT-TELESESSION.md` and `CHANGELOG.md` are packaged. Docs are an explicit user-facing
+  allowlist; repository status/CI records and dated operational reports are not shipped. `private` was removed,
+  and `publishConfig.access: "public"` added (publication is a separate, gated step). The dependency floors were
+  raised to the tested lock versions, `@modelcontextprotocol/sdk ^1.29.0` and `zod ^3.25.76`. Lock resolutions
+  are unchanged.
+- License notice: the MIT `LICENSE` file (2026 dmsdc) is now included and packed. The license terms are
+  unchanged. `test:pack` asserts the exact packed file set.
+- Release validation: the new manual `compatibility.yml` workflow runs the full suite, `test:pack` and (Linux/macOS)
+  installed-tarball acceptance against one exact Telepty commit (40-hex input) on ubuntu/macos/windows. It does not
+  replace the cross-host Mac/Linux live communication gate required before Telepty publication.
+- Tests: `test:pack` (packed file list, including all four bins) and `test:installed` (installed-artifact
+  acceptance, 6 tools). The RC5 restart child is consumer-owned (`test-support/restart-credential-child-1215.cjs`).
+  The new entrypoint and inject-uncertainty files are named in `test:unit`.
+- Compatibility: requires Telepty 0.10.0 (the three capabilities plus a non-2xx `delivery_uncertain`/`DELIVERY_UNCERTAIN`
+  answer and `failed:DELIVERY_UNCERTAIN` audit rows). It is not yet published, and no installed or runtime proof
+  of this integrated candidate exists. A receiver 503 is dead-lettered by that Telepty as `unknown` without retry.
+- Unsupported in 0.2.0: the relay runner, `telesession-relay-tick` and `telesession_send.destination`. Non-local
+  routes are refused with `PEER_UNSUPPORTED`. The outbox is not wired, relayed receipts are refused (#8) and remote
+  provenance is unavailable (telepty#100). A `destination` request stays `pending` and is never completed
+  remote delivery.
+- Known limitation (#10, open): a durable receiver rejection (4 candidates per request or 64 stored texts) answers
+  503 and only increments `inbox_rejected`. There is no reason counter and the request is not marked, so with
+  Telepty 0.10.0 such a reply is lost unless the replier resends. Minimum follow-up: per-reason counters
+  (`candidates_full`, `store_full`) and request marking.
+- The test counts under "Verified / not verified" below are historical (2026-10-12 release branch). The integrated
+  candidate has not been tested yet.
+
 ### Added
 
 - Public `request_id` per request and an immutable, origin-minted `correlation_id` set at request creation.

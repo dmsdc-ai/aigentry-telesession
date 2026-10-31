@@ -88,4 +88,4 @@ jobs:
 
       - name: npm pack --dry-run (nothing is published)
         shell: bash
-        run: npm run --silent check:pack
+        run: npm run --silent test:pack
