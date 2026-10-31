@@ -66,11 +66,19 @@ was created; `not_observed` is not proof of no restart; `observed` is sticky). R
 
 ### 3.1 HTTP client (unchanged limits)
 `redirect:"error"`; one `AbortSignal.timeout` per request covering headers+body (GET 5 s,
-register/inject 10 s, owned DELETE 1.5 s); response body cap 256 KiB. `sent`: `yes` (non-2xx),
-`no` (ECONNREFUSED), `unknown` (timeout/reset/redirect/oversize/unparseable). Codes: telepty
+register/inject 10 s, owned DELETE 1.5 s); response body cap 256 KiB. `sent`: `yes` (non-2xx
+except inject uncertainty), `no` (ECONNREFUSED), `unknown` (timeout/reset/redirect/oversize/
+unparseable, or inject HTTP 5xx/explicit `delivery_uncertain:true`). An inject error response
+does not prove zero effect: preserve uncertain acceptance and never resend. Registration
+and owned DELETE classification are unchanged. Codes: telepty
 `body.code` if `^[A-Z_]{1,64}$`, else `DAEMON_HTTP_<n>`, `DAEMON_TIMEOUT`, `DAEMON_UNREACHABLE`,
 `DAEMON_REDIRECT_REFUSED`, `DAEMON_BODY_TOO_LARGE`, `DAEMON_BAD_RESPONSE`. Never: daemon text, URL,
 header, token or bearer in a result or log. No retry.
+
+Audit recovery's exact verified sender/hash binding establishes attribution only.
+`failed:*` alone does not prove zero effect and leaves the record uncertain;
+current candidates use it for unknown delivery too. Existing success/queued and
+explicit blocked outcomes retain their respective acceptance/refusal handling.
 
 ### 3.2 send
 Allowlist `===` (`TARGET_NOT_ALLOWED`), text 1–8000 chars without NUL; `TRANSPORT_CLOSING`; inbox fatal
@@ -165,8 +173,9 @@ Source-level contract; written before `src/store.js` (L1) landed, syntax-checked
   Audit probe for live `uncertain` records without an inject_id: `GET /api/injects?to&from&since=created−2 s&until=created+12 s&limit=200`.
   Exactly one row matching target, `to_alias:null`, claimed+verified sender sid, epoch, generation,
   `spoof_suspected:false`, payload hash, window, string inject_id, and `next_cursor:null` → `accepted` (success|queued) or
-  `refused` (`AUDIT_DELIVERY_FAILED|AUDIT_DELIVERY_BLOCKED`), `recovery:"audit_verified_match"`. Anything else
-  stays `uncertain` (`not_found|ambiguous|unverified|audit_unavailable`).
+  `refused` for explicit blocked outcomes (`AUDIT_DELIVERY_BLOCKED`), `recovery:"audit_verified_match"`.
+  `failed:*` alone stays `uncertain`/`unverified`: it attributes an attempt but cannot establish zero
+  effect. Anything else stays `uncertain` (`not_found|ambiguous|unverified|audit_unavailable`).
 - health adds `store {mode, state ok|degraded|lock_lost, permissions, credential_persisted, pending, uncertain,
   gaps, orphans[], recovery}` and `recovery`. close: owned DELETE ok → commit `deleted` + clearCredential; the store
   is closed last (owner-matched lock unlink).

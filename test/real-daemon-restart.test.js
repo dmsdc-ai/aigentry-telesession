@@ -27,9 +27,9 @@ import os from "node:os";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { createTeleptyTransport, normalizeConfig, REQUIRED_CAPABILITIES } from "../src/index.js";
-import { HAS_TELEPTY, TELEPTY_DIR, listSessionIds, startRestartableTeleptyDaemon, startTeleptyBridge, waitFor } from "./helpers.js";
+import { HAS_TELEPTY, TELEPTY_DIR, PACKAGE_DIR, listSessionIds, startRestartableTeleptyDaemon, startTeleptyBridge, waitFor } from "./helpers.js";
 
-const CHILD = path.join(TELEPTY_DIR, "test-support", "restart-credential-child-1215.js");
+const CHILD = path.join(PACKAGE_DIR, "test-support", "restart-credential-child-1215.cjs");
 const TARGET = "orchestrator";
 const CASE_TIMEOUT_MS = 180000;
 
