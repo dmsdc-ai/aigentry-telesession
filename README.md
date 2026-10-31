@@ -1,4 +1,4 @@
-# telesession (0.1.0 candidate — work in progress, not released)
+# telesession (local installation candidate — not published)
 
 telesession is a generic, terminal-independent **remote session connection layer**: an MCP adapter and
 a request/reply transport that sit on top of a local telepty daemon.
@@ -13,21 +13,23 @@ current credential.
 - **Plain Node ≥ 20** (no shell, no OS GUI API), intended for macOS, Linux and Windows.
 
 > **Status: candidate, not released.** `package.json` keeps `"private": true` and nothing is published
-> to npm. Real Dot, tunnel, real-daemon and native cross-OS acceptance are **NOTRUN**. See
-> [`docs/status.md`](docs/status.md) for exactly what has and has not been verified. This work is
+> to npm. Linux private-daemon and actual local tarball installation/MCP roundtrip are now verified;
+> real Dot, remote gateway/tunnel and native macOS/Windows acceptance are **NOTRUN**. See
+> [installation](docs/install.md) and [`docs/status.md`](docs/status.md) for exact evidence. This work is
 > tracked under task 1215 for the next aigentry release.
 
 ## Requirements and prerequisites
 telesession refuses to start sending unless the telepty daemon advertises three opt-in capabilities in
 `GET /api/meta`: `inject-exact-target`, `register-create-only` and `delete-owned-session`.
-**The existing telepty 0.8.5 baseline does not provide them**, so the stock npm telepty package does not
-work with this candidate. A telepty build carrying the candidate daemon change is a prerequisite; it is
-not part of this repository and has not been released.
+**The observed installed Telepty0.9.1 and original0.8.5 do not provide them.** Version numbers alone
+do not establish compatibility. Use a reviewed build advertising all three contracts; the tested
+local Telepty source is b842f0c. This package never upgrades or restarts Telepty automatically.
 
-There is no one-command install. To try the candidate locally you need:
+The local tarball can be installed with npm without a source build; it is not yet published to a
+registry. [Installation and MCP configuration](docs/install.md) describes the tested flow. You need:
 1. Node ≥ 20.
-2. A clone of this repository and `npm install` for its two dependencies
-   (`@modelcontextprotocol/sdk`, `zod`).
+2. The reviewed local tarball installed with its two dependencies (`@modelcontextprotocol/sdk`,
+   `zod`), or a source checkout installed from its lockfile.
 3. A local telepty daemon built from the candidate change (the three capabilities above), listening on
    loopback, with its auth token available in a file.
 4. An exact target session that the daemon's existing `AIGENTRY_ORCHESTRATOR_SIDS` policy treats as a

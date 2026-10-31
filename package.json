@@ -17,13 +17,16 @@
   },
   "scripts": {
     "test": "node --test test/",
-    "test:unit": "node --test --test-reporter=tap test/config.test.js test/store.test.js test/tunnel-child.test.js test/tunnel-child-independent.test.js",
+    "test:unit": "node --test --test-reporter=tap test/config.test.js test/store.test.js test/tunnel-child.test.js test/tunnel-child-independent.test.js test/entrypoint-arguments.test.js test/package-layout.test.js",
+    "test:pack": "node --test test/package-layout.test.js",
+    "test:installed": "node test-support/installed-package-acceptance.mjs",
     "check:pack": "npm pack --dry-run --ignore-scripts"
   },
   "files": [
     "bin/",
     "src/",
     "docs/",
+    "API-CONTRACT-TELESESSION.md",
     "README.md"
   ],
   "dependencies": {
