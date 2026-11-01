@@ -9,7 +9,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import fs from "node:fs";
+import path from "node:path";
 import { loadConfig, createTeleptyTransport } from "../src/index.js";
+import { openLedger } from "../src/relay/ledger.js";
 import { registerMcpTools } from "../src/adapters/mcp.js";
 
 const PKG_VERSION = (() => {
@@ -19,11 +21,33 @@ const PKG_VERSION = (() => {
   } catch { return "0.0.0"; }
 })();
 
+// CLI questions must not initialize configuration, a durable store or MCP.
+const args = process.argv.slice(2);
+if (args.length === 1 && ["--help", "-h"].includes(args[0])) {
+  process.stdout.write("Usage: telesession-mcp [--help | --version]\nRun without arguments to serve MCP over stdio.\n" +
+    "Configure TELESESSION_TARGETS, TELESESSION_INBOX_PREFIX, TELESESSION_TELEPTY_URL, and exactly one of TELESESSION_TELEPTY_TOKEN_FILE or TELESESSION_TELEPTY_TOKEN.\n" +
+    "Requires Node >=20 and a compatible local Telepty daemon; never installs, enrolls, restarts or hosts a remote gateway.\n");
+  process.exit(0);
+}
+if (args.length === 1 && args[0] === "--version") {
+  process.stdout.write(`${PKG_VERSION}\n`);
+  process.exit(0);
+}
+if (args.length !== 0) {
+  process.stderr.write("telesession-mcp refused: ARGS_UNEXPECTED (use --help)\n");
+  process.exit(2);
+}
+
 // Fail closed BEFORE any telepty request: exit 2 with a code only (no env values, no token, no
 // state dir path). ConfigError and StoreError (e.g. STORE_LOCKED after an abrupt crash) take this path.
 let transport;
 try {
-  transport = createTeleptyTransport(loadConfig(process.env));
+  const cfg = loadConfig(process.env);
+  // Durable mode only: the correlation ledger lives inside the (locked, private) state dir. A ledger that
+  // cannot open leaves every existing tool unchanged; request_status and health then report
+  // LEDGER_UNAVAILABLE with the open code (e.g. LEDGER_LOCK_STALE after an abrupt exit).
+  const ledger = cfg.stateDir === null ? undefined : () => openLedger({ dir: path.join(cfg.stateDir, "ledger") });
+  transport = createTeleptyTransport(cfg, undefined, { ledger });
 } catch (err) {
   process.stderr.write(`telesession-mcp refused: ${(err && err.code) || "CONFIG_INVALID"}\n`);
   process.exit(2);

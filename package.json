@@ -1,7 +1,6 @@
 {
   "name": "@dmsdc-ai/telesession",
-  "version": "0.1.0",
-  "private": true,
+  "version": "0.2.0",
   "description": "Session-level prompt exchange over a local telepty daemon: exact targets, owned inbox, audit-verified replies, MCP adapter.",
   "type": "module",
   "engines": {
@@ -13,22 +12,36 @@
   },
   "bin": {
     "telesession-mcp": "bin/telesession-mcp.js",
-    "telesession-tunnel-child": "bin/telesession-tunnel-child.js"
+    "telesession-tunnel-child": "bin/telesession-tunnel-child.js",
+    "telesession-relay-tick": "bin/telesession-relay-tick.js",
+    "telesession-ledger-prune": "bin/telesession-ledger-prune.js"
   },
   "scripts": {
     "test": "node --test test/",
-    "test:unit": "node --test --test-reporter=tap test/config.test.js test/store.test.js test/tunnel-child.test.js test/tunnel-child-independent.test.js",
+    "test:unit": "node --test --test-reporter=tap test/config.test.js test/store.test.js test/tunnel-child.test.js test/tunnel-child-independent.test.js test/relay-ledger.test.js test/relay-outbox.test.js test/relay-retention.test.js test/relay-route.test.js test/relay-runner.test.js test/transport-durable.test.js test/transport-ledger.test.js test/transport-postexpiry.test.js test/transport-reconcile.test.js test/transport-telepty.test.js test/test-runners.test.js test/transport-crosshost.test.js test/e2e-full-route.test.js test/transport-uncertain-1238.test.js test/entrypoint-arguments.test.js test/package-layout.test.js test/inject-http-uncertainty.test.js",
+    "test:real-daemon": "node --test --test-reporter=tap test/real-daemon-restart.test.js test/transport-telepty.test.js test/mcp.test.js test/inject-http-uncertainty.test.js",
+    "test:e2e": "node --test --test-reporter=tap test/e2e-full-route.test.js",
+    "test:pack": "node --test test/package-layout.test.js",
+    "test:installed": "node test-support/installed-package-acceptance.mjs",
     "check:pack": "npm pack --dry-run --ignore-scripts"
   },
   "files": [
     "bin/",
     "src/",
-    "docs/",
+    "docs/install.md",
+    "docs/architecture.md",
+    "docs/tunnel-child.md",
+    "docs/specs/2026-10-11-e2e-delivery-protocol.md",
+    "API-CONTRACT-TELESESSION.md",
+    "CHANGELOG.md",
     "README.md"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.26.0",
-    "zod": "^3.24.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.76"
   },
   "license": "MIT"
 }

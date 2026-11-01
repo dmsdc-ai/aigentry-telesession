@@ -180,7 +180,7 @@ describe("startup refusals (synchronous, zero HTTP, no sockets)", () => {
     try { await client.connect(transport); } finally { fs.closeSync(fd); }
     t.after(async () => { try { await client.close(); } finally { sb.remove(); } });
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 5, "no new tools");
+    assert.equal(tools.length, 6, "only telesession_request_status added (task #2026101110)");
     const send = tools.find((x) => x.name === "telesession_send");
     assert.equal(send.inputSchema.additionalProperties, false);
     assert.ok(send.inputSchema.properties.request_id, "request_id declared");
@@ -386,13 +386,14 @@ describe("durable transport vectors (loopback fake telepty)", { skip: NO_LOOPBAC
     const variants = [
       ["exact success", (ctx) => [ctx.row()], { state: "accepted", recovery: "audit_verified_match" }],
       ["exact queued", (ctx) => [ctx.row({ delivery_result: "queued" })], { state: "accepted", recovery: "audit_verified_match" }],
-      ["exact failed", (ctx) => [ctx.row({ delivery_result: "failed:write" })], { state: "refused", recovery: "audit_verified_match" }],
+      ["exact failed cannot prove zero effect", (ctx) => [ctx.row({ delivery_result: "failed:write" })], { state: "uncertain", recovery: "unverified" }],
+      ["exact delivery unknown remains unknown", (ctx) => [ctx.row({ delivery_result: "failed:DELIVERY_UNCERTAIN" })], { state: "uncertain", recovery: "unverified" }],
       ["exact blocked", (ctx) => [ctx.row({ delivery_result: "blocked:peer_lane" })], { state: "refused", recovery: "audit_verified_match" }],
       ["no rows", () => [], { state: "uncertain", recovery: "not_found" }],
       ["two verified rows", (ctx) => [ctx.row(), ctx.row()], { state: "uncertain", recovery: "ambiguous" }],
       ["audit unavailable", (ctx) => { ctx.fake.flags.auditAvailable = false; return [ctx.row()]; }, { state: "uncertain", recovery: "audit_unavailable" }],
       ["claimed from only (no verified sender)", (ctx) => [ctx.row({ verified_sender_sid: null, verified_sender_epoch: null, verified_sender_generation: null })], { state: "uncertain", recovery: "unverified" }],
-      ["TV23 forged by another token holder", (ctx) => { ctx.fake.injectAs(ctx.fake.sessions.get("target-2").bearer, "target-1", ctx.wire, ctx.sender.id); return []; }, { state: "uncertain", recovery: "unverified" }],
+      ["TV23 forged by another token holder", (ctx) => { ctx.fake.injectAs(ctx.fake.sessions.get("target-2").bearer, "target-1", ctx.wire, ctx.sender.id, { ts: new Date(ctx.rec.created_at + 500).toISOString() }); return []; }, { state: "uncertain", recovery: "unverified" }],
       ["verified epoch differs", (ctx) => [ctx.row({ verified_sender_epoch: "epoch-other" })], { state: "uncertain" }],
       ["verified generation differs", (ctx) => [ctx.row({ verified_sender_generation: ctx.sender.generation + 1 })], { state: "uncertain" }],
       ["spoof_suspected", (ctx) => [ctx.row({ spoof_suspected: true })], { state: "uncertain" }],

@@ -32,7 +32,7 @@ const sha256 = (s) => createHash("sha256").update(Buffer.from(s, "utf8")).digest
 const hex = (n) => randomBytes(n).toString("hex");
 
 export function parseWire(prompt) {
-  const m = /^\[telesession nonce=([0-9a-f]{32}) reply-to=([A-Za-z0-9._-]+)\]\n([\s\S]*)$/.exec(String(prompt));
+  const m = /^\[telesession nonce=([0-9a-f]{32}) reply-to=([A-Za-z0-9._-]+)(?: correlation=[0-9a-f]{32})?\]\n([\s\S]*)$/.exec(String(prompt));
   return m ? { nonce: m[1], replyTo: m[2], text: m[3] } : null;
 }
 
@@ -121,7 +121,7 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
   }
 
   // The daemon-side inject path (HTTP route and replyFrom share it).
-  function processInject(id, body, sessionToken) {
+  function processInject(id, body, sessionToken, { ts } = {}) {
     const prompt = typeof body.prompt === "string" ? body.prompt : "";
     const from = typeof body.from === "string" ? body.from : null;
     const session = sessions.get(id);
@@ -141,7 +141,7 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
       attempt(item);                                     // first attempt; result does NOT change the response (F3d)
     }
     audit.push({
-      ts: new Date().toISOString(), inject_id, kind: "inject", source: "inject",
+      ts: ts || new Date().toISOString(), inject_id, kind: "inject", source: "inject",
       claimed_from: from, verified_sender_sid: p ? p.sid : null, verified_sender_epoch: p ? p.epoch : null,
       verified_sender_generation: p ? p.generation : null,
       to: id, to_alias: null, origin: "trusted-local",
@@ -262,8 +262,9 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
       const s = sessions.get(fromSid);
       return processInject(to, { prompt: text, from, exact_target: true }, bearer !== undefined ? bearer : s && s.bearer);
     },
-    // Another holder of a valid token (e.g. a different session's bearer) injecting anything.
-    injectAs(bearer, to, prompt, from) { return processInject(to, { prompt, from, exact_target: true }, bearer); },
+    // Another holder of a valid token (e.g. a different session's bearer) injecting anything. `ts` places
+    // the audit row in time (e.g. inside a recovery probe window).
+    injectAs(bearer, to, prompt, from, { ts } = {}) { return processInject(to, { prompt, from, exact_target: true }, bearer, { ts }); },
     addAuditRow(row, { observe = true } = {}) {
       const full = {
         ts: new Date().toISOString(), inject_id: randomUUID(), kind: "inject", source: "inject", claimed_from: null,

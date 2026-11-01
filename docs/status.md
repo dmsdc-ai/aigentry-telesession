@@ -1,5 +1,29 @@
 # telesession — snapshot status (2026-10-11)
 
+## Integrated 0.2.0 candidate (2026-10-31)
+
+The integrated 0.2.0 source is PR4 (`704200d`) with the reviewed Linux delta (`90d88aa..91b8c9b`)
+ported onto it. It has **not been tested** (unit, real-daemon, full, pack and installed counts are all
+NOT RUN), and its security scan is pending. Every count below is historical and was measured on earlier
+lines. Telepty 0.10.0 is the prerequisite and is not yet published. Relay/`destination` are unsupported in
+0.2.0, and issue #10 (silent reply rejection) remains open. This file and the dated reports in `docs/` are
+repository records; they are not shipped in the npm package.
+
+## Historical local follow-up (2026-10-31, line `91b8c9b`)
+
+The historical table below describes the original snapshot, not current Linux
+test results. The isolated consumer repair at5dd2583 passed187/190, zero failed,
+three native/platform skips against Telepty source b842f0c, including real private
+daemon restart. HTTP/audit uncertainty stays unknown without replay. Later local
+install-flow work adds help/version/strict argument refusal and the missing API
+contract to the actual tarball. A new offline npm prefix installation and its own
+installed MCP SDK/executable completed all-five-tool durable roundtrip/owned close
+acceptance. See [installation](install.md) for exact prerequisites and boundaries.
+
+Native macOS/Windows, current Dot/Mac, remote gateway/tunnel and registry release
+remain unverified/not performed. Installed Telepty0.9.1 remains incompatible with
+the three capability requirements. No live installation or service was changed.
+
 This repository is the initial private source snapshot of a **work-in-progress candidate**. It is not a
 release. `package.json` stays `"private": true`, nothing is published to npm, and pushing this snapshot
 does not complete task 1215 or the actual remote-connection goal. Work is tracked under task 1215 for

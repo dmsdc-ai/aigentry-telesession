@@ -1,0 +1,261 @@
+# Exact-candidate compatibility validation against one immutable Telepty commit.
+# Manual or called by release-check.yml (workflow_call; usable before this file is on the default branch).
+# Read-only token, no secrets, no login, no tag, no publish. See docs/ci.md.
+# GitHub runners do NOT establish the cross-host Mac/Linux live communication gate.
+name: Compatibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      telepty_ref:
+        description: "dmsdc-ai/aigentry-telepty commit (exactly 40 lowercase hex characters; no branch, tag or short SHA)"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      telepty_ref:
+        description: "dmsdc-ai/aigentry-telepty commit (exactly 40 lowercase hex characters; no branch, tag or short SHA)"
+        required: true
+        type: string
+    outputs:
+      telepty_sha:
+        description: "Telepty HEAD verified equal to telepty_ref after checkout (set only after that check passed)"
+        value: ${{ jobs.compatibility.outputs.telepty_sha }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compatibility-${{ github.ref }}-${{ inputs.telepty_ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-ref:
+    name: validate telepty_ref
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require an immutable 40-hex commit SHA (before any checkout)
+        shell: bash
+        env:
+          TELEPTY_REF: ${{ inputs.telepty_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TELEPTY_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::telepty_ref must be exactly 40 lowercase hex characters (immutable commit SHA)"
+            exit 1
+          fi
+
+  compatibility:
+    name: compatibility (${{ matrix.os }}, Node ${{ matrix.node }})
+    needs: [validate-ref]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    outputs:
+      telepty_sha: ${{ steps.ident.outputs.telepty_sha }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ["20.20.0"]
+    steps:
+      - name: Re-check telepty_ref (defence in depth, before any checkout)
+        shell: bash
+        env:
+          TELEPTY_REF: ${{ inputs.telepty_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$TELEPTY_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::invalid telepty_ref"; exit 1; }
+
+      - name: Checkout Telesession (this candidate)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: telesession
+          persist-credentials: false
+
+      - name: Checkout Telepty (public, exact commit, read-only)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: dmsdc-ai/aigentry-telepty
+          ref: ${{ inputs.telepty_ref }}
+          path: telepty
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ matrix.node }}
+
+      # Runner-private evidence/cache/log locations; nothing points at a real user's HOME or services.
+      - name: Private runner paths and exact identities
+        id: ident
+        shell: bash
+        env:
+          TELEPTY_REF: ${{ inputs.telepty_ref }}
+          MATRIX_OS: ${{ matrix.os }}
+        run: |
+          set -euo pipefail
+          actual="$(git -C telepty rev-parse HEAD)"
+          if [ "$actual" != "$TELEPTY_REF" ]; then echo "::error::telepty HEAD $actual != requested $TELEPTY_REF"; exit 1; fi
+          # Without daemon.js the real-daemon suites would only skip (NOTRUN); refuse instead.
+          if [ ! -f telepty/daemon.js ]; then echo "::error::telepty/daemon.js missing at $actual"; exit 1; fi
+          echo "telepty_sha=$actual" >> "$GITHUB_OUTPUT"
+          COMPAT="$RUNNER_TEMP/compat"
+          mkdir -p "$COMPAT/child-logs" "$COMPAT/npm-cache" "$COMPAT/pack" "$COMPAT/prefix"
+          : > "$COMPAT/empty-npmrc"
+          {
+            echo "COMPAT=$COMPAT"
+            echo "TELESESSION_TEST_TELEPTY_DIR=$GITHUB_WORKSPACE/telepty"
+            echo "TELESESSION_TEST_LOG_DIR=$COMPAT/child-logs"
+            echo "npm_config_cache=$COMPAT/npm-cache"
+            echo "npm_config_userconfig=$COMPAT/empty-npmrc"
+            echo "npm_config_update_notifier=false"
+            echo "npm_config_fund=false"
+            echo "npm_config_audit=false"
+          } >> "$GITHUB_ENV"
+          COMPAT="$COMPAT" TELEPTY_SHA="$actual" TELESESSION_SHA="$(git -C telesession rev-parse HEAD)" \
+          NPM_VERSION="$(npm --version)" node -e '
+            const fs = require("fs"), path = require("path");
+            const ver = (d) => JSON.parse(fs.readFileSync(path.join(d, "package.json"), "utf8")).version;
+            const p = {
+              telesession: { sha: process.env.TELESESSION_SHA, dispatched_sha: process.env.GITHUB_SHA, ref: process.env.GITHUB_REF, version: ver("telesession") },
+              telepty: { repository: "dmsdc-ai/aigentry-telepty", sha: process.env.TELEPTY_SHA, version: ver("telepty") },
+              matrix: { os: process.env.MATRIX_OS, runner_os: process.env.RUNNER_OS, arch: process.env.RUNNER_ARCH, node: process.version, npm: process.env.NPM_VERSION },
+              run: { id: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT },
+            };
+            fs.writeFileSync(path.join(process.env.COMPAT, "provenance.json"), JSON.stringify(p, null, 2) + "\n");
+            console.log(JSON.stringify(p));'
+
+      - name: Install Telesession from its lockfile (no lifecycle scripts)
+        id: ts_install
+        shell: bash
+        working-directory: telesession
+        run: npm ci --ignore-scripts
+
+      - name: Install Telepty from its lockfile (no lifecycle scripts)
+        id: tp_install
+        shell: bash
+        working-directory: telepty
+        run: npm ci --ignore-scripts
+
+      # Reviewed exception (the only lifecycle scripts executed): node-pty is a native addon loaded by
+      # Telepty's PTY bridge (`cli.js allow`, used by the real-daemon RC5 restart test). --ignore-scripts
+      # skips its install script, which provides the platform binary. `npm rebuild node-pty` runs only
+      # node-pty's own scripts; Telepty's root postinstall/preuninstall (HOME/skill/service side effects)
+      # never run here.
+      - name: Build node-pty native addon only (reviewed exception)
+        id: pty
+        shell: bash
+        working-directory: telepty
+        run: |
+          set -euo pipefail
+          npm rebuild node-pty --foreground-scripts 2>&1 | tee "$COMPAT/node-pty-rebuild.log"
+          node -e 'require("node-pty"); console.log("node-pty loads")'
+
+      - name: Full suite (npm test) against the exact Telepty tree
+        id: full
+        if: ${{ !cancelled() && steps.ts_install.outcome == 'success' && steps.pty.outcome == 'success' }}
+        shell: bash
+        working-directory: telesession
+        run: |
+          set -euo pipefail
+          npm test 2>&1 | tee "$COMPAT/full.tap"
+
+      - name: Package layout (test:pack)
+        id: packtest
+        if: ${{ !cancelled() && steps.ts_install.outcome == 'success' }}
+        shell: bash
+        working-directory: telesession
+        run: |
+          set -euo pipefail
+          npm run --silent test:pack 2>&1 | tee "$COMPAT/pack-test.tap"
+
+      - name: Pack the exact candidate tarball
+        id: pack
+        if: ${{ !cancelled() && runner.os != 'Windows' && steps.ts_install.outcome == 'success' }}
+        shell: bash
+        working-directory: telesession
+        run: |
+          set -euo pipefail
+          npm pack --ignore-scripts --json --pack-destination "$COMPAT/pack" > "$COMPAT/pack.json"
+          node -e '
+            const fs = require("fs"), path = require("path"), crypto = require("crypto");
+            const [p] = JSON.parse(fs.readFileSync(path.join(process.env.COMPAT, "pack.json"), "utf8"));
+            const tgz = path.join(process.env.COMPAT, "pack", p.filename);
+            const sha256 = crypto.createHash("sha256").update(fs.readFileSync(tgz)).digest("hex");
+            fs.writeFileSync(path.join(process.env.COMPAT, "tarball.json"), JSON.stringify({ filename: p.filename, sha256, integrity: p.integrity, entries: p.entryCount }, null, 2) + "\n");
+            fs.appendFileSync(process.env.GITHUB_ENV, "TELESESSION_TGZ=" + tgz + "\n");
+            console.log(p.filename, sha256);'
+
+      # Install recipe from docs/install.md into a fresh private prefix (dependencies from the registry).
+      - name: Install the packed tarball into a fresh prefix
+        id: install
+        if: ${{ !cancelled() && steps.pack.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --ignore-scripts --no-audit --no-fund --prefix "$COMPAT/prefix" "$TELESESSION_TGZ" 2>&1 | tee "$COMPAT/install.log"
+
+      # The admitted script: TELESESSION_TEST_INSTALLED_PACKAGE=<prefix>/node_modules/@dmsdc-ai/telesession
+      # and TELESESSION_TEST_TELEPTY_DIR (absolute, set above), then `npm run test:installed`.
+      - name: Installed-artifact acceptance (test:installed)
+        id: installed
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && steps.pty.outcome == 'success' }}
+        shell: bash
+        working-directory: telesession
+        run: |
+          set -euo pipefail
+          TELESESSION_TEST_INSTALLED_PACKAGE="$COMPAT/prefix/node_modules/@dmsdc-ai/telesession" \
+            npm run --silent test:installed 2>&1 | tee "$COMPAT/installed.log"
+
+      - name: Counts (skips are not passes)
+        if: always()
+        shell: bash
+        env:
+          FULL: ${{ steps.full.outcome }}
+          PACKTEST: ${{ steps.packtest.outcome }}
+          INSTALLED: ${{ steps.installed.outcome }}
+        run: |
+          set -uo pipefail
+          COMPAT="${COMPAT:-$RUNNER_TEMP/compat}"
+          status=0
+          {
+            echo "### compatibility: $RUNNER_OS / Node $(node --version)"
+            [ -f "$COMPAT/provenance.json" ] && { echo '```json'; cat "$COMPAT/provenance.json"; echo '```'; }
+            for t in full pack-test; do
+              f="$COMPAT/$t.tap"
+              echo "#### $t"
+              if [ ! -s "$f" ]; then echo "- no TAP output (step not run or failed before output)"; continue; fi
+              grep -E '^# (tests|suites|pass|fail|cancelled|skipped|todo) ' "$f" | sed 's/^# /- /'
+              echo "Skipped (NOT counted as passed):"
+              grep -E '# SKIP' "$f" | sed -E 's/^ +//; s/^/- /' || echo "- none"
+            done
+            echo "#### outcomes"
+            echo "- full: ${FULL:-not run}; test:pack: ${PACKTEST:-not run}; installed: ${INSTALLED:-not run (Windows: not part of this gate)}"
+            [ -f "$COMPAT/tarball.json" ] && { echo '```json'; cat "$COMPAT/tarball.json"; echo '```'; }
+          } >> "$GITHUB_STEP_SUMMARY"
+          for t in full pack-test; do
+            f="$COMPAT/$t.tap"
+            if [ -s "$f" ]; then
+              pass=$(sed -n -E 's/^# pass ([0-9]+)$/\1/p' "$f" | tail -n 1)
+              if [ "${pass:-0}" -eq 0 ]; then echo "::error::$t: no passing tests recorded"; status=1; fi
+            fi
+          done
+          # A real-daemon suite skipped for a missing Telepty tree is not compatibility evidence.
+          if [ -s "$COMPAT/full.tap" ] && grep -q 'NOTRUN: telepty source not found' "$COMPAT/full.tap"; then
+            echo "::error::full: real-daemon suites skipped (telepty source not found)"; status=1
+          fi
+          exit $status
+
+      - name: Upload raw evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: compatibility-${{ matrix.os }}-node-${{ matrix.node }}-telepty-${{ inputs.telepty_ref }}
+          path: |
+            ${{ runner.temp }}/compat/*.json
+            ${{ runner.temp }}/compat/*.tap
+            ${{ runner.temp }}/compat/*.log
+            ${{ runner.temp }}/compat/child-logs/
+            ${{ runner.temp }}/compat/pack/
+          if-no-files-found: warn
+          retention-days: 14

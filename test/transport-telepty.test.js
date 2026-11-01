@@ -7,6 +7,8 @@ import { describe, test, before, after, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { pathToFileURL } from "node:url";
@@ -23,10 +25,11 @@ function transportFor(origin, token, targets = ["target-1"], inboxPrefix = "tst"
   return createTeleptyTransport(normalizeConfig({ teleptyUrl: origin, token, targets, inboxPrefix }));
 }
 
-// Raw request (lets a test set Host / Origin / chunking, which fetch forbids).
+// Raw request (lets a test set Host / Origin / chunking, which fetch forbids). Loopback fixtures only.
 function rawRequest(url, { method = "POST", headers = {}, body, chunks } = {}) {
   return new Promise((resolve) => {
     const u = new URL(url);
+    if (u.protocol !== "http:" || u.hostname !== "127.0.0.1") throw new Error("rawRequest: loopback fixtures only");
     const req = http.request({ host: u.hostname, port: u.port, path: u.pathname + u.search, method, headers, agent: false }, (res) => {
       res.resume();
       res.on("end", () => resolve({ status: res.statusCode }));
@@ -240,8 +243,9 @@ describe("HTTP client and receiver limits (recording stub daemon)", () => {
       process.stderr.write = orig.err;
     }
     const send = results[2];
-    assert.equal(send.error.code, "DAEMON_HTTP_500");
-    assert.equal(send.error.accepted, false);
+    assert.equal(send.ok, true);
+    assert.equal(send.reason, "DAEMON_HTTP_500");
+    assert.equal(send.accepted, "unknown");
     const all = JSON.stringify(results) + captured.join("\n");
     for (const s of [token, bearer, secretText, stub.origin, `127.0.0.1:${stub.port}`, "x-telepty"]) {
       assert.ok(!all.includes(s), `leaked: ${s.slice(0, 24)}…`);
@@ -252,7 +256,7 @@ describe("HTTP client and receiver limits (recording stub daemon)", () => {
       const usesBearer = q.pathname.endsWith("/inject") || q.method === "DELETE";
       assert.equal(q.headers["x-telepty-session-token"], usesBearer ? bearer : undefined, `${q.method} ${q.pathname}`);
     }
-    // The 500 retired the nonce: nothing to resend, close() deleted the owned inbox with the bearer.
+    // The 500 leaves acceptance unknown: no resend; close() deletes only the owned inbox.
     assert.equal(results[3].outcome, "deleted");
     assert.ok(stub.requests.some((q) => q.method === "DELETE" && q.url === `/api/sessions/${encodeURIComponent(results[3].inbox_id)}?owned=true`));
   });
@@ -308,6 +312,28 @@ describe("HTTP client and receiver limits (recording stub daemon)", () => {
     assert.equal(final.reply, "not_observed");
     assert.equal(final.pending_candidates, 0);
     assert.deepEqual(final.quarantined, { audit_unmatched: 64 });
+  });
+
+  // Snyk 73c8977b (cleartext HTTP server, src/transports/telepty.js createReceiver): the receiver is
+  // plain HTTP by design and must therefore be bound to 127.0.0.1 exactly — never a wildcard (0.0.0.0, ::).
+  test("receiver listens on 127.0.0.1 only: refused on ::1, on 127.0.0.2 (Linux) and on every non-loopback interface", async (t) => {
+    const stub = await startStubDaemon();
+    const tr = transportFor(stub.origin, freshToken());
+    t.after(async () => { await tr.close(); await stub.close(); });
+    assert.equal((await tr.send({ target: "target-1", text: "x" })).accepted, true);
+    const port = Number(new URL(stub.state.registerEndpoint).port);
+    const connects = (host) => new Promise((resolve) => {
+      const sock = net.connect({ host, port });
+      sock.setTimeout(2000, () => { sock.destroy(); resolve(false); });
+      sock.once("connect", () => { sock.destroy(); resolve(true); });
+      sock.once("error", () => resolve(false));
+    });
+    assert.equal(await connects("127.0.0.1"), true, "control: reachable on 127.0.0.1");
+    const others = ["::1", ...(process.platform === "linux" ? ["127.0.0.2"] : [])];
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const a of list || []) if (!a.internal) others.push(a.address);
+    }
+    for (const host of others) assert.equal(await connects(host), false, `receiver reachable on ${host}`);
   });
 
   test("bounded issued nonces (16), daemon restart observation, owned close and TRANSPORT_CLOSING", async (t) => {
@@ -453,7 +479,7 @@ describe("against a real telepty daemon (fixture)", { skip: HAS_TELEPTY ? false 
       await waitFor(() => deliveredTo(target, s.nonce), { description: "delivery to target endpoint" });
       const got = deliveredTo(target, s.nonce).body;
       assert.equal(got.session_id, "ts-orch");
-      assert.equal(got.text, `[telesession nonce=${s.nonce} reply-to=${tr.inboxId}]\n${text}`);
+      assert.equal(got.text, `[telesession nonce=${s.nonce} reply-to=${tr.inboxId} correlation=${s.correlation_id}]\n${text}`);
 
       const obs = (await d.request(`/api/inject-observations/${s.inject_id}`)).body;
       assert.equal(obs.session_id, "ts-orch");
@@ -646,7 +672,7 @@ describe("against a real telepty daemon (fixture)", { skip: HAS_TELEPTY ? false 
     }
   });
 
-  test("backpressure: 65th held text → receiver 503 → real DeliveryEngine nack + retry → delivered after space frees", async (t) => {
+  test("backpressure: receiver 503 retains unknown payload without replay after space frees", async (t) => {
     const tr = mk();
     try {
       const s = await tr.send({ target: "ts-orch", text: "flood me" });
@@ -660,30 +686,38 @@ describe("against a real telepty daemon (fixture)", { skip: HAS_TELEPTY ? false 
       await waitFor(() => [...latest().values()].filter((v) => v === "acked").length === 64, { timeoutMs: 10000, description: "64 deliveries acked" });
 
       const r65 = await reply(tr.inboxId, `REPLY ${s.nonce} part 64`, { bearer: targetCred.bearer, from: "ts-orch" });
-      assert.equal(r65.status, 200, "telepty accepts the inject; the delivery outcome is the mailbox's");
-      const failRe = new RegExp(`Delivery failed for ${tr.inboxId}/(\\S+): Delivery endpoint returned 503\\. \\(attempt 0\\)`);
-      const msgId = (await waitFor(() => failRe.exec(d.readLog()), { timeoutMs: 5000, description: "503 nack in daemon log" }))[1];
-      assert.equal(latest().get(msgId) === "acked", false);
+      assert.equal(r65.status, 502);
+      assert.equal(r65.body.delivery_uncertain, true);
+      assert.equal(r65.body.retryable, false);
+      const held = readJsonl("dead-letter.jsonl").find(row => row.payload === `REPLY ${s.nonce} part 64`);
+      assert.ok(held);
+      const msgId = held.msg_id;
+      assert.equal(typeof msgId, "string");
+      assert.equal(latest().get(msgId), "dead_letter");
+      assert.equal(held.payload, `REPLY ${s.nonce} part 64`);
+      assert.equal(held.outcome, "unknown");
 
       const rr = await tr.readReply({ nonce: s.nonce, wait_ms: 3000 });
       assert.equal(rr.reply, "trusted");
       assert.equal(rr.text, `REPLY ${s.nonce} part 0`);
 
-      await waitFor(() => latest().get(msgId) === "acked", { timeoutMs: 10000, description: "retried delivery acked" });
+      await delay(2500);
       const states = readJsonl("state.jsonl").filter((e) => e.msg_id === msgId).map((e) => e.state);
       t.diagnostic(`msg ${msgId} states: ${states.join(" → ")}`);
-      assert.ok(states.indexOf("nacked") !== -1 && states.lastIndexOf("acked") > states.indexOf("nacked"));
-      assert.ok(readJsonl("inbox.jsonl").some((m) => m.msg_id === msgId && m.attempt >= 1), "re-enqueued with attempt ≥ 1");
-      assert.equal(readJsonl("dead-letter.jsonl").length, 0);
+      assert.equal(states.includes("nacked"), false);
+      assert.equal(states.includes("acked"), false);
+      assert.equal(latest().get(msgId), "dead_letter");
+      assert.ok(readJsonl("inbox.jsonl").some(m => m.msg_id === msgId && m.attempt === 0));
+      assert.equal(readJsonl("dead-letter.jsonl").length, 1);
 
       const again = await tr.readReply({ nonce: s.nonce });
       assert.equal(again.reply, "trusted");
-      assert.equal(again.text, `REPLY ${s.nonce} part 0`, "the retried delivery did not displace the trusted reply");
+      assert.equal(again.text, `REPLY ${s.nonce} part 0`, "unknown delivery did not displace the trusted reply");
       // Counters for the rejected delivery live on the transport inbox; read them through a fresh nonce.
       const probe = await tr.send({ target: "ts-orch", text: "probe counters" });
       const counts = await tr.readReply({ nonce: probe.nonce });
       t.diagnostic(`inbox counters: ${JSON.stringify(counts.inbox)}`);
-      assert.ok(counts.inbox.inbox_rejected >= 1);
+      assert.equal(counts.inbox.inbox_rejected, 1);
     } finally {
       await tr.close();
     }
