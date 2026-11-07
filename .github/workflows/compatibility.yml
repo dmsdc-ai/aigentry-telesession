@@ -250,7 +250,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: compatibility-${{ matrix.os }}-node-${{ matrix.node }}-telepty-${{ inputs.telepty_ref }}
+          name: compatibility-${{ matrix.os }}-node-${{ matrix.node }}-telepty-${{ inputs.telepty_ref }}-attempt-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/compat/*.json
             ${{ runner.temp }}/compat/*.tap
@@ -258,4 +258,23 @@ jobs:
             ${{ runner.temp }}/compat/child-logs/
             ${{ runner.temp }}/compat/pack/
           if-no-files-found: warn
+          retention-days: 14
+
+      # Publication input (publish.yml). Uploaded only from an Ubuntu leg whose full suite, test:pack and installed-artifact
+      # acceptance all passed in this attempt, so this name never carries an untested tarball. overwrite: a successful
+      # re-run replaces it. The raw evidence above stays diagnostic only (always uploaded, attempt-qualified).
+      - name: Upload tested artifact (Ubuntu, all gates passed)
+        if: ${{ success() && runner.os == 'Linux' && matrix.os == 'ubuntu-latest' && steps.full.outcome == 'success' && steps.packtest.outcome == 'success' && steps.installed.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tested-compatibility-${{ matrix.os }}-node-${{ matrix.node }}-telepty-${{ inputs.telepty_ref }}
+          path: |
+            ${{ runner.temp }}/compat/provenance.json
+            ${{ runner.temp }}/compat/pack.json
+            ${{ runner.temp }}/compat/tarball.json
+            ${{ runner.temp }}/compat/full.tap
+            ${{ runner.temp }}/compat/installed.log
+            ${{ runner.temp }}/compat/pack/
+          overwrite: true
+          if-no-files-found: error
           retention-days: 14

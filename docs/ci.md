@@ -1,8 +1,9 @@
 # CI and release verification
 
-Three workflows live in `.github/workflows/`. All run on GitHub-hosted runners with a read-only token
-(`permissions: contents: read`), use no secrets, check out with `persist-credentials: false`, and never
-publish, release or deploy anything.
+Four workflows live in `.github/workflows/`. All run on GitHub-hosted runners, use no secrets and check out
+with `persist-credentials: false`. `ci.yml`, `compatibility.yml` and `release-check.yml` use a read-only token
+(`permissions: contents: read`) and never publish, release or deploy anything. `publish.yml` is the only
+publication path; it adds `id-token: write` to its `publish` job alone (npm Trusted Publishing, see below).
 
 ## `ci.yml` — cross-platform unit CI
 
@@ -167,10 +168,16 @@ HEAD is compared with the input again afterwards.
 - npm cache, npmrc, child logs, pack output and the install prefix live under the runner's `RUNNER_TEMP`.
   Test fixtures use their own temp HOME and ephemeral loopback daemons. No real user's HOME, data or
   service is used.
-- Evidence artifact (14 days): `provenance.json` (Telesession SHA/version, Telepty SHA/version, OS, arch,
+- Diagnostic evidence artifact `compatibility-<os>-node-<node>-telepty-<sha>-attempt-<run_attempt>` (14 days, always
+  uploaded, one per attempt so re-runs keep earlier bundles; never a publication input): `provenance.json` (Telesession SHA/version, Telepty SHA/version, OS, arch,
   Node, npm, run id), raw `full.tap`, `pack-test.tap`, `pack.json`, `tarball.json` (filename, sha256), the
   tarball, `install.log`, `installed.log`, `node-pty-rebuild.log` and child logs. The job summary lists
   counts per suite and every skipped test by name; skips are never counted as passes.
+- Tested artifact `tested-compatibility-<os>-node-<node>-telepty-<sha>` (14 days, `overwrite: true`,
+  `if-no-files-found: error`): uploaded last, only on the `ubuntu-latest` leg and only when the job is still
+  successful and the `full`, `packtest` and `installed` steps all succeeded in that attempt. It holds
+  `provenance.json`, `pack.json`, `tarball.json`, `full.tap`, `installed.log` and `pack/<tarball>` (no prefix,
+  cache, npmrc or node_modules). This is the only artifact `publish.yml` consumes; a failing upload fails the leg.
 
 What it does **not** establish: the cross-host Mac/Linux live communication gate. Both directions
 (Mac→Linux request with a matching Linux→Mac ACK, and the reverse) need the exact final candidates on both
@@ -242,14 +249,54 @@ and the telepty source lock does not carry them.
   The earlier hand-assembled telesession bundle shipped only 14 of these. The 14 match exactly on
   version/resolved/integrity, but the other 77 were never in that bundle.
 
+## `publish.yml` — tag-driven npm publication (Trusted Publishing / OIDC)
+
+Trigger: `push` of a tag matching `v*` only. There is no `workflow_dispatch`, no input and no way to name a
+different tag or commit: a run publishes only the commit that triggered it. Concurrency: one group per tag,
+`cancel-in-progress: false` (an active publish is never cancelled). The logic lives in
+`scripts/release/publish-guard.mjs` (Node built-ins only, not packed); `test/release-publish-guard.test.js`
+covers its decisions and the workflow's static contract.
+
+npm Trusted Publisher registration (npm package settings): repository `dmsdc-ai/aigentry-telesession`,
+workflow `publish.yml`, no environment. No npm token, `NODE_AUTH_TOKEN` or secret exists or is needed;
+`setup-node` is used without `registry-url`, and `npm whoami` is never used as OIDC proof.
+
+| Job | Permissions | What it does |
+|---|---|---|
+| `identity` | read | Refuses unless: event is a tag push in `dmsdc-ai/aigentry-telesession`; the tag is a stable `vX.Y.Z`; checkout `HEAD` = `GITHUB_SHA` = the tag's commit re-resolved on the remote now (`git ls-remote`, annotated tags peeled); tag = `v` + `package.json` `version` = `package-lock.json` `version` and `packages[""].version`; name and `repository.url` are exact. |
+| `ci` | read | `ci.yml` unchanged (unit matrix ubuntu/macos/windows, Node `20.20.0`, plus pack dry-run). |
+| `compatibility` | read | `compatibility.yml` unchanged, against the pinned Telepty commit `556a4ba3bcbdbcd42d2cca1bdf14a0f3cef7e421` (tag `v0.10.0`, package version 0.10.0). `pack` runs only if its verified `telepty_sha` equals the pin. |
+| `pack` | read | Runs no `npm pack`. Node `24.22.2` (npm 11.19.1; the job refuses npm < 11.5.1). Re-checks identity, then downloads this run's `tested-compatibility-ubuntu-latest-node-20.20.0-telepty-556a4ba3bcbdbcd42d2cca1bdf14a0f3cef7e421` artifact (default same-run download; no run id, repository or token input): the tarball that the Ubuntu compatibility leg packed with Node 20.20.0, installed and accepted with `test:installed`, uploaded only after those gates passed (the attempt-qualified diagnostic bundle is never used). `select-compat` refuses unless `provenance.json` names this `GITHUB_SHA` (`sha` and `dispatched_sha`), `GITHUB_REF`, the tag version, `dmsdc-ai/aigentry-telepty` at the pin, matrix `ubuntu-latest`/`Linux`/`v20.20.0` and this `GITHUB_RUN_ID` with attempt 1..current (an earlier attempt of the same run is valid reuse; another run never is); `pack/` holds exactly `dmsdc-ai-telesession-<version>.tgz`; `tarball.json` filename/sha256/integrity and `pack.json` filename/name/version/integrity/shasum equal the bytes; the packed `package/package.json` is the expected name/version; `installed.log` and `full.tap` are non-empty. It then emits those exact bytes plus a record (filename, sha512 integrity, sha1 shasum, sha256, size, `GITHUB_SHA`, source compatibility provenance) and `source/{provenance,tarball,pack}.json` as `release-tarball` (90 days). |
+| `registry-state` | read | Re-verifies the downloaded tarball against the pack job outputs, then reads the public packument once. `absent` (HTTP 200, exact package, version not listed) → decision `publish`; `published-match` (version listed with exactly the measured integrity and shasum) → `reconcile`; `published-mismatch` or `unknown` (network error, any non-200 including 404 since the package exists, malformed body) → job fails. |
+| `publish` | read + `id-token: write` | Only when the decision is `publish`. Node 24.22.2, npm ≥ 11.5.1. Immediately before publishing it re-checks identity, re-measures the tarball and re-reads the registry; if an earlier attempt already published the same artifact it reconciles instead. Publishes the measured tarball file (`npm publish <tgz> --access public`); npm exchanges the GitHub OIDC token and attaches provenance automatically. |
+| `verify` | read | Always (unless cancelled). Fails unless identity/pack/registry-state succeeded and `publish` succeeded (`publish` path) or was skipped (`reconcile` path). Polls the public packument (20 × 15 s) until it serves the version with the measured integrity and shasum; a different artifact fails at once. |
+
+Evidence artifacts (90 days): `publish-identity`, `publish-pack-evidence`, `publish-registry-state`,
+`publish-npm` (`publish.log`) and `publish-readback` (`readback.json`, including `dist.attestations`).
+
+Re-runs: a re-run keeps the original `GITHUB_SHA`/`GITHUB_REF`. It refuses if the tag was deleted or moved, and
+never publishes a second time: an already-published identical artifact is reconciled by readback without OIDC
+use; a different artifact under that version fails.
+
+Not supported: publishing an older tag that was never published (for example after a failed run whose tag was
+later moved, or a tag created before `publish.yml` existed). There is no recovery input or bypass; such a
+recovery needs a separately reviewed plan.
+
+Not established by the workflow file itself: a live Trusted Publisher acceptance, the registry provenance
+pointing at the exact commit (check `readback.json` `attestations` and the npm provenance page after the run),
+and the cross-host Mac/Linux live communication gate below.
+
+`release-check.yml` still also runs on `v*` tags; it is unchanged and publishes nothing.
+
 ## Publishing prerequisites (not done by CI)
 
 Before any npm publish, someone must:
 
 1. confirm the 0.2.0 publication decision (`private` was removed and `publishConfig.access: "public"` added in 0.2.0);
-2. set up npm credentials or trusted publishing. No workflow here has them, and `id-token: write` is not granted;
-3. apply the existing user publication authority as a separate step after all gates. No automated release tag
-   or publish job exists, and none is added in 0.2.0;
+2. register the npm Trusted Publisher for `publish.yml` (above). No npm token is used; only the `publish.yml`
+   `publish` job is granted `id-token: write`;
+3. apply the existing user publication authority as a separate step after all gates, by pushing the release
+   tag. `publish.yml` (added in 0.2.1) publishes on that tag push;
 4. verify the real-daemon, Dot/꼬마, native PTY and restart paths outside this unit matrix: a green
    `compatibility.yml` run on the exact candidate and Telepty SHA, then the cross-host Mac/Linux live
    communication gate above (before Telepty publication).
