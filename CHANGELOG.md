@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.2 — unreleased
+
+Recovery release for Trusted Publishing; no runtime change (`src/` and `bin/` are unchanged). 0.2.1 was tagged but
+never published: its `publish.yml` run stopped at the Windows compatibility leg, so npm publish was skipped. The
+`v0.2.1` tag is kept as it is; 0.2.2 carries the 0.2.1 changes below and is the intended first publication through `publish.yml`.
+
+- Test fixture: `startTeleptyDaemon` (`test/helpers.js`) now also waits, bounded at 10 s, until the host-token
+  `GET /api/ledger/status` reports `healthy: true`. Telepty listens while its tracked-injection store is still
+  `recovering` and refuses tracked injects 503 `TRACKING_CAPACITY` until then, and `/api/health` does not report that
+  state. On Windows the first inject of the real-endpoint 503 uncertainty test hit this window; the daemon log recorded
+  `observation store unavailable (recovering)`. Assertions, matrix and the Telepty pin are unchanged.
+
 ## 0.2.1 — unreleased
 
 Publication tooling only; no runtime change (`src/` and `bin/` are unchanged).
