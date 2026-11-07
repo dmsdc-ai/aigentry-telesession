@@ -138,6 +138,18 @@ export async function startTeleptyDaemon({ orchestratorSids = "", env: extraEnv 
     await waitFor(async () => {
       try { return (await fetch(`http://127.0.0.1:${port}/api/health`)).ok; } catch { return false; }
     }, { timeoutMs: 5000, description: "telepty daemon health" });
+    // telepty listens while its tracked-injection store is still `recovering` and refuses every
+    // tracked inject 503 TRACKING_CAPACITY until that store is healthy; /api/health does not cover it.
+    let ledger = null;
+    await waitFor(async () => {
+      try {
+        const r = await fetch(`http://127.0.0.1:${port}/api/ledger/status`, { headers: { "x-telepty-token": token }, signal: AbortSignal.timeout(2000) });
+        ledger = r.ok ? await r.json() : { http_status: r.status };
+      } catch { ledger = null; }
+      return ledger !== null && ledger.healthy === true;
+    }, { timeoutMs: 10000, description: "telepty tracked-injection store healthy" }).catch((err) => {
+      throw new Error(`${err.message} (last: ${JSON.stringify(ledger && { healthy: ledger.healthy, unavailable_reason: ledger.unavailable_reason, http_status: ledger.http_status })})`);
+    });
   } catch (err) {
     await stopChild(child);
     home.remove();
