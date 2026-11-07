@@ -1,0 +1,366 @@
+# Tag-driven npm publication through npm Trusted Publishing (OIDC). No npm token, no NODE_AUTH_TOKEN, no secrets.
+# Trusted Publisher registration (npm side): repository dmsdc-ai/aigentry-telesession, workflow publish.yml,
+# no environment. Only the `publish` job holds id-token: write. See docs/ci.md "publish.yml".
+# Gates reused unchanged: ci.yml (unit matrix, Node 20.20.0) and compatibility.yml against the exact Telepty
+# commit pinned below. No npm pack here: the published tarball is the exact file the Ubuntu compatibility leg of this
+# run packed, installed and accepted (test:installed); that measured file is what is published and read back.
+# There is no workflow_dispatch / tag input: a run only ever publishes the tag commit that triggered it.
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+# One publication per tag; an active publish is never cancelled.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # dmsdc-ai/aigentry-telepty tag v0.10.0 (package version 0.10.0), the shipped supported Telepty release.
+  TELEPTY_SHA: 556a4ba3bcbdbcd42d2cca1bdf14a0f3cef7e421
+
+jobs:
+  identity:
+    name: release identity
+    if: github.repository == 'dmsdc-ai/aigentry-telesession'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.id.outputs.tag }}
+      version: ${{ steps.id.outputs.version }}
+      telepty_sha: ${{ steps.pin.outputs.telepty_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20.20.0"
+
+      # HEAD = remote tag commit (re-resolved now, so a re-run after a tag move refuses) = GITHUB_SHA;
+      # tag = v<package.json version> = package-lock.json root versions; exact repository/name/repository.url.
+      - name: Tag, HEAD, run SHA and versions agree
+        id: id
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          node scripts/release/publish-guard.mjs identity "$RUNNER_TEMP/evidence/identity.json"
+
+      - name: Pinned Telepty commit
+        id: pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TELEPTY_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::TELEPTY_SHA is not a 40-hex commit"; exit 1; }
+          echo "telepty_sha=$TELEPTY_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Upload identity evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: publish-identity
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+  ci:
+    needs: [identity]
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  compatibility:
+    needs: [identity, ci]
+    uses: ./.github/workflows/compatibility.yml
+    with:
+      telepty_ref: ${{ needs.identity.outputs.telepty_sha }}
+    permissions:
+      contents: read
+
+  pack:
+    name: select tested tarball (compatibility artifact)
+    needs: [identity, ci, compatibility]
+    if: ${{ needs.compatibility.outputs.telepty_sha == needs.identity.outputs.telepty_sha }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      filename: ${{ steps.record.outputs.filename }}
+      integrity: ${{ steps.record.outputs.integrity }}
+      shasum: ${{ steps.record.outputs.shasum }}
+      sha256: ${{ steps.record.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24.22.2"
+
+      - name: Toolchain (npm >= 11.5.1 for trusted publishing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version; npm --version
+          node -e '
+            const [a, b, c] = process.argv[1].split(".").map(Number);
+            if (a < 11 || (a === 11 && (b < 5 || (b === 5 && c < 1)))) { console.error("::error::npm " + process.argv[1] + " < 11.5.1"); process.exit(1); }' "$(npm --version)"
+
+      - name: Re-check identity in this job
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          node scripts/release/publish-guard.mjs identity "$RUNNER_TEMP/evidence/identity-pack.json"
+
+      # This run's tested Ubuntu compatibility artifact (default same-run download; no run-id/repository/token input).
+      # compatibility.yml uploads this name only after full, test:pack and test:installed passed; the always-uploaded,
+      # attempt-qualified diagnostic bundle is never used. A re-run of failed jobs may reuse the tested artifact from an
+      # earlier attempt of the same run; the guard checks run id/attempt.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: tested-compatibility-ubuntu-latest-node-20.20.0-telepty-556a4ba3bcbdbcd42d2cca1bdf14a0f3cef7e421
+          path: ${{ runner.temp }}/compat-ubuntu
+
+      # Fails closed unless provenance (source/ref/version/run/matrix/Telepty pin), filename and digest metadata
+      # all match the tarball bytes. The record binds name/version/digests to GITHUB_SHA and keeps the source metadata.
+      - name: Accept the tested tarball and record it
+        id: record
+        shell: bash
+        env:
+          VERSION: ${{ needs.identity.outputs.version }}
+          COMPAT_ARTIFACT: tested-compatibility-ubuntu-latest-node-20.20.0-telepty-556a4ba3bcbdbcd42d2cca1bdf14a0f3cef7e421
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/release"
+          status=0
+          node scripts/release/publish-guard.mjs select-compat "$RUNNER_TEMP/compat-ubuntu" "$VERSION" "$TELEPTY_SHA" "$COMPAT_ARTIFACT" "$OUT" || status=$?
+          # Evidence is kept on refusal too (record.json and source metadata as received).
+          cp -R "$OUT/record.json" "$OUT/source" "$RUNNER_TEMP/evidence/" || true
+          exit "$status"
+
+      - name: Upload the measured tarball and record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-tarball
+          path: |
+            ${{ runner.temp }}/release/pkg/
+            ${{ runner.temp }}/release/record.json
+            ${{ runner.temp }}/release/source/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload pack evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: publish-pack-evidence
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+  # Registry state before publication; no id-token. Only definite absence leads to `publish`.
+  registry-state:
+    name: registry state
+    needs: [identity, pack]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      state: ${{ steps.state.outputs.state }}
+      decision: ${{ steps.state.outputs.decision }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24.22.2"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-tarball
+          path: ${{ runner.temp }}/release
+
+      - name: Verify the downloaded tarball against the pack job outputs
+        shell: bash
+        env:
+          FILENAME: ${{ needs.pack.outputs.filename }}
+          INTEGRITY: ${{ needs.pack.outputs.integrity }}
+          SHASUM: ${{ needs.pack.outputs.shasum }}
+          SHA256: ${{ needs.pack.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          REL="$RUNNER_TEMP/release"
+          node -e '
+            const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+            const e = process.env;
+            if (r.filename !== e.FILENAME || r.integrity !== e.INTEGRITY || r.shasum !== e.SHASUM || r.sha256 !== e.SHA256 || r.commit !== e.GITHUB_SHA) {
+              console.error("::error::record.json does not match the pack job outputs / GITHUB_SHA"); process.exit(1); }' "$REL/record.json"
+          node scripts/release/publish-guard.mjs verify-tgz "$REL/record.json" "$REL/pkg/$FILENAME"
+
+      - name: Classify registry state (absent / published-match; anything else fails)
+        id: state
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          node scripts/release/publish-guard.mjs registry-state "$RUNNER_TEMP/release/record.json" "$RUNNER_TEMP/evidence/registry-state.json"
+
+      - name: Upload registry evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: publish-registry-state
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+  # The only job with id-token: write. Runs only on definite absence.
+  publish:
+    name: npm publish (OIDC)
+    needs: [identity, pack, registry-state]
+    if: ${{ needs.registry-state.outputs.decision == 'publish' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      # No registry-url: setup-node must not write an _authToken/NODE_AUTH_TOKEN npmrc.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24.22.2"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-tarball
+          path: ${{ runner.temp }}/release
+
+      - name: Toolchain (npm >= 11.5.1 for trusted publishing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version; npm --version
+          node -e '
+            const [a, b, c] = process.argv[1].split(".").map(Number);
+            if (a < 11 || (a === 11 && (b < 5 || (b === 5 && c < 1)))) { console.error("::error::npm " + process.argv[1] + " < 11.5.1"); process.exit(1); }' "$(npm --version)"
+
+      # Re-run safety: the tag is re-resolved, the tarball re-measured and the registry re-read immediately
+      # before publishing. A re-run after an earlier attempt already published reconciles instead.
+      - name: Re-check identity, tarball and registry state
+        id: recheck
+        shell: bash
+        env:
+          FILENAME: ${{ needs.pack.outputs.filename }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          REL="$RUNNER_TEMP/release"
+          node scripts/release/publish-guard.mjs identity "$RUNNER_TEMP/evidence/identity-publish.json"
+          node scripts/release/publish-guard.mjs verify-tgz "$REL/record.json" "$REL/pkg/$FILENAME"
+          node scripts/release/publish-guard.mjs registry-state "$REL/record.json" "$RUNNER_TEMP/evidence/registry-state-publish.json"
+
+      # Publishes the measured tarball file (never re-packs). npm exchanges the GitHub OIDC token itself and
+      # attaches provenance automatically. Access is public.
+      - name: npm publish <measured tarball> --access public
+        if: ${{ steps.recheck.outputs.decision == 'publish' }}
+        shell: bash
+        env:
+          FILENAME: ${{ needs.pack.outputs.filename }}
+        run: |
+          set -euo pipefail
+          : > "$RUNNER_TEMP/empty-npmrc"
+          npm_config_userconfig="$RUNNER_TEMP/empty-npmrc" \
+            npm publish "$RUNNER_TEMP/release/pkg/$FILENAME" --access public --ignore-scripts 2>&1 | tee "$RUNNER_TEMP/evidence/publish.log"
+
+      - name: Upload publish evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: publish-npm
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+  # Public registry readback for both paths (new publish, or already published). No id-token.
+  verify:
+    name: registry readback
+    needs: [identity, pack, registry-state, publish]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Preconditions
+        shell: bash
+        env:
+          IDENTITY: ${{ needs.identity.result }}
+          PACK: ${{ needs.pack.result }}
+          STATE: ${{ needs.registry-state.result }}
+          DECISION: ${{ needs.registry-state.outputs.decision }}
+          PUBLISH: ${{ needs.publish.result }}
+        run: |
+          set -euo pipefail
+          [ "$IDENTITY" = success ] || { echo "::error::identity: $IDENTITY"; exit 1; }
+          [ "$PACK" = success ] || { echo "::error::pack: $PACK"; exit 1; }
+          [ "$STATE" = success ] || { echo "::error::registry-state: $STATE"; exit 1; }
+          case "$DECISION" in
+            publish)   [ "$PUBLISH" = success ] || { echo "::error::publish: $PUBLISH"; exit 1; } ;;
+            reconcile) [ "$PUBLISH" = skipped ] || { echo "::error::publish ran on an already-published version: $PUBLISH"; exit 1; } ;;
+            *) echo "::error::registry decision unknown: '$DECISION'"; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24.22.2"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-tarball
+          path: ${{ runner.temp }}/release
+
+      - name: Registry serves the measured artifact (version + integrity + shasum)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          node scripts/release/publish-guard.mjs readback "$RUNNER_TEMP/release/record.json" "$RUNNER_TEMP/evidence/readback.json" 20 15
+
+      - name: Summary
+        if: always()
+        shell: bash
+        env:
+          TAG: ${{ needs.identity.outputs.tag }}
+          DECISION: ${{ needs.registry-state.outputs.decision }}
+          INTEGRITY: ${{ needs.pack.outputs.integrity }}
+        run: |
+          {
+            echo "### publish: $TAG @ $GITHUB_SHA"
+            echo "- path: ${DECISION:-unknown} (publish = new OIDC publish; reconcile = already published, no second publish)"
+            echo "- measured integrity: $INTEGRITY"
+            echo "- Telepty compatibility: dmsdc-ai/aigentry-telepty@$TELEPTY_SHA"
+            echo "- Provenance source/commit is recorded in readback.json (dist.attestations) and must be verified separately."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload readback evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: publish-readback
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+          retention-days: 90

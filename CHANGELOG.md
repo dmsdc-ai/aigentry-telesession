@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.1 — unreleased
+
+Publication tooling only; no runtime change (`src/` and `bin/` are unchanged).
+
+- Release: new `.github/workflows/publish.yml` publishes on a `vX.Y.Z` tag push through npm Trusted Publishing
+  (OIDC, automatic provenance; no npm token). It requires tag commit = checkout HEAD = run SHA and tag = package and
+  lock versions, reuses `ci.yml` and `compatibility.yml` (Telepty `v0.10.0`, `556a4ba`), runs no `npm pack` and
+  publishes the exact tarball the Ubuntu compatibility leg of the same run packed and accepted with `test:installed`,
+  and reads the registry back for the exact integrity. An already-published identical version is reconciled, never
+  re-published. See `docs/ci.md`.
+- Compatibility artifacts: the Ubuntu leg uploads `tested-compatibility-…` only after the full suite, `test:pack`
+  and `test:installed` passed (the publication input). The always-uploaded diagnostic bundle is now named
+  `…-attempt-<run_attempt>`. Tests, matrix, conditions and pins are unchanged.
+- Package metadata: `repository.url` is `git+https://github.com/dmsdc-ai/aigentry-telesession.git`.
+- Tests: `test/release-publish-guard.test.js` (named in `test:unit`) for `scripts/release/publish-guard.mjs`.
+
 ## 0.2.0 — 2026-10-12
 
 End-to-end delivery protocol (spec `docs/specs/2026-10-11-e2e-delivery-protocol.md`).
