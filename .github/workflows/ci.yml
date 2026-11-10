@@ -1,91 +1,95 @@
-# Cross-platform unit CI. Read-only token, no secrets, no publish. See docs/ci.md for what this proves.
-name: CI
-
+name: Task1272 Counts reporter compatibility witness only
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
-  workflow_call:
-
 permissions:
   contents: read
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  unit:
-    name: unit (${{ matrix.os }}, Node ${{ matrix.node }})
+  counts:
+    name: Counts shell witness (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 6
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        node: ["20.20.0"]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@v4
         with:
           persist-credentials: false
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
-
-      - name: Toolchain
+          node-version: '26.13.0'
+      - name: Verify immutable authored shell blocks and reporter data
         shell: bash
         run: |
-          node --version
-          npm --version
-
-      - name: Install from lockfile (no lifecycle scripts)
-        shell: bash
-        run: npm ci --ignore-scripts --no-audit --no-fund
-
-      # Explicit files only (see package.json "test:unit"); no auto-discovery, no real telepty daemon.
-      - name: Unit tests
-        shell: bash
-        run: npm run --silent test:unit 2>&1 | tee unit.tap
-
-      - name: Test counts (skips are not passes)
-        if: always()
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/counts753"
+          mkdir -p "$EVIDENCE"
+          echo "EVIDENCE=$EVIDENCE" >> "$GITHUB_ENV"
+          while IFS= read -r f; do
+            dst="$EVIDENCE/${f#.ci/task1272/counts/}"
+            mkdir -p "$(dirname "$dst")"
+            git cat-file blob "HEAD:$f" > "$dst"
+          done < <(git ls-tree -r --name-only HEAD -- .ci/task1272/counts)
+          node -e 'const f=require("node:fs"),c=require("node:crypto"),p=require("node:path"),d=process.argv[1],j=JSON.parse(f.readFileSync(p.join(d,"FIXTURES.json")));const h=x=>c.createHash("sha256").update(f.readFileSync(p.join(d,x))).digest("hex");for(const [k,v] of Object.entries(j.scripts))if(h(k+".sh")!==v)throw Error("script hash mismatch");for(const x of j.cases)for(const y of x.files)if(h(x.label+"/"+y.file)!==y.projected_sha256)throw Error("fixture hash mismatch");console.log(JSON.stringify({sourceRun:j.run,scripts:j.scripts,artifactIDs:j.cases.map(x=>x.artifact)}))' "$EVIDENCE"
+          bash -n "$EVIDENCE/old.sh"
+          bash -n "$EVIDENCE/new.sh"
+      - name: Execute the actual old and corrected Counts blocks, no npm test or app
         shell: bash
         run: |
-          if [ ! -s unit.tap ]; then echo "::error::no TAP output"; exit 1; fi
-          {
-            echo "### unit: $RUNNER_OS / Node $(node --version)"
-            grep -E '^# (tests|suites|pass|fail|cancelled|skipped|todo) ' unit.tap | sed 's/^# /- /'
-            echo
-            echo "Skipped (NOT counted as passed):"
-            grep -E '# SKIP' unit.tap | sed -E 's/^ +//; s/^/- /' || echo "- none"
-          } >> "$GITHUB_STEP_SUMMARY"
-          pass=$(sed -n -E 's/^# pass ([0-9]+)$/\1/p' unit.tap | tail -n 1)
-          if [ "${pass:-0}" -eq 0 ]; then echo "::error::no passing tests recorded"; exit 1; fi
-
-      - name: Upload TAP
+          set -euo pipefail
+          run_case() {
+            local ver="$1" fixture="$2" label="$3" platform="$4" profile="$5" want="$6" rc=0 installed=success
+            if [ "$platform" = Windows ]; then installed=skipped; fi
+            : > "$EVIDENCE/$label.summary"
+            env COMPAT="$EVIDENCE/$fixture" GITHUB_STEP_SUMMARY="$EVIDENCE/$label.summary" RUNNER_OS="$platform" \
+              FULL=success PACKTEST=success PROFILE="$profile" INSTALLED="$installed" DARWIN_READER=skipped \
+              bash -e -o pipefail "$EVIDENCE/$ver.sh" > "$EVIDENCE/$label.log" 2>&1 || rc=$?
+            echo "$label: actual=$rc expected=$want" | tee -a "$EVIDENCE/results.txt"
+            if [ "$rc" -ne "$want" ]; then cat "$EVIDENCE/$label.log"; exit 1; fi
+          }
+          check_full() {
+            local label="$1" pass="$2" skip="$3" total="$4"
+            sed -n '/^#### full$/,/^#### pack-test$/p' "$EVIDENCE/$label.summary" > "$EVIDENCE/$label.full-summary"
+            grep -Fqx -- "- tests $total" "$EVIDENCE/$label.full-summary"
+            grep -Fqx -- "- pass $pass" "$EVIDENCE/$label.full-summary"
+            grep -Fqx -- '- fail 0' "$EVIDENCE/$label.full-summary"
+            grep -Fqx -- "- skipped $skip" "$EVIDENCE/$label.full-summary"
+            test "$(grep -Ec '^- .*# SKIP|^- ﹣ ' "$EVIDENCE/$label.full-summary")" = "$skip"
+          }
+          run_case old linux20 old-tap Linux success 0
+          run_case old linux26 old-spec Linux success 1
+          run_case old windows26 old-win-spec Windows skipped 1
+          run_case new linux20 new-tap Linux success 0
+          check_full new-tap 366 4 370
+          run_case new linux26 new-spec Linux success 0
+          check_full new-spec 361 4 365
+          run_case new windows26 new-win-spec Windows skipped 0
+          check_full new-win-spec 299 65 364
+          mkdir -p "$EVIDENCE/crlf"
+          for t in full pack-test; do awk '{printf "%s\r\n", $0}' "$EVIDENCE/windows26/$t.tap" > "$EVIDENCE/crlf/$t.tap"; done
+          run_case new crlf new-win-crlf Windows skipped 0
+          check_full new-win-crlf 299 65 364
+          cp -r "$EVIDENCE/linux26" "$EVIDENCE/malformed"
+          printf '%s\n' 'ℹ pass 42oops' > "$EVIDENCE/malformed/full.tap"
+          run_case new malformed refuse-malformed Linux success 1
+          grep -Fq 'full: no passing tests recorded' "$EVIDENCE/refuse-malformed.log"
+          cp -r "$EVIDENCE/linux26" "$EVIDENCE/zero"
+          printf '%s\n' 'ℹ tests 65' 'ℹ pass 0' 'ℹ fail 0' 'ℹ skipped 65' > "$EVIDENCE/zero/full.tap"
+          run_case new zero refuse-zero Linux success 1
+          grep -Fq 'full: no passing tests recorded' "$EVIDENCE/refuse-zero.log"
+          run_case new linux26 refuse-missing-profile Linux skipped 1
+          grep -Fq 'required S-R1 profile rows: skipped' "$EVIDENCE/refuse-missing-profile.log"
+          cp -r "$EVIDENCE/linux26" "$EVIDENCE/notrun"
+          printf '%s\n' 'NOTRUN: telepty source not found' >> "$EVIDENCE/notrun/full.tap"
+          run_case new notrun refuse-source-absent Linux success 1
+          grep -Fq 'real-daemon suites skipped (telepty source not found)' "$EVIDENCE/refuse-source-absent.log"
+          echo '11 exact-format and guard assertions passed; no functional suite rerun' | tee -a "$EVIDENCE/results.txt"
+      - name: Preserve focused verification evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@v4
         with:
-          name: unit-tap-${{ matrix.os }}-node-${{ matrix.node }}
-          path: unit.tap
-          if-no-files-found: warn
-          retention-days: 14
-
-  pack:
-    name: package dry-run
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: "20.20.0"
-
-      - name: npm pack --dry-run (nothing is published)
-        shell: bash
-        run: npm run --silent test:pack
+          name: counts753-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/counts753
+          if-no-files-found: error
+          retention-days: 7

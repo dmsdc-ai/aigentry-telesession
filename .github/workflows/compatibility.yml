@@ -286,9 +286,13 @@ jobs:
               f="$COMPAT/$t.tap"
               echo "#### $t"
               if [ ! -s "$f" ]; then echo "- no TAP output (step not run or failed before output)"; continue; fi
-              grep -E '^# (tests|suites|pass|fail|cancelled|skipped|todo) ' "$f" | sed 's/^# /- /'
+              # Node 20 prints TAP ('# pass N'); Node 26's default spec reporter prints 'ℹ pass N' and skipped rows as
+              # '﹣ <title> # NOTRUN: <reason>'. sed -n exits 0 when nothing matches; CR is stripped on read only.
+              sum=$(tr -d '\r' < "$f" | sed -n -E 's/^(# |ℹ )(tests|suites|pass|fail|cancelled|skipped|todo) ([0-9]+)$/- \2 \3/p')
+              if [ -n "$sum" ]; then printf '%s\n' "$sum"; else echo "- no TAP (#) or spec (ℹ) summary line found"; fi
               echo "Skipped (NOT counted as passed):"
-              grep -E '# SKIP' "$f" | sed -E 's/^ +//; s/^/- /' || echo "- none"
+              skips=$(tr -d '\r' < "$f" | sed -n -E '/# SKIP|^ *﹣ /p' | sed -E 's/^ +//; s/^/- /')
+              if [ -n "$skips" ]; then printf '%s\n' "$skips"; else echo "- none"; fi
             done
             echo "#### outcomes"
             echo "- full: ${FULL:-not run}; test:pack: ${PACKTEST:-not run}; installed: ${INSTALLED:-not run (Windows: not part of this gate)}"
@@ -300,7 +304,7 @@ jobs:
           for t in full pack-test; do
             f="$COMPAT/$t.tap"
             if [ -s "$f" ]; then
-              pass=$(sed -n -E 's/^# pass ([0-9]+)$/\1/p' "$f" | tail -n 1)
+              pass=$(tr -d '\r' < "$f" | sed -n -E 's/^(# |ℹ )pass ([0-9]+)$/\2/p' | tail -n 1)
               if [ "${pass:-0}" -eq 0 ]; then echo "::error::$t: no passing tests recorded"; status=1; fi
             fi
           done

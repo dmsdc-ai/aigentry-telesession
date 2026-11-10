@@ -1,0 +1,72 @@
+﹣ S-C0 two profiles resolve to their own prefix, targets, state dir, URL and tpc1 credential (1.2875ms) # NOTRUN: profile mode is refused on win32
+﹣ S-C1/S-C7 profile mode refuses every legacy credential/target/prefix/state/persist/URL key (0.111ms) # NOTRUN: win32
+﹣ S-C7 telepty_url in the file must be raw loopback http (validated like TELESESSION_TELEPTY_URL) (0.1237ms) # NOTRUN: win32
+﹣ S-C5 unknown, malformed and half-configured selections are refused before any token read (0.2917ms) # NOTRUN: win32
+﹣ S-C2 token must be a bare tpc1 token; the shared {authToken} form and other text are refused (0.1957ms) # NOTRUN: win32
+﹣ S-C2b token generation starts at 1: generation 0, a leading zero and bad shapes are refused (1.3722ms) # NOTRUN: win32
+﹣ S-C3 profiles file and token file: symlink, group/other mode, hardlink (nlink>1), oversize, non-regular are refused (0.1433ms) # NOTRUN: win32
+﹣ S-C3 foreign-uid files are refused (needs root to chown; NOTRUN otherwise) (0.2306ms) # NOTRUN: needs euid 0 to create a foreign-owned file
+﹣ S-C4 state dirs equal, nested, symlinked or case-folded (darwin/win32) and prefix collisions are refused (1.2196ms) # NOTRUN: win32
+﹣ S-C4 credential aliases (same path, symlink, inside a state dir) across profiles are refused (0.4557ms) # NOTRUN: win32
+﹣ targets intersect a non-empty AIGENTRY_ORCHESTRATOR_SIDS and never widen (0.2537ms) # NOTRUN: win32
+﹣ S-C6 independent locks: profile A's crash-held lock (STORE_LOCKED) never blocks profile B (0.0992ms) # NOTRUN: win32
+﹣ tunnel child forwards the profile selection; a token file or URL alongside it is refused before spawn (0.1481ms) # NOTRUN: win32
+﹣ S-R1 two profiles end to end on a real daemon: own create/inject/read/delete succeed, server-verified health, cross-profile four-op denial (1.2335ms) # NOTRUN: profile mode unsupported on native Windows
+﹣ S-R1b rotation on a real daemon: old generation PROFILE_CREDENTIAL_REJECTED, new token verified at generation 2 (0.2812ms) # NOTRUN: profile mode unsupported on native Windows
+﹣ S-T4a on a real daemon with the feature off: PROFILE_CREDENTIAL_REJECTED, no register/inject (0.1867ms) # NOTRUN: win32
+﹣ RC5 telesession across a real daemon restart: wrapped target replies with its spawn-time bearer → trusted, verified epoch == pre-restart target_epoch, inbox re-created create_only (1.0886ms) # NOTRUN on Windows: RC5 is POSIX-only (node-pty bridge + SIGTERM-handler restart); not Windows coverage, native Windows restart gate unmeasured
+﹣ T9 permission-limited directory: no crash; reads work; mutations return LEDGER_READ_ONLY (0.1243ms) # SKIP
+﹣ N5 read-only ledger: a checkpoint cursor returns LEDGER_READ_ONLY; a plain status read still works (0.1144ms) # SKIP
+  ﹣ fresh open: leaf created 0700, lock {v,owner,pid,created_at} 0600, fresh frozen snapshot without secrets (0.2256ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ commit: atomic 0600 state.json, generation +1, snapshot swap only on success, no tmp left (0.0936ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ state.json that is a symlink, a hardlink (nlink 2) or a directory → STORE_CORRUPT, nothing touched (0.0875ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ MUST ACCEPT private app state under home, with cwd=home and with cwd=project elsewhere (0.4067ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ STORE_PATH_FORBIDDEN: filesystem root; nothing written, no chmod (0.0701ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ STORE_PATH_FORBIDDEN: home exact; nothing written, no chmod (0.0711ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ STORE_PATH_FORBIDDEN: cwd exact; nothing written, no chmod (0.0697ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ STORE_PATH_FORBIDDEN: ancestor of home; nothing written, no chmod (0.0774ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ STORE_PATH_FORBIDDEN: ancestor of project cwd; nothing written, no chmod (0.0696ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ STORE_PATH_FORBIDDEN: inside project cwd; nothing written, no chmod (0.0694ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ STORE_PATH_FORBIDDEN: ~/.telepty itself; nothing written, no chmod (0.1232ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ STORE_PATH_FORBIDDEN: ~/.telepty/x; nothing written, no chmod (0.0782ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ STORE_PATH_FORBIDDEN: ~/.config/aigentry-telepty; nothing written, no chmod (0.064ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ STORE_PATH_FORBIDDEN: ~/.config/aigentry-telepty/x; nothing written, no chmod (0.0662ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ STORE_PATH_FORBIDDEN: ~/.aigentry/mailbox/x; nothing written, no chmod (0.0664ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ STORE_PATH_FORBIDDEN: ~/.aigentry (ancestor of the mailbox); nothing written, no chmod (0.0706ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ STORE_PATH_FORBIDDEN: parent symlink resolving into ~/.telepty; nothing written, no chmod (0.0852ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ leaf symlink → STORE_PATH_FORBIDDEN; link and target untouched (0.0611ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ leaf mode 755 → STORE_PERMISSIONS_INVALID, mode not repaired, no files (0.0747ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ leaf mode 750 → STORE_PERMISSIONS_INVALID, mode not repaired, no files (0.0643ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ leaf mode 701 → STORE_PERMISSIONS_INVALID, mode not repaired, no files (0.053ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ leaf mode 707 → STORE_PERMISSIONS_INVALID, mode not repaired, no files (0.0594ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ leaf owned by another uid → STORE_PERMISSIONS_INVALID, no chown, no files (0.0484ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ lock replaced under the holder → sticky STORE_LOCK_LOST for every write; close() leaves the foreign lock (0.1929ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ putReply → 0600 file; readReply survives close/reopen; deleteReply → REPLY_MISSING (0.089ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ tampered / symlinked / hardlinked / oversized reply file → REPLY_CORRUPT, text never returned (0.0519ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ persistCredential=true: 0600 file, survives reopen, never in state.json/snapshot, clear is idempotent (0.0507ms) # POSIX-only (native Windows has its own cases below)
+  ﹣ simulated win32 (seam): credential persistence refused before any file; ordinary state 'unverified' (0.0386ms) # NOTRUN: fake win32 platform over a POSIX path is incoherent (R3 §5); see native Windows case
+  ﹣ TV06/TV06c persisted credential: reply while receiver down → retries → dead-letter; reattach (owned DELETE→create_only) shows loss lower bound; later reply trusted (0.1916ms) # credential persistence is POSIX-only
+  ﹣ TV19 reattach DELETE 403 → rotate, orphan owned_delete_forbidden, no further mutation of that id (0.1806ms) # credential persistence is POSIX-only
+  ﹣ TV18 graceful close → phase deleted + credential cleared; restart create_only same id without DELETE; register body exact (0.0683ms) # credential persistence is POSIX-only
+﹣ S-T0 own ops: profile A creates its inbox in its namespace and injects to an allowed target with only x-telepty-client-token (1.2095ms) # NOTRUN: profile mode is refused on win32 (CONFIG_PROFILE_PLATFORM_UNSUPPORTED)
+﹣ S-T6 health.credential comes from the verified server caller (profile mode) (0.2501ms) # NOTRUN: profile mode is refused on win32 (CONFIG_PROFILE_PLATFORM_UNSUPPORTED)
+﹣ S-T4a real-daemon shape: daemon without profile scope answers 401 → PROFILE_CREDENTIAL_REJECTED, no register/inject, never the shared token (0.1944ms) # NOTRUN: profile mode is refused on win32 (CONFIG_PROFILE_PLATFORM_UNSUPPORTED)
+﹣ S-T4b fake 200 without client-profile-scope-v1 → DAEMON_LACKS_CAPABILITY, no register/inject (0.0948ms) # NOTRUN: profile mode is refused on win32 (CONFIG_PROFILE_PLATFORM_UNSUPPORTED)
+﹣ S-T5 capability present but caller not this profile's server enforcement → PROFILE_NOT_ENFORCED before any own op (0.0932ms) # NOTRUN: profile mode is refused on win32 (CONFIG_PROFILE_PLATFORM_UNSUPPORTED)
+﹣ registry 503 PROFILE_REGISTRY_UNAVAILABLE and 401 PROFILE_CREDENTIAL_INVALID pass through without fallback (0.0959ms) # NOTRUN: profile mode is refused on win32 (CONFIG_PROFILE_PLATFORM_UNSUPPORTED)
+﹣ a refused gate is re-checked: once the server proves the caller, the same process proceeds (0.1473ms) # NOTRUN: profile mode is refused on win32 (CONFIG_PROFILE_PLATFORM_UNSUPPORTED)
+﹣ CF3 a concurrent health() transport failure does not refuse an already verified in-flight send (0.11ms) # NOTRUN: profile mode is refused on win32 (CONFIG_PROFILE_PLATFORM_UNSUPPORTED)
+﹣ CF3 an authoritative concurrent revocation (meta 401) still fails the held send closed: nothing registered or injected (0.1483ms) # NOTRUN: profile mode is refused on win32 (CONFIG_PROFILE_PLATFORM_UNSUPPORTED)
+﹣ CF3 an operation's own meta failure stays fail-closed and is not rescued by an earlier verification (0.1095ms) # NOTRUN: profile mode is refused on win32 (CONFIG_PROFILE_PLATFORM_UNSUPPORTED)
+﹣ N1 each health() reports its own meta answer; a stale older success never reopens the gate after a newer revocation (newer revocation answered first) (0.0507ms) # NOTRUN: profile mode is refused on win32 (CONFIG_PROFILE_PLATFORM_UNSUPPORTED)
+﹣ N1 each health() reports its own meta answer; a stale older success never reopens the gate after a newer revocation (stale success answered first) (0.0396ms) # NOTRUN: profile mode is refused on win32 (CONFIG_PROFILE_PLATFORM_UNSUPPORTED)
+﹣ CF4 fake parity: profile list is exactly [{id}], foreign/unknown observation is the schema-v2 unavailable body (0.0365ms) # NOTRUN: profile mode is refused on win32 (CONFIG_PROFILE_PLATFORM_UNSUPPORTED)
+﹣ cross-profile (emulated server refusals): B's targets/namespace are not A's; A cannot be configured or verified into B (0.0351ms) # NOTRUN: profile mode is refused on win32 (CONFIG_PROFILE_PLATFORM_UNSUPPORTED)
+﹣ S-T8 redirect from the daemon is refused; the Location listener receives nothing (no token leak) (0.068ms) # NOTRUN: profile mode is refused on win32 (CONFIG_PROFILE_PLATFORM_UNSUPPORTED)
+ℹ tests 364
+ℹ suites 21
+ℹ pass 299
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 65
+ℹ todo 0

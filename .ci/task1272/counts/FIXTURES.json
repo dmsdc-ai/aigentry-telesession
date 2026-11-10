@@ -1,0 +1,157 @@
+{
+  "task": 1272,
+  "purpose": "Only exact reporter summary and skip-detail rows selected from retained raw artifacts; no application data or credentials; source raw files unchanged",
+  "run": 42907757569,
+  "cases": [
+    {
+      "label": "linux20",
+      "artifact": 13806290713,
+      "files": [
+        {
+          "file": "full.tap",
+          "source_sha256": "863f3ae88cc6403bf59ce5341a0b1e5316d8d9cbf035a279dc69a008cf56b0e9",
+          "projected_sha256": "864f168a6b903cc23858ba89434664c88a385f0a3b3175b6ac65f49a1b7be1e8",
+          "kept_lines": 11,
+          "counts": {
+            "tests": 370,
+            "suites": 21,
+            "pass": 366,
+            "fail": 0,
+            "cancelled": 0,
+            "skipped": 4,
+            "todo": 0
+          },
+          "source_crlf": 0
+        },
+        {
+          "file": "pack-test.tap",
+          "source_sha256": "63174ab4a15071eeea2f95e810d3d3de8b145863e99d0a31139491c9cf1ab95d",
+          "projected_sha256": "9681ec1c4b48113925437ab3e395af61335dc6e7d98b7bdd6f96098903370ae3",
+          "kept_lines": 7,
+          "counts": {
+            "tests": 1,
+            "suites": 0,
+            "pass": 1,
+            "fail": 0,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0
+          },
+          "source_crlf": 0
+        },
+        {
+          "file": "profile.tap",
+          "source_sha256": "50a38de05580e2aaa79741e1803a80738b2998e863ae82c84a44d763445e19a4",
+          "projected_sha256": "bdd41eb2ccaa5953fbaf31194c14454dc372fed2bab98df0e4ca914770cd3470",
+          "kept_lines": 7,
+          "counts": {
+            "tests": 3,
+            "suites": 0,
+            "pass": 3,
+            "fail": 0,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0
+          },
+          "source_crlf": 0
+        }
+      ]
+    },
+    {
+      "label": "linux26",
+      "artifact": 13805926981,
+      "files": [
+        {
+          "file": "full.tap",
+          "source_sha256": "893ecac2b95278eb436aef17d0afddc920d75d4cde24ffec9607b77644b06b87",
+          "projected_sha256": "300a2718cee8516045c7f242a434684a6ed09b8d4d3611fdfb9ee911d7d1d0f8",
+          "kept_lines": 11,
+          "counts": {
+            "tests": 365,
+            "suites": 21,
+            "pass": 361,
+            "fail": 0,
+            "cancelled": 0,
+            "skipped": 4,
+            "todo": 0
+          },
+          "source_crlf": 0
+        },
+        {
+          "file": "pack-test.tap",
+          "source_sha256": "a8326f3e5d22f6217f72d9d2ae649b689d446d6dcf1ac375303432b66a9fad86",
+          "projected_sha256": "92afbfa04f978072d2373975aafc82d42c76fc1be91a2cf8ea22e3a1d597481e",
+          "kept_lines": 7,
+          "counts": {
+            "tests": 1,
+            "suites": 0,
+            "pass": 1,
+            "fail": 0,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0
+          },
+          "source_crlf": 0
+        },
+        {
+          "file": "profile.tap",
+          "source_sha256": "4d07d5738ade820176da16123bdcc1a33b1e61d4d9475b757c608ab17dd3c371",
+          "projected_sha256": "bdd41eb2ccaa5953fbaf31194c14454dc372fed2bab98df0e4ca914770cd3470",
+          "kept_lines": 7,
+          "counts": {
+            "tests": 3,
+            "suites": 0,
+            "pass": 3,
+            "fail": 0,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0
+          },
+          "source_crlf": 0
+        }
+      ]
+    },
+    {
+      "label": "windows26",
+      "artifact": 13805308158,
+      "files": [
+        {
+          "file": "full.tap",
+          "source_sha256": "586900e4fda6904133502b8f787f4ba03f622c46cd2b495ec91251cdb4260516",
+          "projected_sha256": "f58e11b3d6b5e2d85687fa62f4383c3c64cf1b8152c0fe7e99ebf695754cb9c4",
+          "kept_lines": 72,
+          "counts": {
+            "tests": 364,
+            "suites": 21,
+            "pass": 299,
+            "fail": 0,
+            "cancelled": 0,
+            "skipped": 65,
+            "todo": 0
+          },
+          "source_crlf": 0
+        },
+        {
+          "file": "pack-test.tap",
+          "source_sha256": "fa84a11656bfbad8f60c59ac3ec92ef881bf860aafe01860e17745da4e07f840",
+          "projected_sha256": "92afbfa04f978072d2373975aafc82d42c76fc1be91a2cf8ea22e3a1d597481e",
+          "kept_lines": 7,
+          "counts": {
+            "tests": 1,
+            "suites": 0,
+            "pass": 1,
+            "fail": 0,
+            "cancelled": 0,
+            "skipped": 0,
+            "todo": 0
+          },
+          "source_crlf": 0
+        }
+      ]
+    }
+  ],
+  "scripts": {
+    "old": "6b318d5330691945fa771925c2a98c4ee9715764777fc9b155f0a4ff4e02989c",
+    "new": "5fe6521131d76dab48975f03f2216f90d8987bf592f187ed4407b10dee4a81df"
+  }
+}

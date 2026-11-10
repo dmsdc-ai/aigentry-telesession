@@ -1,0 +1,11 @@
+ok 40 - S-C3 foreign-uid files are refused (needs root to chown; NOTRUN otherwise) # SKIP NOTRUN: needs euid 0 to create a foreign-owned file
+    ok 3 - simulated win32 (seam): credential persistence refused before any file; ordinary state 'unverified' # SKIP NOTRUN: fake win32 platform over a POSIX path is incoherent (R3 §5); see native Windows case
+    ok 4 - native Windows: credential persistence refused, ordinary state 'unverified', EEXIST → STORE_LOCKED # SKIP NOTRUN: needs a native Windows runner (TV20)
+    ok 4 - native win32 lexical refusals: UNC, \\\\?\\, \\\\.\\, drive-relative # SKIP NOTRUN: native Windows only (TV20)
+# tests 370
+# suites 21
+# pass 366
+# fail 0
+# cancelled 0
+# skipped 4
+# todo 0
