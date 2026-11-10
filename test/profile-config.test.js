@@ -254,11 +254,14 @@ test("W2 profile mode on win32 → CONFIG_PROFILE_PLATFORM_UNSUPPORTED before an
 
 test("normalizeConfig: a profile needs its own state dir and a valid name; profile is enumerable only when set", () => {
   const base = { teleptyUrl: URL_, token: mkToken(1), targets: ["o"], inboxPrefix: "ts" };
+  // A native absolute, normalized dir (lexical only; nothing is created), so the name check is the one reached on
+  // every platform (CI730: POSIX "/tmp/x" is not normalized on win32 → CONFIG_STATE_DIR_INVALID first).
+  const stateDir = path.resolve(os.tmpdir(), "ts-profile-cfg-synthetic");
   assert.throws(() => normalizeConfig({ ...base, profile: "asst-a" }), (e) => e.code === "CONFIG_STATE_DIR_REQUIRED");
   for (const profile of ["", "a b", 7, "x".repeat(65), "Upper"]) {
-    assert.throws(() => normalizeConfig({ ...base, profile, stateDir: "/tmp/x" }), (e) => e.code === "CONFIG_PROFILE_INVALID");
+    assert.throws(() => normalizeConfig({ ...base, profile, stateDir }), (e) => e.code === "CONFIG_PROFILE_INVALID");
   }
-  const cfg = normalizeConfig({ ...base, profile: "asst-a", stateDir: "/tmp/x" });
+  const cfg = normalizeConfig({ ...base, profile: "asst-a", stateDir });
   assert.equal(cfg.profile, "asst-a");
   assert.ok(Object.keys(cfg).includes("profile"));
   assert.equal(normalizeConfig({ ...base, token: "abc" }).profile, null);
