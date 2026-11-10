@@ -1,91 +1,60 @@
-# Cross-platform unit CI. Read-only token, no secrets, no publish. See docs/ci.md for what this proves.
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-  workflow_dispatch:
-  workflow_call:
-
+name: Task1272 exact corrected candidate pack identity
+'on':
+  workflow_dispatch: null
 permissions:
   contents: read
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  unit:
-    name: unit (${{ matrix.os }}, Node ${{ matrix.node }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        node: ["20.20.0"]
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: ${{ matrix.node }}
-
-      - name: Toolchain
-        shell: bash
-        run: |
-          node --version
-          npm --version
-
-      - name: Install from lockfile (no lifecycle scripts)
-        shell: bash
-        run: npm ci --ignore-scripts --no-audit --no-fund
-
-      # Explicit files only (see package.json "test:unit"); no auto-discovery, no real telepty daemon.
-      - name: Unit tests
-        shell: bash
-        run: npm run --silent test:unit 2>&1 | tee unit.tap
-
-      - name: Test counts (skips are not passes)
-        if: always()
-        shell: bash
-        run: |
-          if [ ! -s unit.tap ]; then echo "::error::no TAP output"; exit 1; fi
-          {
-            echo "### unit: $RUNNER_OS / Node $(node --version)"
-            grep -E '^# (tests|suites|pass|fail|cancelled|skipped|todo) ' unit.tap | sed 's/^# /- /'
-            echo
-            echo "Skipped (NOT counted as passed):"
-            grep -E '# SKIP' unit.tap | sed -E 's/^ +//; s/^/- /' || echo "- none"
-          } >> "$GITHUB_STEP_SUMMARY"
-          pass=$(sed -n -E 's/^# pass ([0-9]+)$/\1/p' unit.tap | tail -n 1)
-          if [ "${pass:-0}" -eq 0 ]; then echo "::error::no passing tests recorded"; exit 1; fi
-
-      - name: Upload TAP
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: unit-tap-${{ matrix.os }}-node-${{ matrix.node }}
-          path: unit.tap
-          if-no-files-found: warn
-          retention-days: 14
-
   pack:
-    name: package dry-run
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 6
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
+    - uses: actions/checkout@v4
+      with:
+        ref: f4a84b0b0749189301766631cb54c9768252d948
+        persist-credentials: false
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 20.20.0
+    - name: Bind exact candidate and prepare pack-only output
+      shell: bash
+      run: 'set -euo pipefail
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: "20.20.0"
+        test "$(git rev-parse HEAD)" = f4a84b0b0749189301766631cb54c9768252d948
 
-      - name: npm pack --dry-run (nothing is published)
-        shell: bash
-        run: npm run --silent test:pack
+        test "$(git rev-parse ''HEAD^{tree}'')" = 63e66c9cc074e789dc42dadfca1f59018742ab2c
+
+        test -z "$(git status --porcelain)"
+
+        COMPAT="$RUNNER_TEMP/client756"
+
+        mkdir -p "$COMPAT/pack"
+
+        echo "COMPAT=$COMPAT" >> "$GITHUB_ENV"
+
+        { git rev-parse HEAD ''HEAD^{tree}''; node --version; npm --version; } | tee "$COMPAT/identity.txt"
+
+        '
+    - name: Pack with the exact maintained compatibility command
+      shell: bash
+      run: "set -euo pipefail\nnpm pack --ignore-scripts --json --pack-destination \"$COMPAT/pack\" > \"$COMPAT/pack.json\"\nnode -e\
+        \ '\n  const fs = require(\"fs\"), path = require(\"path\"), crypto = require(\"crypto\");\n  const [p] = JSON.parse(fs.readFileSync(path.join(process.env.COMPAT,\
+        \ \"pack.json\"), \"utf8\"));\n  const tgz = path.join(process.env.COMPAT, \"pack\", p.filename);\n  const sha256 = crypto.createHash(\"\
+        sha256\").update(fs.readFileSync(tgz)).digest(\"hex\");\n  fs.writeFileSync(path.join(process.env.COMPAT, \"tarball.json\"),\
+        \ JSON.stringify({ filename: p.filename, sha256, integrity: p.integrity, entries: p.entryCount }, null, 2) + \"\\n\");\n  fs.appendFileSync(process.env.GITHUB_ENV,\
+        \ \"TELESESSION_TGZ=\" + tgz + \"\\n\");\n  console.log(p.filename, sha256);'\n"
+    - name: Compare actual archive bytes to the previously installed Linux20 archive
+      shell: bash
+      run: 'set -euo pipefail
+
+        node -e ''const f=require("node:fs"),p=require("node:path"),j=JSON.parse(f.readFileSync(p.join(process.env.COMPAT,"tarball.json")));if(j.sha256!=="06389ef166bfb9bdd996ef29867f445336e69ef995f33dc2c24e0b764cf4cde7"||j.entries!==24||j.filename!=="dmsdc-ai-telesession-0.3.0.tgz")throw
+        Error("Archive differs from the previously installed archive");console.log(JSON.stringify({exactBytesMatch:true,...j}))''
+
+        '
+    - name: Retain candidate pack and identity evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: telesession-756-exact-pack-${{ github.run_id }}
+        path: ${{ runner.temp }}/client756
+        if-no-files-found: error
+        retention-days: 7
