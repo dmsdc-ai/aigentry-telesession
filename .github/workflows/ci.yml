@@ -1,91 +1,115 @@
-# Cross-platform unit CI. Read-only token, no secrets, no publish. See docs/ci.md for what this proves.
-name: CI
+name: Task1272 bounded client native diagnosis (non-shipping)
 
+# Exact frozen client718/server710, three predeclared cases once.
+# This does not replace compatibility.yml, publish or change production source.
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
-  workflow_call:
 
 permissions:
   contents: read
 
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  unit:
-    name: unit (${{ matrix.os }}, Node ${{ matrix.node }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+  diagnose:
+    name: bounded (${{ matrix.os }}, ${{ matrix.case }}, Node26.13.0)
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        node: ["20.20.0"]
+        include:
+          - { os: ubuntu-latest, case: transport, file: test/transport-profile.test.js }
+          - { os: ubuntu-latest, case: real-profile, file: test/real-daemon-profile.test.js }
+          - { os: macos-latest, case: real-profile, file: test/real-daemon-profile.test.js }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
+    env:
+      CLIENT_SHA: e0187bc7f7d1bb72f0bd770ba5f406d6aab8aae1
+      CLIENT_TREE: c415cf6e2e7e27aaebcc25656f6f5265a12bb376
+      SERVER_SHA: 6eebf71a574551cfa5c35fc3d017b45d6b94b029
+      SERVER_TREE: 2307c1a3b6650b1d14cf1bc54bf867392b0abe01
+      CLIENT_TEST: ${{ matrix.file }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@v4
         with:
+          repository: dmsdc-ai/aigentry-telesession
+          ref: e0187bc7f7d1bb72f0bd770ba5f406d6aab8aae1
+          path: telesession
           persist-credentials: false
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/checkout@v4
         with:
-          node-version: ${{ matrix.node }}
-
-      - name: Toolchain
+          repository: dmsdc-ai/aigentry-telepty
+          ref: 6eebf71a574551cfa5c35fc3d017b45d6b94b029
+          path: telepty
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.13.0'
+      - name: Verify exact execution source and create private evidence paths
         shell: bash
         run: |
-          node --version
-          npm --version
-
-      - name: Install from lockfile (no lifecycle scripts)
-        shell: bash
-        run: npm ci --ignore-scripts --no-audit --no-fund
-
-      # Explicit files only (see package.json "test:unit"); no auto-discovery, no real telepty daemon.
-      - name: Unit tests
-        shell: bash
-        run: npm run --silent test:unit 2>&1 | tee unit.tap
-
-      - name: Test counts (skips are not passes)
-        if: always()
-        shell: bash
-        run: |
-          if [ ! -s unit.tap ]; then echo "::error::no TAP output"; exit 1; fi
+          set -euo pipefail
+          test "$(git -C telesession rev-parse HEAD)" = "$CLIENT_SHA"
+          test "$(git -C telesession rev-parse 'HEAD^{tree}')" = "$CLIENT_TREE"
+          test "$(git -C telepty rev-parse HEAD)" = "$SERVER_SHA"
+          test "$(git -C telepty rev-parse 'HEAD^{tree}')" = "$SERVER_TREE"
+          case "$CLIENT_TEST" in test/transport-profile.test.js|test/real-daemon-profile.test.js) ;; *) exit 2 ;; esac
+          COMPAT="$RUNNER_TEMP/client736"
+          mkdir -p "$COMPAT/child-logs" "$COMPAT/npm-cache"
+          : > "$COMPAT/empty-npmrc"
           {
-            echo "### unit: $RUNNER_OS / Node $(node --version)"
-            grep -E '^# (tests|suites|pass|fail|cancelled|skipped|todo) ' unit.tap | sed 's/^# /- /'
-            echo
-            echo "Skipped (NOT counted as passed):"
-            grep -E '# SKIP' unit.tap | sed -E 's/^ +//; s/^/- /' || echo "- none"
-          } >> "$GITHUB_STEP_SUMMARY"
-          pass=$(sed -n -E 's/^# pass ([0-9]+)$/\1/p' unit.tap | tail -n 1)
-          if [ "${pass:-0}" -eq 0 ]; then echo "::error::no passing tests recorded"; exit 1; fi
-
-      - name: Upload TAP
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: unit-tap-${{ matrix.os }}-node-${{ matrix.node }}
-          path: unit.tap
-          if-no-files-found: warn
-          retention-days: 14
-
-  pack:
-    name: package dry-run
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: "20.20.0"
-
-      - name: npm pack --dry-run (nothing is published)
+            echo "COMPAT=$COMPAT"
+            echo "TELESESSION_TEST_TELEPTY_DIR=$GITHUB_WORKSPACE/telepty"
+            echo "TELESESSION_TEST_LOG_DIR=$COMPAT/child-logs"
+            echo "TELESESSION_TEST_REQUIRE_PROFILE_DAEMON=1"
+            echo "npm_config_cache=$COMPAT/npm-cache"
+            echo "npm_config_userconfig=$COMPAT/empty-npmrc"
+            echo "npm_config_update_notifier=false"
+            echo "npm_config_fund=false"
+            echo "npm_config_audit=false"
+          } >> "$GITHUB_ENV"
+          {
+            echo 'task1272; diagnostic only; per-test60s/step3min/job8min caps; no force-exit or pass on cancellation'
+            echo "test=$CLIENT_TEST"
+            git -C telesession rev-parse HEAD 'HEAD^{tree}'
+            git -C telepty rev-parse HEAD 'HEAD^{tree}'
+            node --version
+            npm --version
+          } | tee "$COMPAT/identity.txt"
+      - name: Install Telesession from lockfile (no lifecycle)
+        working-directory: telesession
+        run: npm ci --ignore-scripts
+      - name: Install Telepty from lockfile (no root lifecycle)
+        working-directory: telepty
+        run: npm ci --ignore-scripts
+      - name: Build node-pty only (existing reviewed compatibility exception)
         shell: bash
-        run: npm run --silent test:pack
+        working-directory: telepty
+        run: |
+          set -euo pipefail
+          npm rebuild node-pty --foreground-scripts 2>&1 | tee "$COMPAT/node-pty-rebuild.log"
+          node -e 'require("node-pty"); console.log("node-pty loads")'
+      - name: Build bundled Darwin authority reader (maintained command)
+        if: runner.os == 'macOS'
+        shell: bash
+        working-directory: telepty
+        run: |
+          set -euo pipefail
+          NODE_HEADERS="$(dirname "$(dirname "$(command -v node)")")/include/node"
+          node scripts/build-authority-darwin.mjs --cc "$(xcrun --find clang)" --sdk "$(xcrun --show-sdk-path)" --node-headers "$NODE_HEADERS"
+          shasum -a 256 src/principal/native/prebuilt/darwin/authority-darwin.node src/principal/native/prebuilt/darwin/authority-darwin.node.provenance.json | tee "$COMPAT/native-after.txt"
+      - name: Run exactly one file with shorter diagnostic caps, once
+        timeout-minutes: 3
+        shell: bash
+        working-directory: telesession
+        run: |
+          set +e
+          node --test --test-timeout=60000 --test-reporter=tap "$CLIENT_TEST" 2>&1 | tee "$COMPAT/tests.tap"
+          result=${PIPESTATUS[0]}
+          echo "$result" > "$COMPAT/tests.exit"
+          exit "$result"
+      - name: Upload diagnostic evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: client736-${{ matrix.os }}-${{ matrix.case }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/client736
+          if-no-files-found: error
+          retention-days: 7
