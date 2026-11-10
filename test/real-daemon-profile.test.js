@@ -69,6 +69,23 @@ function assertUnavailableObservation(o, id) {
   assert.ok(capability && typeof capability === "object" && !Array.isArray(capability));
 }
 
+// ci733 defect A: GET /api/sessions also returns fields the server computes per read from `now` (readiness/handshake
+// sampled_at, idleSeconds, healthStatus, healthReason, disconnectedSeconds, transport; server
+// src/routes/session-inspection.js:186 and src/readiness.js:45), so two reads differ with no state change. Before/after
+// comparisons use only this allow-list of stored session state, sorted by id. A field is kept only when present.
+const STABLE_SESSION_FIELDS = ["id", "session_epoch", "type", "command", "cwd", "createdAt", "deliveryEndpoint", "delivery",
+  "lastInjectReturn", "lastActivityAt", "lastConnectedAt", "lastDisconnectedAt", "active_clients", "ready", "owningPrincipal", "authorityAudit"];
+const STABLE_HANDSHAKE_FIELDS = ["session_epoch", "owner_generation", "status", "reason"];
+function stableSessions(body) {
+  assert.ok(Array.isArray(body), "GET /api/sessions answers an array");
+  const pick = (src, keys) => Object.fromEntries(keys.filter((k) => Object.hasOwn(src, k)).map((k) => [k, src[k]]));
+  return body.map((s) => {
+    const out = pick(s, STABLE_SESSION_FIELDS);
+    if (s.handshake !== null && typeof s.handshake === "object") out.handshake = pick(s.handshake, STABLE_HANDSHAKE_FIELDS);
+    return out;
+  }).sort((x, y) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+}
+
 const mkToken = (gen) => `tpc1.${gen}.${randomBytes(32).toString("base64url")}`;
 const verifier = (token) => `sha256:${createHash("sha256").update(token, "utf8").digest("hex")}`;
 
@@ -102,7 +119,9 @@ test("S-R1 two profiles end to end on a real daemon: own create/inject/read/dele
   const seam = { homedir: path.join(root, "home"), cwd: path.join(root, "cwd") };
   const open = (n) => createTeleptyTransport(loadConfig({ TELESESSION_PROFILE: n, TELESESSION_PROFILES_FILE: file }), seam);
   const a = open("asst-a");
+  t.after(() => a.close());
   const b = open("asst-b");
+  t.after(() => b.close());
 
   // Health is server-derived.
   const ha = await a.health();
@@ -173,7 +192,22 @@ test("S-R1 two profiles end to end on a real daemon: own create/inject/read/dele
   assert.equal(await raw("DELETE", `/api/sessions/${encodeURIComponent(bInbox)}?owned=true`), 403);
   assert.equal(await raw("GET", "/api/meta", undefined, { "x-telepty-token": daemon.token }), 400, "mixed carrier is CREDENTIAL_AMBIGUOUS");
   const sessionsAfter = await daemon.request("/api/sessions");
-  assert.deepEqual(sessionsAfter.body, sessionsBefore.body, "no session state changed by any denial");
+  // Negative controls (ci733): the projection still sees a changed epoch, a removed id and a changed lastInjectReturn,
+  // and ignores only the per-read fields.
+  const stableBefore = stableSessions(sessionsBefore.body);
+  const mutated = (edit) => {
+    const copy = structuredClone(sessionsBefore.body);
+    edit(copy, copy.find((x) => x && x.id === "orchestrator"));
+    return stableSessions(copy);
+  };
+  assert.notDeepEqual(mutated((_, o) => { o.session_epoch = `${o.session_epoch}-changed`; }), stableBefore, "an epoch change is seen");
+  assert.notDeepEqual(mutated((c) => { c.splice(c.findIndex((x) => x && x.id === bInbox), 1); }), stableBefore, "a removed id is seen");
+  assert.notDeepEqual(mutated((_, o) => { o.lastInjectReturn = { synthetic: "changed" }; }), stableBefore, "a lastInjectReturn change is seen");
+  assert.deepEqual(mutated((_, o) => {
+    o.idleSeconds = -1;
+    if (o.handshake !== null && typeof o.handshake === "object") o.handshake = { ...o.handshake, sampled_at: "1970-01-01T00:00:00.000Z" };
+  }), stableBefore, "per-read fields are not state");
+  assert.deepEqual(stableSessions(sessionsAfter.body), stableBefore, "no session state changed by any denial");
 
   // C4 owned delete needs the live owner bearer: A's client token alone, or with a forged bearer, removes nothing.
   const aInbox = a.inboxId;
@@ -182,11 +216,13 @@ test("S-R1 two profiles end to end on a real daemon: own create/inject/read/dele
     const del = await asA("DELETE", `/api/sessions/${encodeURIComponent(aInbox)}?owned=true`, undefined, extra);
     assert.ok(del.status >= 400, `owned delete without the live bearer refused (${del.status})`);
   }
-  assert.deepEqual((await daemon.request("/api/sessions")).body, listedBefore.body, "no session removed without the bearer");
+  assert.deepEqual(stableSessions((await daemon.request("/api/sessions")).body), stableSessions(listedBefore.body), "no session removed without the bearer");
 
   // Own delete (with the live owned bearer) succeeds; B is unaffected.
   assert.equal((await a.close()).outcome, "deleted");
-  assert.ok(!(await daemon.request("/api/sessions")).body.some((x) => x && x.id === aInbox), "A's inbox is gone");
+  const listedAfterDelete = await daemon.request("/api/sessions");
+  assert.notDeepEqual(stableSessions(listedAfterDelete.body), stableSessions(listedBefore.body), "the authorized owned delete changes the projection");
+  assert.ok(!listedAfterDelete.body.some((x) => x && x.id === aInbox), "A's inbox is gone");
   assert.equal((await b.health()).credential.server_enforced, true);
   assert.equal((await b.close()).outcome, "deleted");
 });
@@ -219,6 +255,7 @@ test("S-R1b rotation on a real daemon: old generation PROFILE_CREDENTIAL_REJECTE
     return createTeleptyTransport(loadConfig({ TELESESSION_PROFILE: "asst-a", TELESESSION_PROFILES_FILE: file }), seam);
   };
   const a1 = openWith("g1", old);
+  t.after(() => a1.close());
   assert.equal((await a1.health()).credential.generation, 1);
   assert.equal((await a1.send({ target: "orchestrator", text: "generation 1" })).ok, true);
 
@@ -230,7 +267,7 @@ test("S-R1b rotation on a real daemon: old generation PROFILE_CREDENTIAL_REJECTE
   const r1 = await a1.send({ target: "orchestrator", text: "old generation" });
   assert.equal(r1.ok, false);
   assert.equal(r1.error.code, "PROFILE_CREDENTIAL_REJECTED");
-  assert.deepEqual((await daemon.request("/api/sessions")).body, sessionsBefore.body, "the old token changed nothing");
+  assert.deepEqual(stableSessions((await daemon.request("/api/sessions")).body), stableSessions(sessionsBefore.body), "the old token changed nothing");
   await a1.close();
 
   const a2 = openWith("g2", rotated);
@@ -260,5 +297,5 @@ test("S-T4a on a real daemon with the feature off: PROFILE_CREDENTIAL_REJECTED, 
   const r = await tr.send({ target: "orchestrator", text: "x" });
   assert.equal(r.ok, false);
   assert.equal(r.error.code, "PROFILE_CREDENTIAL_REJECTED");
-  assert.deepEqual((await daemon.request("/api/sessions")).body, before.body, "nothing registered");
+  assert.deepEqual(stableSessions((await daemon.request("/api/sessions")).body), stableSessions(before.body), "nothing registered");
 });
