@@ -26,6 +26,7 @@ const args = process.argv.slice(2);
 if (args.length === 1 && ["--help", "-h"].includes(args[0])) {
   process.stdout.write("Usage: telesession-mcp [--help | --version]\nRun without arguments to serve MCP over stdio.\n" +
     "Configure TELESESSION_TARGETS, TELESESSION_INBOX_PREFIX, TELESESSION_TELEPTY_URL, and exactly one of TELESESSION_TELEPTY_TOKEN_FILE or TELESESSION_TELEPTY_TOKEN.\n" +
+    "Or profile mode: TELESESSION_PROFILES_FILE and TELESESSION_PROFILE only (needs Telepty client-profile-scope-v1; no shared-token fallback).\n" +
     "Requires Node >=20 and a compatible local Telepty daemon; never installs, enrolls, restarts or hosts a remote gateway.\n");
   process.exit(0);
 }

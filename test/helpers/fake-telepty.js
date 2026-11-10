@@ -21,6 +21,12 @@
  * Hooks let a test act at precise points: beforeInject / afterInject (e.g. SIGKILL a child, then
  * "hang" or "reset" the connection), onRegister ("reset" after creating = lost response), onDelete
  * ({status} override), beforeDelivery ("fail" = receiver unreachable for that attempt).
+ *
+ * Issue #16 `clientProfiles` (received contract564 §3 + review569 §3): emulates the RESPONSES of a Telepty
+ * `client-profile-scope-v1` daemon so client behaviour can be tested. It is not enforcement evidence: only a
+ * real Telepty build proves the server side. `[{profile, inbox_prefix, targets, generation, token}]`;
+ * `profileScope:false` models 0.10.1 / feature off (any client token → 401). flags: callerOverride (merged
+ * into the profile `caller`), registryUnavailable (503), metaStatus (forced meta status for profile callers).
  */
 
 import http from "node:http";
@@ -62,7 +68,12 @@ function postJson(endpoint, body, timeoutMs = 5000) {
   });
 }
 
-export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs = [1000, 2000], capabilities = FAKE_CAPABILITIES } = {}) {
+export const PROFILE_SCOPE_CAPABILITY = "client-profile-scope-v1";
+const PROFILE_FORBIDDEN_HEADERS = ["authorization", "x-telepty-token", "x-telepty-principal", "x-telepty-owner-token",
+  "x-telepty-input-policy-capability", "x-telepty-bridge-capabilities", "x-telepty-assertion"];
+
+export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs = [1000, 2000], capabilities = FAKE_CAPABILITIES,
+  clientProfiles = null, profileScope = clientProfiles !== null } = {}) {
   const token = hex(24);
   const sessions = new Map();          // id → {id, type, epoch, generation, bearer, endpoint, delivered[]}
   const audit = [];                    // audit rows (persist across restartDaemon, like the audit file)
@@ -78,7 +89,12 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
   let generationSeq = 0;
   let mailSeq = 0;
   let pid = 40000 + Math.floor(Math.random() * 20000);
-  const flags = { auditAvailable: true, forceNextCursor: false, ignoreWindow: false };
+  const flags = { auditAvailable: true, forceNextCursor: false, ignoreWindow: false, callerOverride: null, registryUnavailable: false, metaStatus: null, omitProfileCapability: false };
+  const observationSource = new Map();  // inject_id → claimed `from` (profile observation ownership)
+  const caps = () => (profileScope && !flags.omitProfileCapability ? [...capabilities, PROFILE_SCOPE_CAPABILITY] : [...capabilities]);
+  // Namespace = exact `<prefix>-i<32 hex>` (contract564 §3.2), never a startsWith test.
+  const inNs = (p, id) => typeof id === "string" && id.length === p.inbox_prefix.length + 34
+    && id.startsWith(`${p.inbox_prefix}-i`) && /^[0-9a-f]{32}$/.test(id.slice(p.inbox_prefix.length + 2));
 
   function addWrapped(id) {
     generationSeq += 1;
@@ -149,6 +165,7 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
       payload_sha256: sha256(prompt), delivery_result: "success",
     });
     observations.set(inject_id, { inject_id, session_id: id, session_epoch: session.epoch, tracking_state: "tracked" });
+    observationSource.set(inject_id, from);
     record.status = 200;
     record.inject_id = inject_id;
     return { status: 200, body: { success: true, inject_id, exact_target: body.exact_target === true, session_id: id, strategy } };
@@ -170,11 +187,33 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
       authorized: req.headers["x-telepty-token"] === token, body,
     };
     requests.push(entry);
-    if (!entry.authorized) return send(res, 401, { code: "UNAUTHORIZED" });
+    const rawNames = req.rawHeaders.filter((_, i) => i % 2 === 0).map((n) => n.toLowerCase());
+    entry.clientToken = rawNames.includes("x-telepty-client-token") ? req.headers["x-telepty-client-token"] : null;
+    entry.rootTokenSent = rawNames.includes("x-telepty-token");
+    if (entry.clientToken !== null) {
+      const out = profileRoute(req, url, body, rawNames, entry);
+      if (out) return send(res, out.status, out.body);
+    } else if (!entry.authorized) return send(res, 401, { code: "UNAUTHORIZED" });
     const ctx = { req, res, body, entry };
 
     if (req.method === "GET" && url.pathname === "/api/meta") {
-      return send(res, 200, { name: "fake-telepty", version: "0.0.0-fake", pid, capabilities: [...capabilities] });
+      const caller = profileScope ? (entry.profile
+        ? { kind: "client-profile", profile: entry.profile.profile, generation: entry.profile.generation, inbox_prefix: entry.profile.inbox_prefix,
+          targets: [...entry.profile.targets], enforcement: "server", shared_token: false, ...(flags.callerOverride || {}) }
+        : { kind: "shared-control", enforcement: "none", shared_token: true }) : undefined;
+      return send(res, 200, { name: "fake-telepty", version: "0.0.0-fake", pid, capabilities: caps(), ...(caller ? { caller } : {}) });
+    }
+    if (entry.profile && req.method === "GET" && url.pathname === "/api/sessions") {
+      const p = entry.profile;
+      return send(res, 200, [...sessions.values()].filter((x) => p.targets.includes(x.id) || inNs(p, x.id)).map((x) => ({ id: x.id, type: x.type })));
+    }
+    if (entry.profile && req.method === "GET" && /^\/api\/inject-observations\/[^/]+$/.test(url.pathname)) {
+      const id = decodeURIComponent(url.pathname.split("/").pop());
+      if (!inNs(entry.profile, observationSource.get(id))) return send(res, 200, { inject_id: id, tracking_state: "tracking_unavailable", reason: "no_tracked_inject" });
+    }
+    if (!entry.profile && profileScope && clientProfiles && req.method === "POST" && url.pathname === "/api/sessions/register"
+        && clientProfiles.some((p) => inNs(p, body && body.session_id))) {
+      return send(res, 403, { code: "PROFILE_NAMESPACE_RESERVED" });
     }
     if (req.method === "GET" && url.pathname === "/api/sessions") {
       return send(res, 200, [...sessions.values()].map((s) => ({ id: s.id, type: s.type })));
@@ -244,6 +283,49 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
     return send(res, 404, { code: "NOT_FOUND" });
   });
   server.keepAliveTimeout = 1;
+
+  // Profile gate (emulated): returns a refusal {status, body}, or null after setting entry.profile.
+  function profileRoute(req, url, body, rawNames, entry) {
+    if (!profileScope) return { status: 401, body: { code: "PERMISSION_DENIED" } };
+    const count = (n) => rawNames.filter((x) => x === n).length;
+    if (count("x-telepty-client-token") !== 1 || count("x-telepty-session-token") > 1
+        || PROFILE_FORBIDDEN_HEADERS.some((h) => count(h) > 0) || url.searchParams.has("token") || url.searchParams.has("owner_token")) {
+      return { status: 400, body: { code: "CREDENTIAL_AMBIGUOUS" } };
+    }
+    if (flags.registryUnavailable) return { status: 503, body: { code: "PROFILE_REGISTRY_UNAVAILABLE" } };
+    const p = (clientProfiles || []).find((x) => x.token === entry.clientToken);
+    if (!p) return { status: 401, body: { code: "PROFILE_CREDENTIAL_INVALID" } };
+    entry.profile = p;
+    const m = req.method;
+    const q = [...url.searchParams.keys()];
+    if (m === "GET" && url.pathname === "/api/meta") return flags.metaStatus ? { status: flags.metaStatus, body: { code: "FORCED" } } : null;
+    if (m === "GET" && url.pathname === "/api/sessions" && q.length === 0) return null;
+    if (m === "POST" && url.pathname === "/api/sessions/register") {
+      const b = body || {};
+      if (!inNs(p, b.session_id)) return { status: 403, body: { code: "PROFILE_NAMESPACE_DENIED" } };
+      if (b.create_only !== true || b.delivery_type !== "aterm") return { status: 403, body: { code: "PROFILE_REQUEST_FIELD_DENIED" } };
+      return null;
+    }
+    let mm = /^\/api\/sessions\/([^/]+)\/inject$/.exec(url.pathname);
+    if (m === "POST" && mm) {
+      const b = body || {};
+      if (!p.targets.includes(decodeURIComponent(mm[1]))) return { status: 403, body: { code: "PROFILE_TARGET_DENIED" } };
+      if (!inNs(p, b.from) || b.reply_to !== b.from) return { status: 403, body: { code: "PROFILE_SENDER_DENIED" } };
+      return null;
+    }
+    if (m === "GET" && url.pathname === "/api/injects") {
+      const to = url.searchParams.get("to");
+      const from = url.searchParams.get("from");
+      if (inNs(p, to) || (inNs(p, from) && (to === null || p.targets.includes(to)))) return null;
+      return { status: 403, body: { code: "PROFILE_READ_DENIED" } };
+    }
+    if (m === "GET" && /^\/api\/inject-observations\/[^/]+$/.test(url.pathname)) return null;
+    mm = /^\/api\/sessions\/([^/]+)$/.exec(url.pathname);
+    if (m === "DELETE" && mm && q.join() === "owned") {
+      return inNs(p, decodeURIComponent(mm[1])) ? null : { status: 403, body: { code: "PROFILE_NAMESPACE_DENIED" } };
+    }
+    return { status: 403, body: { code: "PROFILE_ACTION_DENIED" } };
+  }
 
   await new Promise((resolve, reject) => {
     server.once("error", reject);

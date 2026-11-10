@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0 — unreleased — issue #16 assistant profiles (client side of Telepty `client-profile-scope-v1`)
+
+- Opt-in profile mode: `TELESESSION_PROFILE` + `TELESESSION_PROFILES_FILE` (`telesession.profiles/v1`) select the URL,
+  inbox prefix, targets, private state dir/lock and a bare `tpc1.` client token file per profile.
+  - Legacy credential/target/prefix/state/persist/URL env is refused alongside it.
+  - Files must be private regular files.
+  - Prefix, state-dir and token-file aliases across profiles are refused.
+  - Native Windows is refused.
+- Profile mode sends only `x-telepty-client-token`, requires `client-profile-scope-v1` and a matching
+  server-computed `caller`, and maps 401/403 to `PROFILE_CREDENTIAL_REJECTED`. It never falls back to the shared token.
+- `health` adds `credential {mode, profile, server_enforced, shared_token_in_use, generation}` from the server.
+- Shared-control mode (no profile) is unchanged. Requires a real Telepty ≥ 0.11.0 for end-to-end use; not yet
+  verified against one.
+
 ## 0.2.2 — unreleased
 
 Recovery release for Trusted Publishing; no runtime change (`src/` and `bin/` are unchanged). 0.2.1 was tagged but

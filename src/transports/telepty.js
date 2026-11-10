@@ -22,6 +22,9 @@ import { createRelayRunner, transportSendPrimitive } from "../relay/runner.js";
 import { DEFAULT_PROVENANCE, NO_RECEIPTS, applyReceipts, applyConsumption } from "../relay/adapters.js";
 
 export const REQUIRED_CAPABILITIES = Object.freeze(["inject-exact-target", "register-create-only", "delete-owned-session"]);
+// Issue #16 profile mode (Telepty `client-profile-scope-v1`, received contract564 §3-4 + review569 §3): required
+// in addition, and the server-computed meta `caller` must prove THIS profile before any own operation.
+export const PROFILE_CAPABILITY = "client-profile-scope-v1";
 
 const SID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -89,10 +92,13 @@ function transportFailure(err, signal) {
   return { code: "DAEMON_UNREACHABLE", sent: "unknown" };
 }
 
-function createHttpClient(cfg) {
+// Profile mode carries ONLY `x-telepty-client-token` (never `x-telepty-token`; no fallback). `allowed(method,
+// path)` is defence in depth: until the server proved this profile, a refused request never leaves the process.
+function createHttpClient(cfg, allowed = () => true) {
   async function request(method, path, { body, sessionToken, timeoutMs = READ_TIMEOUT_MS } = {}) {
+    if (!allowed(method, path)) return { ok: false, http_status: null, code: "PROFILE_NOT_ENFORCED", sent: "no" };
     const signal = AbortSignal.timeout(timeoutMs);
-    const headers = { "x-telepty-token": cfg.token };
+    const headers = cfg.profile === null ? { "x-telepty-token": cfg.token } : { "x-telepty-client-token": cfg.token };
     if (sessionToken) headers["x-telepty-session-token"] = sessionToken;
     if (body !== undefined) headers["content-type"] = "application/json";
     let res;
@@ -335,8 +341,15 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     stateDir: config && config.stateDir,
     persistInboxCredential: config && config.persistInboxCredential,
     relayIntervalMs: config && config.relayIntervalMs,
+    profile: config && config.profile,
   });
-  const client = createHttpClient(cfg);
+  // Issue #16: with a selected profile only GET /api/meta may run until the latest meta answer proved this
+  // profile's server enforcement (`caller`); anything else fails closed. `caller` = what that answer proved.
+  const required = cfg.profile === null ? REQUIRED_CAPABILITIES : [...REQUIRED_CAPABILITIES, PROFILE_CAPABILITY];
+  const tokenGeneration = cfg.profile === null ? null : Number(cfg.token.split(".")[1]);
+  const caller = { verified: false, code: null, generation: null, sharedToken: null };
+  const client = createHttpClient(cfg, (method, p) => cfg.profile === null || caller.verified
+    || (method === "GET" && p === "/api/meta"));
   function newInboxId() {
     let id;
     do { id = `${cfg.inboxPrefix}-i${randomBytes(16).toString("hex")}`; } while (cfg.targets.includes(id));
@@ -374,6 +387,8 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
   let recoveryCode = null;
   let recoverPromise = null;
   let recoverRuns = 0;
+  let gateRefused = false;
+  let gateRefusal = null;
 
   function noteLock() {
     if (store && !lockLost && store.lockState() === "lost") lockLost = true;
@@ -791,6 +806,12 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
 
   async function recover() {
     recoverRuns += 1;
+    if (cfg.profile !== null) {
+      // Re-checked on the next call (meta GET only); the gate attempt is not a recovery run.
+      const refused = await profileGate();
+      if (refused) { recoverRuns -= 1; recovery = "failed"; recoveryCode = refused.error.code; gateRefused = true; gateRefusal = refused; return; }
+      gateRefused = false;
+    }
     const r = await recoverInbox();
     await probeUncertain();
     if (!r.ok) { recovery = "failed"; recoveryCode = r.code; return; }
@@ -807,7 +828,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
   // Awaited by send/receipt/readReply. health/listAllowedTargets stay read-only and never start it.
   function awaitRecovery() {
     if (!store || recovery === "done" || closing) return Promise.resolve();
-    if (recovery === "failed" && !(recoveryCode === "INBOX_REATTACH_UNKNOWN" && recoverRuns < 2)) return Promise.resolve();
+    if (recovery === "failed" && !(recoveryCode === "INBOX_REATTACH_UNKNOWN" && recoverRuns < 2) && !gateRefused) return Promise.resolve();
     if (!recoverPromise) {
       recoverPromise = recover()
         .catch(() => { recovery = "failed"; recoveryCode = "TRANSPORT_INTERNAL"; })
@@ -1118,10 +1139,18 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
 
   async function readMeta() {
     const meta = await client.get("/api/meta", { timeoutMs: READ_TIMEOUT_MS });
-    if (!meta.ok) return { error: fail(meta.code, { http_status: meta.http_status }) };
+    if (!meta.ok) {
+      // Profile mode (review569 F6): a daemon without the feature, or a rejected/rotated token, answers 401/403;
+      // 503 PROFILE_REGISTRY_UNAVAILABLE passes through. Never retried with another credential.
+      const code = cfg.profile !== null && (meta.http_status === 401 || meta.http_status === 403) ? "PROFILE_CREDENTIAL_REJECTED" : meta.code;
+      Object.assign(caller, { verified: false, code, generation: null, sharedToken: null });
+      return { error: fail(code, { http_status: meta.http_status }) };
+    }
     const caps = Array.isArray(meta.body.capabilities) ? meta.body.capabilities : [];
+    const missing = required.filter((c) => !caps.includes(c));
+    verifyCaller(meta.body.caller, missing);
     noteMeta(meta.body);
-    return { body: meta.body, missing: REQUIRED_CAPABILITIES.filter((c) => !caps.includes(c)) };
+    return { body: meta.body, missing };
   }
 
   // Present only when a ledger was configured: ok (mode + counters) or unavailable with its open code.
@@ -1131,10 +1160,47 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     return ledgerOpenCode ? { ledger: { state: "unavailable", code: "LEDGER_UNAVAILABLE", ledger_code: ledgerOpenCode }, ...off } : {};
   }
 
+  // Issue #16: the server-computed `caller` must name exactly this profile, prefix and token generation, grant at
+  // least every configured target, and state server enforcement without the shared token.
+  function verifyCaller(c, missing) {
+    const plain = c !== null && typeof c === "object" && !Array.isArray(c);
+    caller.sharedToken = plain && typeof c.shared_token === "boolean" ? c.shared_token : null;
+    if (cfg.profile === null) { Object.assign(caller, { verified: false, code: null, generation: null }); return; }
+    const verified = missing.length === 0 && plain && c.kind === "client-profile" && c.profile === cfg.profile
+      && c.inbox_prefix === cfg.inboxPrefix && Array.isArray(c.targets) && cfg.targets.every((t) => c.targets.includes(t))
+      && c.enforcement === "server" && c.shared_token === false && Number.isSafeInteger(c.generation) && c.generation === tokenGeneration;
+    Object.assign(caller, {
+      verified, generation: verified ? c.generation : null,
+      code: verified ? null : missing.length ? "DAEMON_LACKS_CAPABILITY" : "PROFILE_NOT_ENFORCED",
+    });
+  }
+
+  // health.credential: from the server's answer only (contract564 §4, review569 §3). Never a path, token or digest.
+  function credentialHealth() {
+    if (cfg.profile === null) {
+      return { credential: { mode: "shared-control", profile: null, server_enforced: false,
+        shared_token_in_use: caller.sharedToken === null ? true : caller.sharedToken, generation: null } };
+    }
+    const metaFailed = caller.code !== null && caller.code !== "PROFILE_NOT_ENFORCED" && caller.code !== "DAEMON_LACKS_CAPABILITY";
+    return { credential: {
+      mode: "client-profile", profile: cfg.profile, server_enforced: metaFailed ? null : caller.verified,
+      shared_token_in_use: false, generation: caller.generation, ...(caller.code ? { code: caller.code } : {}),
+    } };
+  }
+
+  // Profile mode: the gate is the latest meta answer; refused before any other daemon request.
+  async function profileGate() {
+    if (cfg.profile === null) return null;
+    const meta = await readMeta();
+    if (meta.error) return meta.error;
+    if (meta.missing.length) return fail("DAEMON_LACKS_CAPABILITY", { missing: meta.missing });
+    return caller.verified ? null : fail("PROFILE_NOT_ENFORCED");
+  }
+
   const health = guarded(async () => {
     if (store) flushHeld();
     const meta = await readMeta();
-    if (meta.error) return { ...meta.error, inbox: { id: S.inbox.id, state: inbox.fatal || inbox.state }, daemon_restart: daemonRestart(), ...storeHealth(), ...ledgerHealth() };
+    if (meta.error) return { ...meta.error, inbox: { id: S.inbox.id, state: inbox.fatal || inbox.state }, daemon_restart: daemonRestart(), ...storeHealth(), ...ledgerHealth(), ...credentialHealth() };
     const version = typeof meta.body.version === "string" && VERSION_RE.test(meta.body.version) ? meta.body.version : null;
     return ok({
       telepty: { version, capabilities_missing: meta.missing },
@@ -1142,11 +1208,14 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       daemon_restart: daemonRestart(),
       ...storeHealth(),
       ...ledgerHealth(),
+      ...credentialHealth(),
     });
   });
 
   // Allowlist only; other daemon session ids are never returned.
   const listAllowedTargets = guarded(async () => {
+    const refused = await profileGate();
+    if (refused) return refused;
     const list = await client.get("/api/sessions", { timeoutMs: READ_TIMEOUT_MS });
     const ids = list.ok && Array.isArray(list.body) ? new Set(list.body.filter((s) => s && typeof s.id === "string").map((s) => s.id)) : null;
     return ok({
@@ -1204,7 +1273,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     if (closing) return fail("TRANSPORT_CLOSING");
     if (noteLock()) return fail("STORE_LOCK_LOST");
     if (!flushHeld()) return fail(noteLock() ? "STORE_LOCK_LOST" : "STORE_DEGRADED");
-    if (store && recovery === "failed") return fail(recoveryCode || "TRANSPORT_INTERNAL");
+    if (store && recovery === "failed") return gateRefused ? gateRefusal : fail(recoveryCode || "TRANSPORT_INTERNAL");
     if (inbox.fatal) return fail(inbox.fatal, inbox.detail || {});
     if (liveCount(Date.now()) >= ISSUED_MAX) return fail("ISSUED_LIMIT");
     if (Object.keys(S.requests).length >= STORE_LIMITS.requests) return fail("STORE_FULL");
@@ -1212,6 +1281,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     const meta = await readMeta();
     if (meta.error) return meta.error;
     if (meta.missing.length) return fail("DAEMON_LACKS_CAPABILITY", { missing: meta.missing });
+    if (cfg.profile !== null && !caller.verified) return fail("PROFILE_NOT_ENFORCED", { accepted: false });
 
     const list = await client.get("/api/sessions", { timeoutMs: READ_TIMEOUT_MS });
     if (!list.ok) return fail(list.code, { http_status: list.http_status });

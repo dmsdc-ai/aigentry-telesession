@@ -119,6 +119,59 @@ sent while the receiver or inbox is down can be lost: `reply_loss_possible` and
 The state dir never holds the telepty token, the receiver secret or prompt text (hashes only).
 Without a state dir everything is memory only.
 
+## Assistant profiles (issue #16; needs Telepty `client-profile-scope-v1`, Telepty ≥ 0.11.0)
+Several assistants on one host can each use their own inbox prefix, targets, durable state dir and lock, and
+**their own Telepty client credential**. The daemon enforces that credential (create, read, inject and delete
+only inside the profile's own namespace and granted targets). Profile mode is opt-in. Without it, nothing
+changes (shared-control mode).
+
+| env | rule | refusal code |
+|---|---|---|
+| `TELESESSION_PROFILE` + `TELESESSION_PROFILES_FILE` | both or neither; name `^[a-z0-9][a-z0-9._-]{0,63}$`; the file path is absolute | `CONFIG_PROFILE_MISSING`, `CONFIG_PROFILES_FILE_MISSING`, `CONFIG_PROFILE_INVALID`, `CONFIG_PROFILE_UNKNOWN` |
+| legacy keys | in profile mode `TELESESSION_TELEPTY_TOKEN`, `_TOKEN_FILE`, `_TARGETS`, `_INBOX_PREFIX`, `_STATE_DIR`, `_PERSIST_INBOX_CREDENTIAL` and `_TELEPTY_URL` must be unset (`TELESESSION_RELAY_INTERVAL_MS` stays allowed) | `CONFIG_PROFILE_CONFLICT` |
+| platform | native Windows is not supported in profile mode | `CONFIG_PROFILE_PLATFORM_UNSUPPORTED` |
+| `AIGENTRY_ORCHESTRATOR_SIDS` (optional) | when non-empty, the profile's targets are intersected with it (never widened) | `CONFIG_TARGETS_INVALID` |
+
+Profiles file (operator-private, synthetic example):
+```json
+{"schema":"telesession.profiles/v1","telepty_url":"http://127.0.0.1:3848",
+ "profiles":{"example-a":{"inbox_prefix":"exa","targets":["example-target-1"],
+   "state_dir":"/abs/state/example-a","token_file":"/abs/secrets/example-a.token","persist_inbox_credential":false}}}
+```
+- The profiles file and each token file must be a regular file that is not a symlink, has exactly one link,
+  is owned by you, has mode `0600` (no group/other bits) and is ≤ 64 KiB. Otherwise:
+  `CONFIG_PROFILES_FILE_INVALID` / `CONFIG_TOKEN_FILE_INVALID`. A malformed file gives
+  `CONFIG_PROFILES_INVALID`. `telepty_url` follows the `TELESESSION_TELEPTY_URL` rule (`CONFIG_URL_INVALID`).
+  Each profile has 1–8 targets.
+- A token file holds exactly one bare `tpc1.<generation>.<43 base64url>` client token, as minted by
+  `telepty client-profile mint`. The shared telepty `{"authToken":…}` form and any other text give
+  `CONFIG_PROFILE_TOKEN_INVALID`, so a profile can never be pointed at the shared root token.
+- Checked over the whole file: inbox prefixes are unique case-insensitively (`CONFIG_PROFILE_CONFLICT`).
+  State dirs are pairwise distinct and not nested, compared by path, realpath and dev:ino, and
+  case-insensitively on macOS (`CONFIG_PROFILE_STATE_ALIAS`). Token files are not aliased to each other
+  and not inside any state dir (`CONFIG_PROFILE_CREDENTIAL_ALIAS`). Only the selected token file is read.
+- On the wire, profile mode sends only `x-telepty-client-token`, never `x-telepty-token`, and never falls
+  back. Before any own operation, `/api/meta` must list `client-profile-scope-v1`. It must also return a
+  server-computed `caller` with `kind:"client-profile"`, this profile, this prefix, every configured target,
+  `enforcement:"server"`, `shared_token:false` and the token's generation.
+  - A daemon without the feature, or a rejected or rotated token (401/403), gives `PROFILE_CREDENTIAL_REJECTED`.
+  - 503 gives `PROFILE_REGISTRY_UNAVAILABLE`.
+  - A 200 without the capability gives `DAEMON_LACKS_CAPABILITY`.
+  - Any other caller mismatch gives `PROFILE_NOT_ENFORCED`.
+  - In every one of these cases nothing is registered, injected, read or deleted.
+- `telesession_health` adds
+  `credential {mode: "client-profile"|"shared-control", profile, server_enforced, shared_token_in_use, generation}`,
+  taken from the server's answer. `server_enforced:null` plus `code` means the server could not be asked.
+  Paths, tokens and digests are never reported.
+
+Threat model. Profile scope separates assistants that hold **different credentials**. Within one OS user,
+any process can read every token file, the profiles file and process environments, and can choose another
+`TELESESSION_PROFILE`. Profile selection is configuration, not authentication. Use separate OS accounts for
+that boundary. Daemon capacity (audit query workers, tracking ledger) is shared: 429/503 from one
+profile's load are reported as-is (retryable), not as an enforcement failure. Profile mode is unsupported
+on native Windows. Without a Telepty that implements `client-profile-scope-v1`, profile mode refuses to
+operate. It is not complete until a real Telepty build passes `test/real-daemon-profile.test.js`.
+
 ## JS API (no MCP needed)
 ```js
 import { loadConfig, createTeleptyTransport } from "@dmsdc-ai/telesession";

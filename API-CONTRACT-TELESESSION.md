@@ -210,3 +210,45 @@ A request with a `destination` stays `pending`/unproven. `pending` is never comp
 Known open limitation (#10): a durable receiver rejection for 4 candidates per request or 64 stored texts
 answers 503 and increments only `inbox_rejected` (no reason counter, request not marked). With Telepty 0.10.0
 the 503 is dead-lettered as `unknown` without retry. Minimum follow-up: per-reason counters plus request marking.
+
+## 9. Assistant profiles — issue #16, `client-profile-scope-v1` client (task 1272; received contract564 §4 + review569 §3)
+- Config: `resolveProfile(env, {platform})` (exported; no token read) then `loadConfig`. Check order:
+  1. Pair presence → `CONFIG_PROFILES_FILE_MISSING|CONFIG_PROFILE_MISSING`.
+  2. win32 → `CONFIG_PROFILE_PLATFORM_UNSUPPORTED`.
+  3. Name `^[a-z0-9][a-z0-9._-]{0,63}$` → `CONFIG_PROFILE_INVALID`.
+  4. Legacy token/token-file/targets/prefix/state/persist/URL env → `CONFIG_PROFILE_CONFLICT`.
+  5. Private-file read of the profiles file (lstat → `O_NOFOLLOW` open → fstat with equal dev/ino; regular;
+     nlink 1; uid = euid; `mode & 077 = 0`; ≤ 64 KiB) → `CONFIG_PROFILES_FILE_INVALID`.
+  6. Shape `{schema:"telesession.profiles/v1", telepty_url, profiles:{name:{inbox_prefix, targets, state_dir,
+     token_file, persist_inbox_credential?}}}` → `CONFIG_PROFILES_INVALID`; `telepty_url` → `CONFIG_URL_INVALID`.
+  7. Selected profile exists → `CONFIG_PROFILE_UNKNOWN`.
+  8. Whole-file aliases: prefix `CONFIG_PROFILE_CONFLICT`; state dirs `CONFIG_PROFILE_STATE_ALIAS`; token files
+     `CONFIG_PROFILE_CREDENTIAL_ALIAS`.
+  9. Targets ∩ a non-empty `AIGENTRY_ORCHESTRATOR_SIDS`.
+  10. Selected token file (private-file rules, `CONFIG_TOKEN_FILE_INVALID`) → bare `tpc1.<gen>.<43 b64url>` with at
+      most one trailing LF, else `CONFIG_PROFILE_TOKEN_INVALID`.
+
+  `normalizeConfig({..., profile})`: a profile needs a state dir and a `tpc1` token.
+- Transport:
+  - Profile mode sends only `x-telepty-client-token` (plus the inbox `x-telepty-session-token` on inject and owned
+    delete), never `x-telepty-token`. `redirect:"error"` is kept.
+  - Required capabilities add `client-profile-scope-v1`.
+  - After every `/api/meta`, `caller` must satisfy `kind==="client-profile"`, `profile`, `inbox_prefix`,
+    `cfg.targets ⊆ caller.targets`, `enforcement==="server"`, `shared_token===false`, and a safe-integer
+    `generation` equal to the token's generation. Otherwise `PROFILE_NOT_ENFORCED`, or `DAEMON_LACKS_CAPABILITY`.
+  - Meta 401/403 → `PROFILE_CREDENTIAL_REJECTED`; daemon codes such as 503 `PROFILE_REGISTRY_UNAVAILABLE` pass through.
+  - send, list_targets and recovery refuse before any own operation, and the HTTP client refuses every non-meta
+    request until verified (`sent:"no"`). The refusal is re-checked on the next call.
+  - Nonce, dedupe, uncertain, `create_only`, owned delete and audit-verification semantics are unchanged.
+- health adds `credential {mode, profile, server_enforced: true|false|null, shared_token_in_use, generation, code?}`.
+  - Shared-control mode: from the server `caller` when present, else `shared_token_in_use:true` (the shared token
+    was sent).
+  - The `profile` health block of the unreleased placeholder (candidate eca462ea) is removed.
+- Tunnel child forwards `TELESESSION_PROFILE`, `TELESESSION_PROFILES_FILE`, `AIGENTRY_ORCHESTRATOR_SIDS`. A profile
+  plus a token file gives `TUNNEL_CHILD_PROFILE_CONFLICT`. The map is validated before spawn (config code; a
+  forwarded URL gives `CONFIG_PROFILE_CONFLICT`).
+- Server obligations (Telepty 0.11.0, not part of this package; amendments A1–A6): verifier compare, raw-header
+  `CREDENTIAL_AMBIGUOUS`, loopback-only, WebSocket refusal, exact allow table with reserved segments,
+  `not_before`/history, observation stripping, exact audit filters, per-request registry digest reload, win32
+  refusal. Client tests against `test/helpers/fake-telepty.js` emulate these responses and are not enforcement
+  evidence. Only `test/real-daemon-profile.test.js` (S-R1) on a real build is.

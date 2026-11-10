@@ -9,6 +9,7 @@
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveProfile } from "./config.js";
 
 // Exactly the keys src/config.js reads, except TELESESSION_TELEPTY_TOKEN (refused, never forwarded).
 export const CHILD_CONFIG_KEYS = Object.freeze([
@@ -18,11 +19,15 @@ export const CHILD_CONFIG_KEYS = Object.freeze([
   "TELESESSION_INBOX_PREFIX",
   "TELESESSION_STATE_DIR",
   "TELESESSION_PERSIST_INBOX_CREDENTIAL",
+  "TELESESSION_PROFILE",
+  "TELESESSION_PROFILES_FILE",
+  "AIGENTRY_ORCHESTRATOR_SIDS",
 ]);
 const WIN32_PLATFORM_KEYS = Object.freeze(["SystemRoot", "WINDIR", "TEMP", "TMP"]);
 const POSIX_PLATFORM_KEYS = Object.freeze(["TMPDIR", "LANG", "LC_ALL"]);
 const TOKEN_KEY = "TELESESSION_TELEPTY_TOKEN";
 const TOKEN_FILE_KEY = "TELESESSION_TELEPTY_TOKEN_FILE";
+const PROFILE_KEY = "TELESESSION_PROFILE";
 const DEFAULT_GRACE_MS = 5000;
 
 export class TunnelChildError extends Error {
@@ -52,8 +57,14 @@ export function buildChildEnv(env, { platform = process.platform } = {}) {
   const token = lookup(e, keys, TOKEN_KEY, win32);
   if (token !== undefined && token !== "") throw new TunnelChildError("TUNNEL_CHILD_TOKEN_VALUE_FORBIDDEN");
   const tokenFile = lookup(e, keys, TOKEN_FILE_KEY, win32);
-  if (tokenFile === undefined || tokenFile === "") throw new TunnelChildError("TUNNEL_CHILD_TOKEN_FILE_REQUIRED");
-  if (!(win32 ? path.win32 : path.posix).isAbsolute(tokenFile)) throw new TunnelChildError("TUNNEL_CHILD_TOKEN_FILE_INVALID");
+  const profile = lookup(e, keys, PROFILE_KEY, win32);
+  // Issue #16: a selected profile names its own token file; a second credential source is refused.
+  if (profile !== undefined && profile !== "") {
+    if (tokenFile !== undefined && tokenFile !== "") throw new TunnelChildError("TUNNEL_CHILD_PROFILE_CONFLICT");
+  } else {
+    if (tokenFile === undefined || tokenFile === "") throw new TunnelChildError("TUNNEL_CHILD_TOKEN_FILE_REQUIRED");
+    if (!(win32 ? path.win32 : path.posix).isAbsolute(tokenFile)) throw new TunnelChildError("TUNNEL_CHILD_TOKEN_FILE_INVALID");
+  }
   // Null prototype: spawn enumerates env with for..in, so inherited properties must not exist.
   const child = Object.create(null);
   for (const name of [...CHILD_CONFIG_KEYS, ...(win32 ? WIN32_PLATFORM_KEYS : POSIX_PLATFORM_KEYS)]) {
@@ -79,10 +90,16 @@ export function buildSpawnPlan({ argv, env, platform = process.platform, execPat
   for (const p of [execPath, entryPath]) {
     if (typeof p !== "string" || p.includes("\u0000") || !P.isAbsolute(p)) throw new TunnelChildError("TUNNEL_CHILD_ENTRY_INVALID");
   }
+  const childEnv = buildChildEnv(env, { platform });
+  // Issue #16: an unknown/malformed/conflicting profile map is refused before any child exists (stat/read of
+  // the map only; no token is read here). The child re-validates everything in loadConfig.
+  try { resolveProfile(childEnv, { platform }); } catch (err) {
+    throw new TunnelChildError(err && typeof err.code === "string" ? err.code : "TUNNEL_CHILD_PROFILE_INVALID");
+  }
   return Object.freeze({
     command: execPath,
     args: Object.freeze([entryPath]),
-    options: Object.freeze({ env: buildChildEnv(env, { platform }), stdio: "inherit", shell: false, detached: false }),
+    options: Object.freeze({ env: childEnv, stdio: "inherit", shell: false, detached: false }),
   });
 }
 
