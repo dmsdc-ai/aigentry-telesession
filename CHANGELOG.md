@@ -13,6 +13,24 @@
 - `health` adds `credential {mode, profile, server_enforced, shared_token_in_use, generation}` from the server.
 - Shared-control mode (no profile) is unchanged. Requires a real Telepty ≥ 0.11.0 for end-to-end use; not yet
   verified against one.
+- Review698 corrections:
+  - A failed concurrent read (for example `health` timing out) no longer refuses an already verified send. Only a
+    server answer changes the request gate (CF3).
+  - Token generation must be 1 or higher with no leading zero, as on the server (CF5).
+  - Release gates: `compatibility.yml` requires the S-R1/S-R1b profile rows on Linux and macOS
+    (`TELESESSION_TEST_REQUIRE_PROFILE_DAEMON=1`). It also builds and verifies Telepty's Darwin authority reader on
+    macOS and adds Node 26.13.0 legs. `release-check.yml` always runs it, against the pinned commit when no
+    `telepty_ref` is given. `publish.yml` and `release-check.yml` pin Telepty `6eebf71a`, the immutable server
+    candidate (full server CI and security pending; publication NOT_APPROVED).
+- Review714 corrections:
+  - The required profile step checks the TAP summary line Node actually prints (`# skipped 0`, not `# skip 0`), so
+    a fully passing run is no longer refused (B1). A guard test now checks that grammar and that `release-check.yml`
+    pins the same Telepty commit as `publish.yml` (N5).
+  - `health()` reports its own server answer, and a delayed older answer can no longer overwrite a newer one, for
+    example reopening the request gate after a newer revocation (N1).
+  - S-R1 now reads an actual reply through A's profile inbox, and checks that B cannot read it (N2), and that A's
+    observation names neither B's inject nor `active_inject_id` (N3).
+  - On macOS, S-R1 runs against the runner-built Darwin reader. That is not proof of the final shipping binary (N4).
 
 ## 0.2.2 — unreleased
 

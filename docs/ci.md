@@ -98,10 +98,11 @@ Node lines are not claimed until they are added to the matrix and pass.
 Triggers: `workflow_dispatch`, with an optional string input `telepty_ref`, and pushes of tags matching `v*`.
 
 1. `ci` calls `ci.yml` (the full matrix plus pack).
-2. `compat-request` reads `telepty_ref`. If it is empty (it always is on tag pushes), compatibility is not
-   requested. If it is exactly 40 lowercase hex characters, compatibility is requested. Any other value fails
-   the run before any checkout.
-3. `compatibility` runs only when compatibility is requested and `ci` passed. It calls `compatibility.yml`
+2. `compat-request` reads `telepty_ref`. If it is empty (it always is on tag pushes), the pinned
+   `PINNED_TELEPTY_SHA` is used: Telepty `6eebf71a574551cfa5c35fc3d017b45d6b94b029` (the client-profile-scope-v1
+   server candidate; full server CI and security pending), the same commit as `publish.yml` `TELEPTY_SHA`. If it is exactly 40 lowercase hex characters, that commit is used.
+   Any other value fails the run before any checkout. Compatibility is therefore always requested.
+3. `compatibility` runs when `ci` passed. It calls `compatibility.yml`
    (`workflow_call`) with that SHA. Because the call goes through `release-check.yml`, the compatibility run
    works on a named branch before `compatibility.yml` exists on the default branch. A `workflow_dispatch`
    workflow cannot run for the first time until it is on the default branch.
@@ -109,13 +110,13 @@ Triggers: `workflow_dispatch`, with an optional string input `telepty_ref`, and 
    is never a silent skip:
    - `ci` passed;
    - the request was valid;
-   - if compatibility was requested, `compatibility` passed and its verified Telepty HEAD (`telepty_sha`
-     output) equals the requested SHA;
-   - if compatibility was not requested, `compatibility` was skipped.
+   - `compatibility` passed and its verified Telepty HEAD (`telepty_sha` output) equals the requested SHA.
+     There is no "not requested" pass: compatibility, including the required S-R1/S-R1b profile rows on
+     Linux and macOS, is mandatory.
 
    On tag pushes it then checks that the tag equals `v` + `package.json` `version`. It runs
    `npm pack --dry-run --ignore-scripts` and writes a ready summary. The summary names the verified Telepty
-   SHA, or says that compatibility was **not requested, not run and not established**.
+   SHA and says when it is the pinned CI/release candidate anchor. Publication stays NOT_APPROVED by this result.
 
 It creates no GitHub release, runs no `npm publish` and performs no deployment. Since 0.2.0 `package.json`
 no longer has `"private": true` and declares `publishConfig.access: "public"`, so npm would **not** refuse a
@@ -147,9 +148,21 @@ input `telepty_ref`. It must be exactly 40 lowercase hex characters, an immutabl
 HEAD is compared with the input again afterwards.
 - A Telepty tree without `daemon.js` fails the job. So does a full-suite TAP that reports a real-daemon
   suite skipped as `NOTRUN: telepty source not found`.
+- Issue #16 (Linux and macOS): a Telepty tree without `src/protocol/client-profiles.js` fails the job, and
+  `TELESESSION_TEST_REQUIRE_PROFILE_DAEMON=1` is set, so a missing, older than 0.11.0 or capability-less Telepty
+  fails the profile rows instead of skipping them. A separate step runs `test/real-daemon-profile.test.js` and
+  fails unless the TAP summary shows `# fail 0` and `# skipped 0` (the lines Node's TAP reporter prints) and plain
+  `ok` lines for `S-R1 two profiles` and
+  `S-R1b rotation` (`profile.tap`). On macOS it first builds Telepty's Darwin authority reader with the same
+  command as Telepty's `test-install.yml` and runs Telepty's `test/authority-file-darwin-1215.test.js`; the
+  pre- and post-build hashes and whether the binary is tracked go to `darwin-reader.txt`. The macOS S-R1 rows
+  therefore run against this runner-built reader: that is not proof of the final shipping binary, whose canonical
+  archive/native-consumer identity is a later, separate release proof. Windows runs the
+  configured-mode refusal rows only; no cross-profile result is claimed there.
 - The output `telepty_sha` is set only after the HEAD check passes. `release-gate` compares it with the request.
 
-- Matrix: `ubuntu-latest`, `macos-latest`, `windows-latest` × Node `20.20.0`, `fail-fast: false`, 20 min.
+- Matrix: `ubuntu-latest`, `macos-latest`, `windows-latest` × Node `20.20.0`, plus the same three OSes on Node
+  `26.13.0` (matrix `include`), `fail-fast: false`, 20 min.
 - Telesession (this ref) and Telepty (the exact SHA) are checked out read-only into separate directories
   (`persist-credentials: false`). The pinned actions are the same three as `ci.yml`. It has no secrets and
   no login, and it never tags or publishes.
@@ -265,8 +278,8 @@ workflow `publish.yml`, no environment. No npm token, `NODE_AUTH_TOKEN` or secre
 |---|---|---|
 | `identity` | read | Refuses unless: event is a tag push in `dmsdc-ai/aigentry-telesession`; the tag is a stable `vX.Y.Z`; checkout `HEAD` = `GITHUB_SHA` = the tag's commit re-resolved on the remote now (`git ls-remote`, annotated tags peeled); tag = `v` + `package.json` `version` = `package-lock.json` `version` and `packages[""].version`; name and `repository.url` are exact. |
 | `ci` | read | `ci.yml` unchanged (unit matrix ubuntu/macos/windows, Node `20.20.0`, plus pack dry-run). |
-| `compatibility` | read | `compatibility.yml` unchanged, against the pinned Telepty commit `556a4ba3bcbdbcd42d2cca1bdf14a0f3cef7e421` (tag `v0.10.0`, package version 0.10.0). `pack` runs only if its verified `telepty_sha` equals the pin. |
-| `pack` | read | Runs no `npm pack`. Node `24.22.2` (npm 11.19.1; the job refuses npm < 11.5.1). Re-checks identity, then downloads this run's `tested-compatibility-ubuntu-latest-node-20.20.0-telepty-556a4ba3bcbdbcd42d2cca1bdf14a0f3cef7e421` artifact (default same-run download; no run id, repository or token input): the tarball that the Ubuntu compatibility leg packed with Node 20.20.0, installed and accepted with `test:installed`, uploaded only after those gates passed (the attempt-qualified diagnostic bundle is never used). `select-compat` refuses unless `provenance.json` names this `GITHUB_SHA` (`sha` and `dispatched_sha`), `GITHUB_REF`, the tag version, `dmsdc-ai/aigentry-telepty` at the pin, matrix `ubuntu-latest`/`Linux`/`v20.20.0` and this `GITHUB_RUN_ID` with attempt 1..current (an earlier attempt of the same run is valid reuse; another run never is); `pack/` holds exactly `dmsdc-ai-telesession-<version>.tgz`; `tarball.json` filename/sha256/integrity and `pack.json` filename/name/version/integrity/shasum equal the bytes; the packed `package/package.json` is the expected name/version; `installed.log` and `full.tap` are non-empty. It then emits those exact bytes plus a record (filename, sha512 integrity, sha1 shasum, sha256, size, `GITHUB_SHA`, source compatibility provenance) and `source/{provenance,tarball,pack}.json` as `release-tarball` (90 days). |
+| `compatibility` | read | `compatibility.yml` (with the required S-R1/S-R1b profile rows on Linux and macOS), against the pinned Telepty commit `6eebf71a574551cfa5c35fc3d017b45d6b94b029` (the immutable CI/release candidate anchor; full server CI and security pending, publication NOT_APPROVED). `pack` runs only if its verified `telepty_sha` equals the pin. |
+| `pack` | read | Runs no `npm pack`. Node `24.22.2` (npm 11.19.1; the job refuses npm < 11.5.1). Re-checks identity, then downloads this run's `tested-compatibility-ubuntu-latest-node-20.20.0-telepty-6eebf71a574551cfa5c35fc3d017b45d6b94b029` artifact (default same-run download; no run id, repository or token input): the tarball that the Ubuntu compatibility leg packed with Node 20.20.0, installed and accepted with `test:installed`, uploaded only after those gates passed (the attempt-qualified diagnostic bundle is never used). `select-compat` refuses unless `provenance.json` names this `GITHUB_SHA` (`sha` and `dispatched_sha`), `GITHUB_REF`, the tag version, `dmsdc-ai/aigentry-telepty` at the pin, matrix `ubuntu-latest`/`Linux`/`v20.20.0` and this `GITHUB_RUN_ID` with attempt 1..current (an earlier attempt of the same run is valid reuse; another run never is); `pack/` holds exactly `dmsdc-ai-telesession-<version>.tgz`; `tarball.json` filename/sha256/integrity and `pack.json` filename/name/version/integrity/shasum equal the bytes; the packed `package/package.json` is the expected name/version; `installed.log` and `full.tap` are non-empty. It then emits those exact bytes plus a record (filename, sha512 integrity, sha1 shasum, sha256, size, `GITHUB_SHA`, source compatibility provenance) and `source/{provenance,tarball,pack}.json` as `release-tarball` (90 days). |
 | `registry-state` | read | Re-verifies the downloaded tarball against the pack job outputs, then reads the public packument once. `absent` (HTTP 200, exact package, version not listed) → decision `publish`; `published-match` (version listed with exactly the measured integrity and shasum) → `reconcile`; `published-mismatch` or `unknown` (network error, any non-200 including 404 since the package exists, malformed body) → job fails. |
 | `publish` | read + `id-token: write` | Only when the decision is `publish`. Node 24.22.2, npm ≥ 11.5.1. Immediately before publishing it re-checks identity, re-measures the tarball and re-reads the registry; if an earlier attempt already published the same artifact it reconciles instead. Publishes the measured tarball file (`npm publish <tgz> --access public`); npm exchanges the GitHub OIDC token and attaches provenance automatically. |
 | `verify` | read | Always (unless cancelled). Fails unless identity/pack/registry-state succeeded and `publish` succeeded (`publish` path) or was skipped (`reconcile` path). Polls the public packument (20 × 15 s) until it serves the version with the measured integrity and shasum; a different artifact fails at once. |
@@ -286,7 +299,7 @@ Not established by the workflow file itself: a live Trusted Publisher acceptance
 pointing at the exact commit (check `readback.json` `attestations` and the npm provenance page after the run),
 and the cross-host Mac/Linux live communication gate below.
 
-`release-check.yml` still also runs on `v*` tags; it is unchanged and publishes nothing.
+`release-check.yml` still also runs on `v*` tags (always with compatibility against the pinned commit) and publishes nothing.
 
 ## Publishing prerequisites (not done by CI)
 

@@ -26,7 +26,14 @@
  * `client-profile-scope-v1` daemon so client behaviour can be tested. It is not enforcement evidence: only a
  * real Telepty build proves the server side. `[{profile, inbox_prefix, targets, generation, token}]`;
  * `profileScope:false` models 0.10.1 / feature off (any client token → 401). flags: callerOverride (merged
- * into the profile `caller`), registryUnavailable (503), metaStatus (forced meta status for profile callers).
+ * into the profile `caller`), registryUnavailable (503), metaStatus (forced meta status for profile callers),
+ * metaDrop (n: the next n GET /api/meta connections are destroyed without a response = transport failure, not an
+ * answer). hooks.beforeProfileList (async, awaited before a profile GET /api/sessions is answered) lets a test hold
+ * one operation at a fixed point while another runs (review698 CF3), with no timer.
+ * Response shapes follow the real server (review698 CF4, server source of 6eebf71a): a profile list is exactly
+ * `[{id}]`; a foreign or unknown observation is the schema-v2 `tracking_state:"unavailable"` body with
+ * `reason:"not_observed_by_daemon_epoch"` (observationUnavailableBody). The fake does NOT emulate not_before /
+ * grant history (A2), digest reload or any other server-only rule; only S-R rows on a real daemon show those.
  */
 
 import http from "node:http";
@@ -69,6 +76,16 @@ function postJson(endpoint, body, timeoutMs = 5000) {
 }
 
 export const PROFILE_SCOPE_CAPABILITY = "client-profile-scope-v1";
+// Server daemon.js `unavailable(reason)` body (GET /api/inject-observations/:id), fields in the server's order. The
+// server's `capability` value (CAPABILITY_STAGE_A) is defined outside the review packet; the fake sends a fixed
+// empty object there and the client reads none of it.
+export function observationUnavailableBody(injectId, reason = "not_observed_by_daemon_epoch") {
+  return {
+    type: "task_completion_unknown", schema_version: 2, inject_id: injectId, completion_fact: null, terminal: false,
+    tracking_state: "unavailable", reason, observation: { kind: "tracking_unavailable", trigger: reason },
+    consumption: { status: "not_established", basis: "no_tracked_inject" }, capability: {},
+  };
+}
 const PROFILE_FORBIDDEN_HEADERS = ["authorization", "x-telepty-token", "x-telepty-principal", "x-telepty-owner-token",
   "x-telepty-input-policy-capability", "x-telepty-bridge-capabilities", "x-telepty-assertion"];
 
@@ -89,7 +106,7 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
   let generationSeq = 0;
   let mailSeq = 0;
   let pid = 40000 + Math.floor(Math.random() * 20000);
-  const flags = { auditAvailable: true, forceNextCursor: false, ignoreWindow: false, callerOverride: null, registryUnavailable: false, metaStatus: null, omitProfileCapability: false };
+  const flags = { auditAvailable: true, forceNextCursor: false, ignoreWindow: false, callerOverride: null, registryUnavailable: false, metaStatus: null, omitProfileCapability: false, metaDrop: 0 };
   const observationSource = new Map();  // inject_id → claimed `from` (profile observation ownership)
   const caps = () => (profileScope && !flags.omitProfileCapability ? [...capabilities, PROFILE_SCOPE_CAPABILITY] : [...capabilities]);
   // Namespace = exact `<prefix>-i<32 hex>` (contract564 §3.2), never a startsWith test.
@@ -190,6 +207,11 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
     const rawNames = req.rawHeaders.filter((_, i) => i % 2 === 0).map((n) => n.toLowerCase());
     entry.clientToken = rawNames.includes("x-telepty-client-token") ? req.headers["x-telepty-client-token"] : null;
     entry.rootTokenSent = rawNames.includes("x-telepty-token");
+    if (req.method === "GET" && url.pathname === "/api/meta" && flags.metaDrop > 0) {
+      flags.metaDrop -= 1;
+      entry.dropped = true;
+      return req.socket.destroy();
+    }
     if (entry.clientToken !== null) {
       const out = profileRoute(req, url, body, rawNames, entry);
       if (out) return send(res, out.status, out.body);
@@ -205,11 +227,12 @@ export async function startFakeTelepty({ targets = ["target-1"], retryDelaysMs =
     }
     if (entry.profile && req.method === "GET" && url.pathname === "/api/sessions") {
       const p = entry.profile;
-      return send(res, 200, [...sessions.values()].filter((x) => p.targets.includes(x.id) || inNs(p, x.id)).map((x) => ({ id: x.id, type: x.type })));
+      if (hooks.beforeProfileList) await hooks.beforeProfileList(entry);
+      return send(res, 200, [...sessions.values()].filter((x) => p.targets.includes(x.id) || inNs(p, x.id)).map((x) => ({ id: x.id })));
     }
     if (entry.profile && req.method === "GET" && /^\/api\/inject-observations\/[^/]+$/.test(url.pathname)) {
       const id = decodeURIComponent(url.pathname.split("/").pop());
-      if (!inNs(entry.profile, observationSource.get(id))) return send(res, 200, { inject_id: id, tracking_state: "tracking_unavailable", reason: "no_tracked_inject" });
+      if (!inNs(entry.profile, observationSource.get(id))) return send(res, 200, observationUnavailableBody(id));
     }
     if (!entry.profile && profileScope && clientProfiles && req.method === "POST" && url.pathname === "/api/sessions/register"
         && clientProfiles.some((p) => inNs(p, body && body.session_id))) {

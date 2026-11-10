@@ -2,6 +2,10 @@
 # Manual or called by release-check.yml (workflow_call; usable before this file is on the default branch).
 # Read-only token, no secrets, no login, no tag, no publish. See docs/ci.md.
 # GitHub runners do NOT establish the cross-host Mac/Linux live communication gate.
+# Issue #16 (review698 RB1): on Linux and macOS the S-R* profile rows (test/real-daemon-profile.test.js) are REQUIRED
+# (TELESESSION_TEST_REQUIRE_PROFILE_DAEMON=1): a missing, too-old or capability-less Telepty fails, never a NOTRUN pass.
+# macOS first rebuilds and verifies Telepty's Darwin authority reader with the unchanged test-install.yml command.
+# Windows runs the configured-mode refusal rows only; no cross-profile positive is claimed there.
 name: Compatibility
 
 on:
@@ -58,6 +62,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         node: ["20.20.0"]
+        # Node 26.13.0 alongside the supported Node 20 floor (added legs; the Node 20 legs are unchanged).
+        include:
+          - { os: ubuntu-latest, node: "26.13.0" }
+          - { os: macos-latest, node: "26.13.0" }
+          - { os: windows-latest, node: "26.13.0" }
     steps:
       - name: Re-check telepty_ref (defence in depth, before any checkout)
         shell: bash
@@ -98,6 +107,11 @@ jobs:
           if [ "$actual" != "$TELEPTY_REF" ]; then echo "::error::telepty HEAD $actual != requested $TELEPTY_REF"; exit 1; fi
           # Without daemon.js the real-daemon suites would only skip (NOTRUN); refuse instead.
           if [ ! -f telepty/daemon.js ]; then echo "::error::telepty/daemon.js missing at $actual"; exit 1; fi
+          # Issue #16: supported POSIX legs require the server side of client-profile-scope-v1 (S-R1 cannot skip).
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            if [ ! -f telepty/src/protocol/client-profiles.js ]; then echo "::error::telepty $actual has no src/protocol/client-profiles.js (client-profile-scope-v1)"; exit 1; fi
+            echo "TELESESSION_TEST_REQUIRE_PROFILE_DAEMON=1" >> "$GITHUB_ENV"
+          fi
           echo "telepty_sha=$actual" >> "$GITHUB_OUTPUT"
           COMPAT="$RUNNER_TEMP/compat"
           mkdir -p "$COMPAT/child-logs" "$COMPAT/npm-cache" "$COMPAT/pack" "$COMPAT/prefix"
@@ -151,14 +165,59 @@ jobs:
           npm rebuild node-pty --foreground-scripts 2>&1 | tee "$COMPAT/node-pty-rebuild.log"
           node -e 'require("node-pty"); console.log("node-pty loads")'
 
+      # Issue #16: a daemon configured with client profiles refuses to start on macOS without the bundled native
+      # authority reader, which is gitignored in Telepty. Same command as Telepty's maintained test-install.yml
+      # ("Build the bundled Darwin authority reader (task 1215)"), then Telepty's own native-reader test. The pre- and
+      # post-build hashes and whether the binary is tracked at this commit are recorded (provenance, not a skip).
+      # Review714 N4: the S-R1 rows below run against THIS runner-built reader. That is not proof of the final shipping
+      # binary; the canonical archive/native-consumer identity is a later, separate release proof.
+      - name: Build and verify Telepty's Darwin authority reader (unchanged test-install.yml command)
+        id: darwin_reader
+        if: ${{ !cancelled() && runner.os == 'macOS' && steps.tp_install.outcome == 'success' }}
+        shell: bash
+        working-directory: telepty
+        run: |
+          set -euo pipefail
+          BIN=src/principal/native/prebuilt/darwin/authority-darwin.node
+          PROV="$BIN.provenance.json"
+          h() { if [ -f "$1" ]; then shasum -a 256 "$1" | cut -d' ' -f1; else echo absent; fi; }
+          tracked() { if git ls-files --error-unmatch "$1" >/dev/null 2>&1; then echo yes; else echo no; fi; }
+          {
+            echo "telepty_sha=$(git rev-parse HEAD)"
+            echo "bin_tracked=$(tracked "$BIN") provenance_tracked=$(tracked "$PROV")"
+            echo "pre_build bin=$(h "$BIN") provenance=$(h "$PROV")"
+          } | tee "$COMPAT/darwin-reader.txt"
+          NODE_HEADERS="$(dirname "$(dirname "$(command -v node)")")/include/node"
+          node scripts/build-authority-darwin.mjs --cc "$(xcrun --find clang)" --sdk "$(xcrun --show-sdk-path)" --node-headers "$NODE_HEADERS"
+          echo "post_build bin=$(h "$BIN") provenance=$(h "$PROV")" | tee -a "$COMPAT/darwin-reader.txt"
+          node --require ./test-support/setup-env.js --test --test-reporter=tap test/authority-file-darwin-1215.test.js 2>&1 | tee "$COMPAT/darwin-reader.tap"
+
       - name: Full suite (npm test) against the exact Telepty tree
         id: full
-        if: ${{ !cancelled() && steps.ts_install.outcome == 'success' && steps.pty.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.ts_install.outcome == 'success' && steps.pty.outcome == 'success' && (runner.os != 'macOS' || steps.darwin_reader.outcome == 'success') }}
         shell: bash
         working-directory: telesession
         run: |
           set -euo pipefail
           npm test 2>&1 | tee "$COMPAT/full.tap"
+
+      # Issue #16 S-R1 release evidence, run on its own so the TAP names each required row. Fails unless every S-R*
+      # row ran and passed: zero skips, zero failures, and the S-R1 and S-R1b rows present as plain `ok` lines.
+      - name: Required S-R1 profile rows against the exact Telepty tree (Linux, macOS)
+        id: profile
+        if: ${{ !cancelled() && runner.os != 'Windows' && steps.ts_install.outcome == 'success' && steps.pty.outcome == 'success' && (runner.os != 'macOS' || steps.darwin_reader.outcome == 'success') }}
+        shell: bash
+        working-directory: telesession
+        run: |
+          set -euo pipefail
+          [ "${TELESESSION_TEST_REQUIRE_PROFILE_DAEMON:-}" = 1 ] || { echo "::error::TELESESSION_TEST_REQUIRE_PROFILE_DAEMON is not set"; exit 1; }
+          node --test --test-reporter=tap test/real-daemon-profile.test.js 2>&1 | tee "$COMPAT/profile.tap"
+          f="$COMPAT/profile.tap"
+          grep -Eq '^# skipped 0$' "$f" || { echo "::error::profile rows: a skip is not S-R1 evidence"; exit 1; }
+          grep -Eq '^# fail 0$' "$f" || { echo "::error::profile rows: failures"; exit 1; }
+          for row in 'S-R1 two profiles' 'S-R1b rotation'; do
+            grep -E "^ok [0-9]+ - $row" "$f" | grep -vq '# SKIP' || { echo "::error::required row '$row' did not run and pass"; exit 1; }
+          done
 
       - name: Package layout (test:pack)
         id: packtest
@@ -214,6 +273,8 @@ jobs:
           FULL: ${{ steps.full.outcome }}
           PACKTEST: ${{ steps.packtest.outcome }}
           INSTALLED: ${{ steps.installed.outcome }}
+          PROFILE: ${{ steps.profile.outcome }}
+          DARWIN_READER: ${{ steps.darwin_reader.outcome }}
         run: |
           set -uo pipefail
           COMPAT="${COMPAT:-$RUNNER_TEMP/compat}"
@@ -221,7 +282,7 @@ jobs:
           {
             echo "### compatibility: $RUNNER_OS / Node $(node --version)"
             [ -f "$COMPAT/provenance.json" ] && { echo '```json'; cat "$COMPAT/provenance.json"; echo '```'; }
-            for t in full pack-test; do
+            for t in full pack-test profile; do
               f="$COMPAT/$t.tap"
               echo "#### $t"
               if [ ! -s "$f" ]; then echo "- no TAP output (step not run or failed before output)"; continue; fi
@@ -231,6 +292,9 @@ jobs:
             done
             echo "#### outcomes"
             echo "- full: ${FULL:-not run}; test:pack: ${PACKTEST:-not run}; installed: ${INSTALLED:-not run (Windows: not part of this gate)}"
+            echo "- required S-R1 profile rows: ${PROFILE:-not run}; Darwin authority reader: ${DARWIN_READER:-not run}"
+            [ "$RUNNER_OS" = Windows ] && echo "- Windows: profile mode is refused there (configured-mode refusal rows only); S-R1 is NOT run and NOT claimed"
+            [ -f "$COMPAT/darwin-reader.txt" ] && { echo '```'; cat "$COMPAT/darwin-reader.txt"; echo '```'; }
             [ -f "$COMPAT/tarball.json" ] && { echo '```json'; cat "$COMPAT/tarball.json"; echo '```'; }
           } >> "$GITHUB_STEP_SUMMARY"
           for t in full pack-test; do
@@ -240,6 +304,10 @@ jobs:
               if [ "${pass:-0}" -eq 0 ]; then echo "::error::$t: no passing tests recorded"; status=1; fi
             fi
           done
+          # Issue #16: on Linux/macOS the required profile rows must have run and passed in this attempt.
+          if [ "$RUNNER_OS" != Windows ] && [ "${PROFILE:-}" != success ]; then
+            echo "::error::required S-R1 profile rows: ${PROFILE:-not run}"; status=1
+          fi
           # A real-daemon suite skipped for a missing Telepty tree is not compatibility evidence.
           if [ -s "$COMPAT/full.tap" ] && grep -q 'NOTRUN: telepty source not found' "$COMPAT/full.tap"; then
             echo "::error::full: real-daemon suites skipped (telepty source not found)"; status=1
@@ -255,6 +323,7 @@ jobs:
             ${{ runner.temp }}/compat/*.json
             ${{ runner.temp }}/compat/*.tap
             ${{ runner.temp }}/compat/*.log
+            ${{ runner.temp }}/compat/*.txt
             ${{ runner.temp }}/compat/child-logs/
             ${{ runner.temp }}/compat/pack/
           if-no-files-found: warn

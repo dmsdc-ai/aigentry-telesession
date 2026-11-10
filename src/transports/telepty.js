@@ -343,12 +343,23 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     relayIntervalMs: config && config.relayIntervalMs,
     profile: config && config.profile,
   });
-  // Issue #16: with a selected profile only GET /api/meta may run until the latest meta answer proved this
-  // profile's server enforcement (`caller`); anything else fails closed. `caller` = what that answer proved.
+  // Issue #16: with a selected profile only GET /api/meta may run until a server answer proved this profile's
+  // server enforcement; anything else fails closed. `gateVerified` = the request gate. Review698 CF3: only an
+  // authoritative answer changes it (a meta 200, verified or not, or a profile 401/403); a transport failure, timeout
+  // or other error of an unrelated concurrent read leaves it as it was. Review714 N1: an answer is applied only if its
+  // request was issued after the last applied one, so a delayed older answer never overwrites a newer one. Operations
+  // and health() decide and report on their OWN answer (readMeta().verified / .cred), never on this state.
   const required = cfg.profile === null ? REQUIRED_CAPABILITIES : [...REQUIRED_CAPABILITIES, PROFILE_CAPABILITY];
   const tokenGeneration = cfg.profile === null ? null : Number(cfg.token.split(".")[1]);
-  const caller = { verified: false, code: null, generation: null, sharedToken: null };
-  const client = createHttpClient(cfg, (method, p) => cfg.profile === null || caller.verified
+  let gateVerified = false;
+  let metaIssued = 0;
+  let gateAppliedSeq = 0;
+  function applyGate(seq, verified) {
+    if (seq <= gateAppliedSeq) return;
+    gateAppliedSeq = seq;
+    gateVerified = verified;
+  }
+  const client = createHttpClient(cfg, (method, p) => cfg.profile === null || gateVerified
     || (method === "GET" && p === "/api/meta"));
   function newInboxId() {
     let id;
@@ -1138,19 +1149,21 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
   }
 
   async function readMeta() {
+    const seq = ++metaIssued;
     const meta = await client.get("/api/meta", { timeoutMs: READ_TIMEOUT_MS });
     if (!meta.ok) {
       // Profile mode (review569 F6): a daemon without the feature, or a rejected/rotated token, answers 401/403;
       // 503 PROFILE_REGISTRY_UNAVAILABLE passes through. Never retried with another credential.
       const code = cfg.profile !== null && (meta.http_status === 401 || meta.http_status === 403) ? "PROFILE_CREDENTIAL_REJECTED" : meta.code;
-      Object.assign(caller, { verified: false, code, generation: null, sharedToken: null });
-      return { error: fail(code, { http_status: meta.http_status }) };
+      if (code === "PROFILE_CREDENTIAL_REJECTED") applyGate(seq, false);
+      return { error: fail(code, { http_status: meta.http_status }), cred: { verified: false, code, generation: null, sharedToken: null } };
     }
     const caps = Array.isArray(meta.body.capabilities) ? meta.body.capabilities : [];
     const missing = required.filter((c) => !caps.includes(c));
-    verifyCaller(meta.body.caller, missing);
+    const cred = verifyCaller(meta.body.caller, missing);
+    if (cfg.profile !== null) applyGate(seq, cred.verified);
     noteMeta(meta.body);
-    return { body: meta.body, missing };
+    return { body: meta.body, missing, verified: cred.verified, cred };
   }
 
   // Present only when a ledger was configured: ok (mode + counters) or unavailable with its open code.
@@ -1162,21 +1175,23 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
 
   // Issue #16: the server-computed `caller` must name exactly this profile, prefix and token generation, grant at
   // least every configured target, and state server enforcement without the shared token.
+  // Returns this answer's snapshot {verified, code, generation, sharedToken}; it changes no shared state.
   function verifyCaller(c, missing) {
     const plain = c !== null && typeof c === "object" && !Array.isArray(c);
-    caller.sharedToken = plain && typeof c.shared_token === "boolean" ? c.shared_token : null;
-    if (cfg.profile === null) { Object.assign(caller, { verified: false, code: null, generation: null }); return; }
+    const sharedToken = plain && typeof c.shared_token === "boolean" ? c.shared_token : null;
+    if (cfg.profile === null) return { verified: false, code: null, generation: null, sharedToken };
     const verified = missing.length === 0 && plain && c.kind === "client-profile" && c.profile === cfg.profile
       && c.inbox_prefix === cfg.inboxPrefix && Array.isArray(c.targets) && cfg.targets.every((t) => c.targets.includes(t))
       && c.enforcement === "server" && c.shared_token === false && Number.isSafeInteger(c.generation) && c.generation === tokenGeneration;
-    Object.assign(caller, {
-      verified, generation: verified ? c.generation : null,
+    return {
+      verified, generation: verified ? c.generation : null, sharedToken,
       code: verified ? null : missing.length ? "DAEMON_LACKS_CAPABILITY" : "PROFILE_NOT_ENFORCED",
-    });
+    };
   }
 
-  // health.credential: from the server's answer only (contract564 §4, review569 §3). Never a path, token or digest.
-  function credentialHealth() {
+  // health.credential: from the server's answer only (contract564 §4, review569 §3), and only from THIS call's answer
+  // (`caller` = its readMeta().cred). Never a path, token or digest.
+  function credentialHealth(caller) {
     if (cfg.profile === null) {
       return { credential: { mode: "shared-control", profile: null, server_enforced: false,
         shared_token_in_use: caller.sharedToken === null ? true : caller.sharedToken, generation: null } };
@@ -1194,13 +1209,13 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     const meta = await readMeta();
     if (meta.error) return meta.error;
     if (meta.missing.length) return fail("DAEMON_LACKS_CAPABILITY", { missing: meta.missing });
-    return caller.verified ? null : fail("PROFILE_NOT_ENFORCED");
+    return meta.verified ? null : fail("PROFILE_NOT_ENFORCED");
   }
 
   const health = guarded(async () => {
     if (store) flushHeld();
     const meta = await readMeta();
-    if (meta.error) return { ...meta.error, inbox: { id: S.inbox.id, state: inbox.fatal || inbox.state }, daemon_restart: daemonRestart(), ...storeHealth(), ...ledgerHealth(), ...credentialHealth() };
+    if (meta.error) return { ...meta.error, inbox: { id: S.inbox.id, state: inbox.fatal || inbox.state }, daemon_restart: daemonRestart(), ...storeHealth(), ...ledgerHealth(), ...credentialHealth(meta.cred) };
     const version = typeof meta.body.version === "string" && VERSION_RE.test(meta.body.version) ? meta.body.version : null;
     return ok({
       telepty: { version, capabilities_missing: meta.missing },
@@ -1208,7 +1223,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       daemon_restart: daemonRestart(),
       ...storeHealth(),
       ...ledgerHealth(),
-      ...credentialHealth(),
+      ...credentialHealth(meta.cred),
     });
   });
 
@@ -1281,7 +1296,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     const meta = await readMeta();
     if (meta.error) return meta.error;
     if (meta.missing.length) return fail("DAEMON_LACKS_CAPABILITY", { missing: meta.missing });
-    if (cfg.profile !== null && !caller.verified) return fail("PROFILE_NOT_ENFORCED", { accepted: false });
+    if (cfg.profile !== null && !meta.verified) return fail("PROFILE_NOT_ENFORCED", { accepted: false });
 
     const list = await client.get("/api/sessions", { timeoutMs: READ_TIMEOUT_MS });
     if (!list.ok) return fail(list.code, { http_status: list.http_status });

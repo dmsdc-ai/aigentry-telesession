@@ -144,6 +144,24 @@ test("S-C2 token must be a bare tpc1 token; the shared {authToken} form and othe
     (e) => e.code === "CONFIG_PROFILE_TOKEN_INVALID");
 });
 
+// review698 CF5: the token generation field matches the server's `tpc1\.[1-9][0-9]{0,15}\.` (generation >= 1).
+test("S-C2b token generation starts at 1: generation 0, a leading zero and bad shapes are refused", { skip: !POSIX && "NOTRUN: win32" }, (t) => {
+  const s = profileSandbox(t);
+  const tf = s.profiles["asst-a"].token_file;
+  const tail = randomBytes(32).toString("base64url");
+  for (const text of [`tpc1.0.${tail}`, `tpc1.00.${tail}`, `tpc1.01.${tail}`, `tpc1.007.${tail}`, `tpc1.${"1".repeat(17)}.${tail}`,
+    `tpc1.-1.${tail}`, `tpc1.+1.${tail}`, `tpc1.1e3.${tail}`, `tpc1..${tail}`, `tpc1.1.${tail}=`, `tpc1.1.${tail.slice(1)}`, `TPC1.1.${tail}`]) {
+    writePrivate(tf, text);
+    refuses(() => loadConfig(s.env("asst-a")), "CONFIG_PROFILE_TOKEN_INVALID");
+    assert.throws(() => normalizeConfig({ teleptyUrl: URL_, token: text, targets: ["o"], inboxPrefix: "ts", stateDir: "/tmp/x", profile: "asst-a" }),
+      (e) => e.code === "CONFIG_PROFILE_TOKEN_INVALID", text.slice(0, 12));
+  }
+  for (const gen of ["1", "9", "10", "1234567890123456"]) {
+    writePrivate(tf, `tpc1.${gen}.${tail}`);
+    assert.equal(loadConfig(s.env("asst-a")).token, `tpc1.${gen}.${tail}`, gen);
+  }
+});
+
 test("S-C3 profiles file and token file: symlink, group/other mode, hardlink (nlink>1), oversize, non-regular are refused", { skip: !POSIX && "NOTRUN: win32" }, (t) => {
   const s = profileSandbox(t);
   const real = s.file;

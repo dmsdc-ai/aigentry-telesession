@@ -23,8 +23,9 @@ const RELAY_INTERVAL_MAX_MS = 3600000;
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const PROFILES_SCHEMA = "telesession.profiles/v1";
 const PRIVATE_FILE_MAX = 64 * 1024;
-// Profile credential: `tpc1.<generation>.<43 base64url>`; only the bare token is accepted.
-export const PROFILE_TOKEN_RE = /^tpc1\.(0|[1-9]\d{0,15})\.[A-Za-z0-9_-]{43}$/;
+// Profile credential: `tpc1.<generation>.<43 base64url>`; only the bare token is accepted. Generation >= 1 with no
+// leading zero, exactly the server's TOKEN_RE (review698 CF5).
+export const PROFILE_TOKEN_RE = /^tpc1\.[1-9]\d{0,15}\.[A-Za-z0-9_-]{43}$/;
 const PROFILE_REQUIRED_KEYS = Object.freeze(["inbox_prefix", "state_dir", "targets", "token_file"]);
 const PROFILE_OPTIONAL_KEYS = Object.freeze(["persist_inbox_credential"]);
 // Legacy credential/target/prefix/state/persist/URL keys: in profile mode the profiles file is their only
