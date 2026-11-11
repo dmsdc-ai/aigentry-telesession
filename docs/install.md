@@ -75,6 +75,20 @@ request metadata, not prompt text or the daemon token. POSIX-only optional inbox
 credential persistence is separate; native Windows credential persistence is not
 supported. Abrupt-crash locks are not automatically removed or taken over.
 
+## Assistant profiles (optional, issue #16)
+
+Several assistants can each use their own Telepty client credential on one host. The prerequisite is a
+Telepty build with `client-profile-scope-v1` (≥ 0.11.0), where the operator has configured the daemon's
+client profiles and minted one `tpc1.<generation>.` token file per profile (generation 1 or higher). Set only `TELESESSION_PROFILE` and
+`TELESESSION_PROFILES_FILE`; all other credential, target, prefix, state, persist and URL variables must stay
+unset. The profiles file and token files must be private (`0600`, owned by you, single link, not a symlink).
+See README "Assistant profiles". Not supported on native Windows. `telesession_health` → `credential` shows
+whether the server enforces the profile. `PROFILE_CREDENTIAL_REJECTED` means the daemon did not accept the
+client credential (old daemon, feature off, rotated or revoked token); nothing was sent. Different OS users are
+still the only protection against a same-user process reading another profile's token file. A non-empty
+`AIGENTRY_ORCHESTRATOR_SIDS` only narrows a profile's targets on the client; the Telepty server's grant is the
+enforcement.
+
 ## Diagnose before sending
 
 The client should expose exactly six tools: `telesession_health`,

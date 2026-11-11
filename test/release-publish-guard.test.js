@@ -232,8 +232,8 @@ test("publish.yml: tag-only trigger, OIDC on the publish job only, no tokens, no
   // No npm pack in this workflow: the tarball is the Ubuntu compatibility leg's tested artifact of this run.
   assert.doesNotMatch(code, /^\s*(?:\S+=\S+ )*npm pack\b/m);
   const packJob = code.slice(code.indexOf("\n  pack:\n"), code.indexOf("\n  registry-state:\n"));
-  assert.match(packJob, /name: tested-compatibility-ubuntu-latest-node-20\.20\.0-telepty-556a4ba3bcbdbcd42d2cca1bdf14a0f3cef7e421\n/);
-  assert.match(packJob, /COMPAT_ARTIFACT: tested-compatibility-ubuntu-latest-node-20\.20\.0-telepty-556a4ba3bcbdbcd42d2cca1bdf14a0f3cef7e421\n/);
+  assert.match(packJob, /name: tested-compatibility-ubuntu-latest-node-20\.20\.0-telepty-6eebf71a574551cfa5c35fc3d017b45d6b94b029\n/);
+  assert.match(packJob, /COMPAT_ARTIFACT: tested-compatibility-ubuntu-latest-node-20\.20\.0-telepty-6eebf71a574551cfa5c35fc3d017b45d6b94b029\n/);
   assert.doesNotMatch(code, /name: compatibility-/);
   assert.match(packJob, /publish-guard\.mjs select-compat /);
   assert.doesNotMatch(code, /run-id:|github-token:|repository: /);
@@ -241,7 +241,7 @@ test("publish.yml: tag-only trigger, OIDC on the publish job only, no tokens, no
   assert.doesNotMatch(code, /24\.11\.0/);
   assert.equal((code.match(/^\s*(?:npm_config_userconfig="[^"]*" \\\n\s*)?npm publish /gm) || []).length, 1);
   assert.match(code, /npm publish "\$RUNNER_TEMP\/release\/pkg\/\$FILENAME" --access public/);
-  assert.match(code, /TELEPTY_SHA: 556a4ba3bcbdbcd42d2cca1bdf14a0f3cef7e421/);
+  assert.match(code, /TELEPTY_SHA: 6eebf71a574551cfa5c35fc3d017b45d6b94b029/);
   assert.match(code, /uses: \.\/\.github\/workflows\/ci\.yml/);
   assert.match(code, /uses: \.\/\.github\/workflows\/compatibility\.yml/);
   assert.match(publishJob, /if: \$\{\{ needs\.registry-state\.outputs\.decision == 'publish' \}\}/);
@@ -279,4 +279,38 @@ test("compatibility.yml: tested artifact only after all Ubuntu gates passed; dia
   const expected = `tested-compatibility-ubuntu-latest-node-20.20.0-telepty-${pin}`;
   assert.equal((p.match(/name: (\S*compatibility-\S+)/g) || []).join("|"), `name: ${expected}`);
   assert.ok(/node: \["20\.20\.0"\]/.test(code) && /ubuntu-latest/.test(code));
+});
+
+// review714 B1/N5: the required profile step must match the summary lines Node's TAP reporter really prints
+// (`# fail N`, `# skipped N`; there is no `# skip N` line), so a fully passing run is green and a skip or failure is
+// red; and release-check.yml must pin the same immutable Telepty commit as publish.yml.
+test("compatibility.yml profile step: Node TAP summary grammar (fail 0, skipped 0) and required S-R1/S-R1b rows; release-check pin = publish pin", () => {
+  const y = fs.readFileSync(path.join(ROOT, ".github/workflows/compatibility.yml"), "utf8");
+  const code = y.split(/\r?\n/).filter((l) => !/^\s*#/.test(l)).join("\n");
+  const steps = code.split(/\n(?=      - )/);
+  const profile = steps.filter((st) => /\n        id: profile\n/.test(st));
+  assert.equal(profile.length, 1, "exactly one required profile step");
+  const st = profile[0];
+  assert.match(st, /\[ "\$\{TELESESSION_TEST_REQUIRE_PROFILE_DAEMON:-\}" = 1 \] \|\| \{ [^\n]*exit 1; \}/);
+  assert.match(st, /node --test --test-reporter=tap test\/real-daemon-profile\.test\.js 2>&1 \| tee "\$COMPAT\/profile\.tap"/);
+  const patterns = [...st.matchAll(/grep -Eq '([^']+)' "\$f" \|\| \{ [^\n]*exit 1; \}/g)].map((m) => new RegExp(m[1], "m"));
+  assert.equal(patterns.length, 2, "one summary check for failures and one for skips");
+  // Node's TAP trailer as the reporter prints it (node:test `reporter.diagnostic` → `# <msg>`).
+  const trailer = (fail, skipped) =>
+    `# tests 3\n# suites 0\n# pass ${3 - fail - skipped}\n# fail ${fail}\n# cancelled 0\n# skipped ${skipped}\n# todo 0\n# duration_ms 1234.5\n`;
+  for (const re of patterns) assert.ok(re.test(trailer(0, 0)), `${re} matches a fully passing Node TAP summary`);
+  assert.ok(patterns.some((re) => !re.test(trailer(0, 1))), "a skipped row fails the step");
+  assert.ok(patterns.some((re) => !re.test(trailer(1, 0))), "a failed row fails the step");
+  assert.deepEqual(patterns.map((re) => re.source).sort(), ["^# fail 0$", "^# skipped 0$"]);
+  assert.match(st, /for row in 'S-R1 two profiles' 'S-R1b rotation'; do\n\s+grep -E "\^ok \[0-9\]\+ - \$row" "\$f" \| grep -vq '# SKIP' \|\| \{ [^\n]*exit 1; \}\n\s+done/);
+  // N5: one immutable Telepty pin for release-check and publish.
+  const rc = fs.readFileSync(path.join(ROOT, ".github/workflows/release-check.yml"), "utf8");
+  const p = fs.readFileSync(path.join(ROOT, ".github/workflows/publish.yml"), "utf8");
+  const rcPins = [...rc.matchAll(/^  PINNED_TELEPTY_SHA: (\S+)$/gm)].map((m) => m[1]);
+  const pPins = [...p.matchAll(/^  TELEPTY_SHA: (\S+)$/gm)].map((m) => m[1]);
+  assert.equal(rcPins.length, 1);
+  assert.equal(pPins.length, 1);
+  assert.match(rcPins[0], /^[0-9a-f]{40}$/);
+  assert.equal(rcPins[0], pPins[0], "release-check.yml PINNED_TELEPTY_SHA equals publish.yml TELEPTY_SHA");
+  assert.equal(rcPins[0], "6eebf71a574551cfa5c35fc3d017b45d6b94b029");
 });

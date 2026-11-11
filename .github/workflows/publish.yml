@@ -20,8 +20,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # dmsdc-ai/aigentry-telepty tag v0.10.0 (package version 0.10.0), the shipped supported Telepty release.
-  TELEPTY_SHA: 556a4ba3bcbdbcd42d2cca1bdf14a0f3cef7e421
+  # Issue #16 / 0.3.0 candidate: dmsdc-ai/aigentry-telepty server candidate commit 6eebf71a (tree 2307c1a3…,
+  # client-profile-scope-v1), the current immutable CI/release candidate anchor. Full server CI and security are still
+  # pending; publication NOT_APPROVED. A later server fix means a new exact SHA here and in release-check.yml, never a
+  # branch or "latest". Replaces 556a4ba3 (v0.10.0, no profile scope: S-R1 skipped), the provisional 1d70d803 and 234fcf6b.
+  TELEPTY_SHA: 6eebf71a574551cfa5c35fc3d017b45d6b94b029
 
 jobs:
   identity:
@@ -125,7 +128,7 @@ jobs:
       # earlier attempt of the same run; the guard checks run id/attempt.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: tested-compatibility-ubuntu-latest-node-20.20.0-telepty-556a4ba3bcbdbcd42d2cca1bdf14a0f3cef7e421
+          name: tested-compatibility-ubuntu-latest-node-20.20.0-telepty-6eebf71a574551cfa5c35fc3d017b45d6b94b029
           path: ${{ runner.temp }}/compat-ubuntu
 
       # Fails closed unless provenance (source/ref/version/run/matrix/Telepty pin), filename and digest metadata
@@ -135,7 +138,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ needs.identity.outputs.version }}
-          COMPAT_ARTIFACT: tested-compatibility-ubuntu-latest-node-20.20.0-telepty-556a4ba3bcbdbcd42d2cca1bdf14a0f3cef7e421
+          COMPAT_ARTIFACT: tested-compatibility-ubuntu-latest-node-20.20.0-telepty-6eebf71a574551cfa5c35fc3d017b45d6b94b029
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/release"

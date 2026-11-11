@@ -1,13 +1,15 @@
 # Release verification gate. Runs the reusable CI first; nothing below runs unless it passes.
-# An optional telepty_ref (manual runs) also runs compatibility.yml against that exact Telepty commit
-# before the gate. It creates no release, publishes nothing to npm and deploys nothing. See docs/ci.md.
+# compatibility.yml always runs before the gate: against telepty_ref when a manual run supplies one, otherwise (tag
+# pushes, empty input) against the pinned PINNED_TELEPTY_SHA below. Issue #16 (review698 RB1): its Linux/macOS legs
+# require the S-R1 profile rows, so a release check can never pass on a skipped S-R1. It creates no release,
+# publishes nothing to npm and deploys nothing. See docs/ci.md.
 name: Release check
 
 on:
   workflow_dispatch:
     inputs:
       telepty_ref:
-        description: "Optional dmsdc-ai/aigentry-telepty commit (exactly 40 lowercase hex). Set: compatibility.yml must pass against it. Empty: compatibility NOT requested and NOT established."
+        description: "Optional dmsdc-ai/aigentry-telepty commit (exactly 40 lowercase hex). Set: compatibility.yml must pass against it. Empty: it must pass against the pinned PINNED_TELEPTY_SHA."
         required: false
         type: string
         default: ""
@@ -16,6 +18,12 @@ on:
 
 permissions:
   contents: read
+
+env:
+  # Same commit as publish.yml TELEPTY_SHA: dmsdc-ai/aigentry-telepty server candidate commit 6eebf71a (tree 2307c1a3…,
+  # client-profile-scope-v1), the current immutable CI/release candidate anchor. Full server CI and security pending;
+  # publication NOT_APPROVED. A later server fix means a new exact SHA in both files. Never a branch, tag name or "latest".
+  PINNED_TELEPTY_SHA: 6eebf71a574551cfa5c35fc3d017b45d6b94b029
 
 concurrency:
   group: release-check-${{ github.ref }}
@@ -27,7 +35,7 @@ jobs:
     permissions:
       contents: read
 
-  # Empty (always on tag pushes) = not requested. Anything else must be a 40-hex SHA or the run fails.
+  # Empty (always on tag pushes) = the pinned commit. Anything else must be a 40-hex SHA or the run fails.
   compat-request:
     name: compatibility request
     runs-on: ubuntu-latest
@@ -44,9 +52,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$TELEPTY_REF" ]; then
-            echo "requested=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::telepty_ref not supplied: Telepty compatibility is NOT requested and NOT established by this run"
-          elif [[ "$TELEPTY_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            TELEPTY_REF="$PINNED_TELEPTY_SHA"
+            echo "::notice::telepty_ref not supplied: compatibility runs against the pinned Telepty commit $TELEPTY_REF (CI/release candidate anchor; publication NOT_APPROVED)"
+          fi
+          if [[ "$TELEPTY_REF" =~ ^[0-9a-f]{40}$ ]]; then
             { echo "requested=true"; echo "telepty_ref=$TELEPTY_REF"; } >> "$GITHUB_OUTPUT"
           else
             echo "::error::telepty_ref must be empty or exactly 40 lowercase hex characters (immutable commit SHA)"
@@ -89,7 +98,7 @@ jobs:
               [ "$COMPAT_SHA" = "$REQUESTED_REF" ] || { echo "::error::compatibility verified '$COMPAT_SHA', requested '$REQUESTED_REF'"; exit 1; }
               ;;
             false)
-              [ "$COMPAT_RESULT" = skipped ] || { echo "::error::compatibility ran without a request: $COMPAT_RESULT"; exit 1; }
+              echo "::error::compatibility (with the required S-R1 profile rows) is mandatory for a release check"; exit 1
               ;;
             *) echo "::error::compatibility request state unknown"; exit 1 ;;
           esac
@@ -129,11 +138,9 @@ jobs:
             echo "### release check: verification passed"
             echo "- CI unit matrix (ubuntu/macos/windows, Node 20.20.0): passed"
             echo "- npm pack --dry-run: passed (file layout only; it does not publish and does not imply publication readiness or authorization)"
-            if [ "$REQUESTED" = true ]; then
-              echo "- Telepty compatibility (compatibility.yml, ubuntu/macos/windows): passed against dmsdc-ai/aigentry-telepty@$COMPAT_SHA on GitHub runners only"
-            else
-              echo "- Telepty compatibility: NOT REQUESTED, NOT RUN and NOT established (no telepty_ref). Not proven here: real telepty daemon, Dot/꼬마 connection, native PTY, restart/recovery."
-            fi
+            echo "- Telepty compatibility (compatibility.yml, ubuntu/macos/windows, Node 20.20.0 and 26.13.0): passed against dmsdc-ai/aigentry-telepty@$COMPAT_SHA on GitHub runners only"
+            echo "- Issue #16 S-R1/S-R1b profile rows: required and passed on Linux and macOS against that commit; Windows: configured-mode refusal only (no cross-profile claim)"
+            [ "$COMPAT_SHA" = "$PINNED_TELEPTY_SHA" ] && echo "- Telepty commit is the pinned CI/release candidate anchor; publication is NOT_APPROVED by this result"
             echo "- NOT released: no GitHub release, npm publish or deployment was performed by this workflow. This result authorizes no tag or publication."
             echo "- Still required before publication: the cross-host Mac/Linux live communication gate (before Telepty publication). See docs/ci.md."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -25,7 +25,8 @@ give the control-plane key only as a `file:` reference (`control_plane.api_key: 
 | Forwarded when present | Notes |
 |---|---|
 | `TELESESSION_TELEPTY_URL`, `TELESESSION_TARGETS`, `TELESESSION_INBOX_PREFIX`, `TELESESSION_STATE_DIR`, `TELESESSION_PERSIST_INBOX_CREDENTIAL` | Values are forwarded unchanged. `src/config.js` in the child remains the final validator. |
-| `TELESESSION_TELEPTY_TOKEN_FILE` | **Required**: nonempty and absolute by the target platform's `path.isAbsolute` (same check as `src/config.js`). Spaces and non-ASCII (e.g. Korean) are fine, because the path travels as an env value and never through argv. |
+| `TELESESSION_PROFILE`, `TELESESSION_PROFILES_FILE`, `AIGENTRY_ORCHESTRATOR_SIDS` | Issue #16 profile selection (Telepty `client-profile-scope-v1`), forwarded unchanged. With a profile, `TELESESSION_TELEPTY_TOKEN_FILE` must be absent (`TUNNEL_CHILD_PROFILE_CONFLICT`). The profiles file is validated before spawn, with the config code as the refusal code: for example, a forwarded `TELESESSION_TELEPTY_URL` gives `CONFIG_PROFILE_CONFLICT` and native Windows gives `CONFIG_PROFILE_PLATFORM_UNSUPPORTED`. |
+| `TELESESSION_TELEPTY_TOKEN_FILE` | **Required** unless a profile is selected: nonempty and absolute by the target platform's `path.isAbsolute` (same check as `src/config.js`). Spaces and non-ASCII (e.g. Korean) are fine, because the path travels as an env value and never through argv. |
 | win32 only: `SystemRoot`, `WINDIR`, `TEMP`, `TMP` | Platform essentials. |
 | POSIX only: `TMPDIR`, `LANG`, `LC_ALL` | Optional. |
 
