@@ -264,3 +264,35 @@ the 503 is dead-lettered as `unknown` without retry. Minimum follow-up: per-reas
   evidence. Only `test/real-daemon-profile.test.js` (S-R1, S-R1b) on a real build is. With
   `TELESESSION_TEST_REQUIRE_PROFILE_DAEMON=1` (set by the Linux/macOS compatibility legs) a missing, older than
   0.11.0 or capability-less Telepty fails those rows instead of skipping them.
+
+## 10. Reply capability in 0.4.0
+
+Set `TELESESSION_REPLY_CAPABILITY=on` to request the optional `reply-capability-v1` capability.
+It defaults to `off`. Other values produce `CONFIG_REPLY_CAPABILITY_INVALID`. The JS
+`normalizeConfig` option `replyCapability` accepts the same values. The feature requires
+Telepty 0.12.0 or newer and the advertised capability in `GET /api/meta`. (I4)
+
+A fresh send requests `reply_capability` only when enabled and advertised. The request
+object has `v: 1`, `not_after_ms` equal to the request's existing expiry, and
+`reply_prefix` equal to `REPLY <nonce>` followed by a newline. The responder can use
+Telepty's `reply-v1` command supplied with the delivered request. (I3, I4, D1)
+
+With the switch off, `send` omits the field and retains its previous serialized result.
+Deduplicated results also omit the field. A fresh accepted or uncertain result with the
+switch on adds one field, `reply_capability`. Its value is `"unsupported"` if the daemon
+did not advertise, the mint metadata if minted, or `"not_minted"` when advertised but
+valid mint metadata was unavailable. The metadata is
+`{ v: 1, id, not_after_ms, responder: { session_id, epoch, generation } }`. A successful
+mint supplies the responder epoch directly. If there is no mint on a successful send, the
+client still checks the existing inject observation. (I4)
+
+A definitive mint refusal follows the ordinary refusal path and is never resent.
+An error with `delivery_uncertain: true` retains `accepted: "unknown"` and is never
+resent. The client uses the existing request fields to record the inbound inject ID
+and responder epoch only when the ID and mint metadata all validate. The mint metadata
+is available on the fresh result. There is no new durable state. (I4)
+
+On both live and late replies, an otherwise eligible audit row carrying `sender_proof`
+must name the request's inbound inject ID in `reply_to_inject_id`. A foreign or missing
+binding is untrusted (`capability_mismatch`). Rows without `sender_proof` retain the
+previous classification. Claimed-only replies remain quarantined. (I3, I7)

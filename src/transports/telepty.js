@@ -26,6 +26,8 @@ export const REQUIRED_CAPABILITIES = Object.freeze(["inject-exact-target", "regi
 // in addition, and the server-computed meta `caller` must prove THIS profile before any own operation.
 export const PROFILE_CAPABILITY = "client-profile-scope-v1";
 
+const REPLY_CAPABILITY = "reply-capability-v1";
+const REPLY_CAPABILITY_ID_RE = /^[A-Za-z0-9_-]{22}$/;
 const SID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const NONCE_RE = /^[0-9a-f]{32}$/;
@@ -56,6 +58,24 @@ const CANDIDATES_MAX = 4;            // per durable record (state schema v1)
 const RECEIVED_MAX = 1024;
 const PROBE_BEFORE_MS = 2000;
 const PROBE_AFTER_MS = 12000;
+
+function readReplyCapabilityMint(body, notAfterMs) {
+  const cap = body.reply_capability;
+  const responder = cap?.responder;
+  if (cap?.v !== 1 || typeof cap.id !== "string" || !REPLY_CAPABILITY_ID_RE.test(cap.id)
+      || cap.not_after_ms !== notAfterMs || typeof body.inject_id !== "string" || !INJECT_ID_RE.test(body.inject_id)
+      || typeof responder?.session_id !== "string" || !SID_RE.test(responder.session_id)
+      || typeof responder.epoch !== "string" || responder.epoch.length < 1 || responder.epoch.length > 256
+      || /[\x00-\x1f\x7f]/.test(responder.epoch)
+      || !Number.isSafeInteger(responder.generation) || responder.generation < 1) return null;
+  return {
+    injectId: body.inject_id,
+    metadata: {
+      v: 1, id: cap.id, not_after_ms: notAfterMs,
+      responder: { session_id: responder.session_id, epoch: responder.epoch, generation: responder.generation },
+    },
+  };
+}
 
 // ── HTTP client ──
 // One AbortSignal covers headers and body. Errors are sanitized to a code; daemon text, URLs and
@@ -129,7 +149,12 @@ function createHttpClient(cfg, allowed = () => true) {
       // existing uncertain/no-resend state without changing registration/delete.
       const injectUnknown = method === "POST" && /^\/api\/sessions\/[^/]+\/inject$/.test(path)
         && (res.status >= 500 || parsed?.delivery_uncertain === true);
-      return { ok: false, http_status: res.status, code, sent: code === "DELIVERY_UNCERTAIN" || injectUnknown ? "unknown" : "yes" };
+      const mint = injectUnknown && parsed?.delivery_uncertain === true && body?.reply_capability
+        ? readReplyCapabilityMint(parsed, body.reply_capability.not_after_ms) : null;
+      return {
+        ok: false, http_status: res.status, code, sent: code === "DELIVERY_UNCERTAIN" || injectUnknown ? "unknown" : "yes",
+        ...(mint ? { mint } : {}),
+      };
     }
     if (parsed === null || typeof parsed !== "object") {
       return { ok: false, http_status: res.status, code: "DAEMON_BAD_RESPONSE", sent: "unknown" };
@@ -277,6 +302,14 @@ export function classifyAuditRows(rows, candidate, issued, ctx) {
   return { trusted: true, row };
 }
 
+function checkReplyCapabilityBinding(verdict, inboundInjectId) {
+  if (verdict.trusted && Object.hasOwn(verdict.row, "sender_proof")
+      && (inboundInjectId == null || verdict.row.reply_to_inject_id !== inboundInjectId)) {
+    return { trusted: false, reason: "capability_mismatch" };
+  }
+  return verdict;
+}
+
 export function mapReceipt(body) {
   const b = body || {};
   const trackingState = typeof b.tracking_state === "string" ? b.tracking_state : "unknown";
@@ -342,6 +375,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     persistInboxCredential: config && config.persistInboxCredential,
     relayIntervalMs: config && config.relayIntervalMs,
     profile: config && config.profile,
+    replyCapability: config?.replyCapability,
   });
   // Issue #16: with a selected profile only GET /api/meta may run until a server answer proved this profile's
   // server enforcement; anything else fails closed. `gateVerified` = the request gate. Review698 CF3: only an
@@ -906,7 +940,10 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
         answered: !tracks(rec.nonce) && (rec.state === "answered" || answered.has(c.key)),
       };
       const verdict = audit.ok
-        ? classifyAuditRows(rows, c, issued, { inboxId: S.inbox.id, boundInjectIds: bound, complete: audit.complete })
+        ? checkReplyCapabilityBinding(
+          classifyAuditRows(rows, c, issued, { inboxId: S.inbox.id, boundInjectIds: bound, complete: audit.complete }),
+          rec.inject_id,
+        )
         : { pending: true, reason: "audit_unavailable" };
       const p = paceOf(rec, c);
       if (verdict.pending && p.attempt < AUDIT_BACKOFF_MS.length) {
@@ -1046,7 +1083,10 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
         sent_at: x.created_ms, expires_at: x.retain_until_ms, answered: false,
       };
       const verdict = audit.ok
-        ? classifyAuditRows(rows, x, issued, { inboxId: S.inbox.id, boundInjectIds: bound, complete: audit.complete })
+        ? checkReplyCapabilityBinding(
+          classifyAuditRows(rows, x, issued, { inboxId: S.inbox.id, boundInjectIds: bound, complete: audit.complete }),
+          byNonce(x.nonce)?.inject_id,
+        )
         : { pending: true, reason: "audit_unavailable" };
       if (verdict.pending && p.attempt < AUDIT_BACKOFF_MS.length) {
         p.nextAuditAt = Date.now() + AUDIT_BACKOFF_MS[p.attempt];
@@ -1107,10 +1147,13 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
 
   // A prior record (dedupe hit). Zero telepty requests; `accepted` is never delivery or completion.
   function recordView(rec) {
+    const deliveryUnknown = rec.uncertain_reason === "no_response" && rec.recovery !== "audit_verified_match"
+      && rec.state !== "answered";
+    const injectId = deliveryUnknown ? null : rec.inject_id;
     return {
-      inject_id: rec.inject_id, target: rec.target, nonce: rec.nonce, reply_to: rec.reply_to,
+      inject_id: injectId, target: rec.target, nonce: rec.nonce, reply_to: rec.reply_to,
       correlation_id: (tracks(rec.nonce) && ledger.record(rec.nonce).correlation_id) || null,
-      accepted: rec.state === "refused" ? false : rec.inject_id !== null ? true : "unknown",
+      accepted: rec.state === "refused" ? false : injectId !== null ? true : "unknown",
       delivery: "unknown", target_epoch_known: rec.target_epoch !== null,
       reply: rec.state === "answered" ? "trusted" : "not_observed",
       durability: durability(), daemon_restart: daemonRestart(),
@@ -1163,7 +1206,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     const cred = verifyCaller(meta.body.caller, missing);
     if (cfg.profile !== null) applyGate(seq, cred.verified);
     noteMeta(meta.body);
-    return { body: meta.body, missing, verified: cred.verified, cred };
+    return { body: meta.body, missing, verified: cred.verified, cred, replyCapability: caps.includes(REPLY_CAPABILITY) };
   }
 
   // Present only when a ledger was configured: ok (mode + counters) or unavailable with its open code.
@@ -1318,11 +1361,15 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     const bearer = inbox.bearer;
     const wire = `[telesession nonce=${nonce} reply-to=${inboxId} correlation=${correlationId}]\n` + text;
     const sentAt = Date.now();
+    const expiresAt = sentAt + ISSUED_TTL_MS;
+    const capabilityEnabled = cfg.replyCapability === "on";
+    const capabilityRequest = capabilityEnabled && meta.replyCapability
+      ? { v: 1, not_after_ms: expiresAt, reply_prefix: "REPLY " + nonce + "\n" } : null;
     const rkey = key === null ? `n:${nonce}` : key;
     const fresh = () => ({
       request_id: requestId, target, body_sha256: bodySha, body_len: Buffer.byteLength(text, "utf8"), nonce,
       reply_to: inboxId, state: "reserved", inject_id: null, target_epoch: null,
-      created_at: sentAt, sent_at: sentAt, expires_at: sentAt + ISSUED_TTL_MS, retain_until: sentAt + ISSUED_TTL_MS + STORE_LIMITS.retainMs,
+      created_at: sentAt, sent_at: sentAt, expires_at: expiresAt, retain_until: expiresAt + STORE_LIMITS.retainMs,
       error_code: null, http_status: null, uncertain_reason: null, recovery: null, route_interrupted: false,
       reply: { candidates: [], trusted: null }, quarantined: {},
       payload_sha256: sha256hex(wire), sender_inbox_id: inboxId,
@@ -1334,8 +1381,14 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
 
     const r = await client.post(`/api/sessions/${encodeURIComponent(target)}/inject`, {
       prompt: wire, from: inboxId, reply_to: inboxId, exact_target: true,
+      ...(capabilityRequest ? { reply_capability: capabilityRequest } : {}),
     }, { sessionToken: bearer, timeoutMs: WRITE_TIMEOUT_MS });
     const settle = (fields) => persistOrHold((d) => { const q = d.requests[rkey]; if (q) Object.assign(q, fields); });
+    const parsedMint = capabilityRequest ? (r.ok ? readReplyCapabilityMint(r.body, expiresAt) : r.mint) : null;
+    const mint = parsedMint?.metadata.responder.session_id === target ? parsedMint : null;
+    const capabilityResult = capabilityEnabled
+      ? { reply_capability: mint?.metadata ?? (capabilityRequest ? "not_minted" : "unsupported") } : {};
+    const mintBinding = mint ? { inject_id: mint.injectId, target_epoch: mint.metadata.responder.epoch } : {};
 
     if (!r.ok && (r.sent === "yes" || r.sent === "no")) {
       settle({ state: "refused", error_code: r.code, http_status: r.http_status ?? null });
@@ -1344,10 +1397,10 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
     }
     if (!r.ok) {
       // No definitive outcome: the bytes may or may not have been accepted. Never re-sent.
-      settle({ state: "uncertain", uncertain_reason: "no_response", error_code: r.code });
+      settle({ state: "uncertain", uncertain_reason: "no_response", error_code: r.code, ...mintBinding });
       return ok({
         accepted: "unknown", inject_id: null, target, nonce, correlation_id: correlationId, delivery: "unknown", reason: r.code, reply: "not_observed",
-        durability: durability(), daemon_restart: daemonRestart(), ...addedFields(S.requests[rkey], false),
+        durability: durability(), daemon_restart: daemonRestart(), ...addedFields(S.requests[rkey], false), ...capabilityResult,
       });
     }
     const b = r.body;
@@ -1356,11 +1409,13 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       settle({ state: "uncertain", uncertain_reason: "exact_routing_unconfirmed" });
       return fail("EXACT_ROUTING_UNCONFIRMED", { accepted: "unknown", nonce });
     }
-    settle({ state: "accepted", inject_id: b.inject_id });
-    const obs = await client.get(`/api/inject-observations/${encodeURIComponent(b.inject_id)}`, { timeoutMs: READ_TIMEOUT_MS });
-    if (obs.ok && obs.body.inject_id === b.inject_id && obs.body.session_id === target
-        && typeof obs.body.session_epoch === "string" && obs.body.session_epoch) {
-      settle({ target_epoch: obs.body.session_epoch });
+    settle({ state: "accepted", inject_id: b.inject_id, ...mintBinding });
+    if (!mint) {
+      const obs = await client.get(`/api/inject-observations/${encodeURIComponent(b.inject_id)}`, { timeoutMs: READ_TIMEOUT_MS });
+      if (obs.ok && obs.body.inject_id === b.inject_id && obs.body.session_id === target
+          && typeof obs.body.session_epoch === "string" && obs.body.session_epoch) {
+        settle({ target_epoch: obs.body.session_epoch });
+      }
     }
     const rec = S.requests[rkey];
     if (ledger) openLedgerRecord(rec, destination, correlationId, reservation);
@@ -1368,7 +1423,7 @@ export function createTeleptyTransport(config, storeOptions, extensions) {
       inject_id: b.inject_id, target, nonce, correlation_id: correlationId, reply_to: inboxId, accepted: true,
       delivery: b.bootstrap_queued === true ? "queued" : "unknown",
       target_epoch_known: rec.target_epoch !== null, reply: "not_observed",
-      durability: durability(), daemon_restart: daemonRestart(), ...addedFields(rec, false),
+      durability: durability(), daemon_restart: daemonRestart(), ...addedFields(rec, false), ...capabilityResult,
     });
   }
 

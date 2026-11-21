@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0 — unreleased
+
+- Added the opt-in reply capability for Telepty 0.12.0. A responder can use the `telepty reply-v1`
+  command supplied with the request to send an audit-verified reply even when its tool shell has no
+  session credential.
+- Telesession checks that capability-proved replies belong to the original request before trusting them.
+- Enable with `TELESESSION_REPLY_CAPABILITY=on`. The default is `off`.
+
 ## 0.3.0 — unreleased — issue #16 assistant profiles (client side of Telepty `client-profile-scope-v1`)
 
 - Opt-in profile mode: `TELESESSION_PROFILE` + `TELESESSION_PROFILES_FILE` (`telesession.profiles/v1`) select the URL,

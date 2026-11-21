@@ -75,7 +75,7 @@ function normalizeStateDir(raw) {
 // enumerable only when enabled; enabling it needs a state dir (the ledger lives there).
 // profile (issue #16): the host-selected assistant profile name, or null (legacy); enumerable only when
 // set, and a profile always needs its own state dir (own store and lock).
-export function normalizeConfig({ teleptyUrl, token, targets, inboxPrefix, stateDir, persistInboxCredential, relayIntervalMs, profile } = {}) {
+export function normalizeConfig({ teleptyUrl, token, targets, inboxPrefix, stateDir, persistInboxCredential, relayIntervalMs, profile, replyCapability = "off" } = {}) {
   if (!Array.isArray(targets)) throw new ConfigError("CONFIG_TARGETS_INVALID");
   const unique = [...new Set(targets)];
   if (unique.length < 1 || unique.length > MAX_TARGETS || unique.length !== targets.length
@@ -98,11 +98,13 @@ export function normalizeConfig({ teleptyUrl, token, targets, inboxPrefix, state
   if (prof !== null && (typeof prof !== "string" || !PROFILE_NAME_RE.test(prof))) throw new ConfigError("CONFIG_PROFILE_INVALID");
   if (prof !== null && dir === null) throw new ConfigError("CONFIG_STATE_DIR_REQUIRED");
   if (prof !== null && !PROFILE_TOKEN_RE.test(token)) throw new ConfigError("CONFIG_PROFILE_TOKEN_INVALID");
+  if (replyCapability !== "off" && replyCapability !== "on") throw new ConfigError("CONFIG_REPLY_CAPABILITY_INVALID");
   const cfg = { targets: Object.freeze(unique), inboxPrefix, teleptyOrigin };
   Object.defineProperty(cfg, "stateDir", { value: dir, enumerable: dir !== null });
   Object.defineProperty(cfg, "persistInboxCredential", { value: persist, enumerable: dir !== null });
   Object.defineProperty(cfg, "relayIntervalMs", { value: relay, enumerable: relay > 0 });
   Object.defineProperty(cfg, "profile", { value: prof, enumerable: prof !== null });
+  Object.defineProperty(cfg, "replyCapability", { value: replyCapability, enumerable: replyCapability === "on" });
   Object.defineProperty(cfg, "token", { value: token, enumerable: false });
   return Object.freeze(cfg);
 }
@@ -321,7 +323,10 @@ export function loadConfig(env, { readTokenFile = defaultReadTokenFile, readPriv
     : rawPersist === "1" ? true : String(rawPersist);
   const rawRelay = e.TELESESSION_RELAY_INTERVAL_MS;
   const relayIntervalMs = rawRelay === undefined || rawRelay === "" ? 0 : /^\d{1,7}$/.test(String(rawRelay)) ? Number(rawRelay) : String(rawRelay);
-  return normalizeConfig({ teleptyUrl, token, targets, inboxPrefix, stateDir, persistInboxCredential, relayIntervalMs });
+  return normalizeConfig({
+    teleptyUrl, token, targets, inboxPrefix, stateDir, persistInboxCredential, relayIntervalMs,
+    replyCapability: e.TELESESSION_REPLY_CAPABILITY,
+  });
 }
 
 function relayOption(e) {
@@ -340,5 +345,6 @@ function loadProfileConfig(e, profile, readPrivateFile) {
   if (!PROFILE_TOKEN_RE.test(token)) throw new ConfigError("CONFIG_PROFILE_TOKEN_INVALID");
   return normalizeConfig({
     ...base, token, profile: profile.name, persistInboxCredential: profile.persistInboxCredential, relayIntervalMs: relayOption(e),
+    replyCapability: e.TELESESSION_REPLY_CAPABILITY,
   });
 }
