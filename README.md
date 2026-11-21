@@ -1,4 +1,4 @@
-# telesession 0.2.0 (release candidate — not yet published)
+# telesession 0.4.0 (release candidate)
 
 telesession is a generic, terminal-independent **remote session connection layer**: an MCP adapter and
 a request/reply transport that sit on top of a local telepty daemon.
@@ -28,7 +28,7 @@ must also match: a non-2xx with `delivery_uncertain: true` or code `DELIVERY_UNC
 `failed:DELIVERY_UNCERTAIN` row. No installed or runtime proof of this candidate with Telepty 0.10.0
 exists yet. This package never upgrades or restarts Telepty automatically.
 
-Once published, `npm install @dmsdc-ai/telesession@0.2.0` installs it without a source build.
+Once published, `npm install @dmsdc-ai/telesession@0.4.0` installs it without a source build.
 [Installation and MCP configuration](docs/install.md) describes the flow. You need:
 1. Node ≥ 20.
 2. The package installed with its two dependencies (`@modelcontextprotocol/sdk` ^1.29.0, `zod`
@@ -48,8 +48,9 @@ Once published, `npm install @dmsdc-ai/telesession@0.2.0` installs it without a 
 | `TELESESSION_STATE_DIR` (optional) | absolute, normalized, 1–512 chars, no control chars, no trailing separator (win32: no UNC/device/drive-relative). Private app state, e.g. `~/.local/state/telesession`; never home/cwd itself, a project dir or telepty's own state | `CONFIG_STATE_DIR_INVALID`; at open `STORE_PATH_FORBIDDEN`, `STORE_PERMISSIONS_INVALID`, `STORE_LOCKED`, `STORE_CORRUPT`, … |
 | `TELESESSION_PERSIST_INBOX_CREDENTIAL` (optional) | unset/`0` or `1`; `1` requires a state dir and verified POSIX permissions (refused on Windows) | `CONFIG_PERSIST_INVALID`, `CONFIG_STATE_DIR_REQUIRED`, `STORE_CREDENTIAL_PLATFORM_UNSUPPORTED` |
 | `TELESESSION_RELAY_INTERVAL_MS` (optional, **unsupported in 0.2.0** — see [Relay](#relay-and-destination-unsupported-in-020)) | unset/`0` = relay runner off (default); otherwise an integer 1000–3600000 ms, requires a state dir. Turning it on in a live deployment is a separate approval (spec §10). One tick on demand: `telesession-relay-tick` (refuses a held ledger lock, exit 3) | `CONFIG_RELAY_INTERVAL_INVALID`, `CONFIG_STATE_DIR_REQUIRED` |
+| `TELESESSION_REPLY_CAPABILITY` (optional) | `off` (default) or `on`. Requires the optional `reply-capability-v1` daemon capability | `CONFIG_REPLY_CAPABILITY_INVALID` |
 
-No defaults, no `~/.telepty` lookup, no credential minting. The token never appears in tool
+No defaults for the required settings, no `~/.telepty` lookup, no credential minting. The token never appears in tool
 arguments, results, logs or the state dir. telepty's own peer-lane guard still applies and is not
 bypassed: full prompt exchange is only for a target the operator has designated as a true
 orchestrator in the daemon's existing `AIGENTRY_ORCHESTRATOR_SIDS` policy. Never add inbox ids or
@@ -100,6 +101,14 @@ as refused. A receipt with tracking state `aborted` alone is `unknown`, not `ref
 A reply is `trusted` only with exactly one audit row whose payload sha256 matches, whose verified
 sender sid and epoch equal the target's, with no spoof suspicion, inside the nonce window and with an
 unbound inject id. Anything else is counted by reason and not returned as a reply.
+
+### Opt-in reply capability (Telepty 0.12.0)
+
+With `TELESESSION_REPLY_CAPABILITY=on`, telesession requests a single-use reply capability from daemons
+that advertise `reply-capability-v1`. Responders can run the `telepty reply-v1` command supplied with the
+request and provide the reply body on stdin. Telepty 0.12.0 or newer must be on the responder's PATH.
+Telesession trusts a capability-proved reply only when the daemon's audit row names the original
+request's inject ID and passes the existing reply checks. An older daemon can still receive requests.
 
 ### Dedupe
 `request_id` (`^[A-Za-z0-9._:-]{1,128}$`, optional): the same id with the same target and the exact
