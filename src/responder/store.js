@@ -1,19 +1,24 @@
 /**
  * Durable state of the scoped responder (issue #18). One private directory, same write discipline as
- * src/store.js and src/relay/ledger.js: strict single-writer lock, schema-validated `responder.json`,
+ * src/store.js and src/relay/ledger.js: strict single-writer lock, a schema-validated state file,
  * tmp (O_EXCL, 0600) + fsync + rename + dir fsync. Errors carry a code and at most an errno NAME.
  *
- * Review r1 F01: the state file is AUTHENTICATED. Every committed body carries a monotonic counter, the
- * previous commit's MAC and `mac = HMAC-SHA256(stateKey, canonicalJson(body))`, where `stateKey` is
- * derived from the session credential the pump holds IN MEMORY and is never written here. An edited,
- * spliced or hand-written file fails to verify and is refused without being rewritten; a file recorded
- * under another credential instance is refused as rotated. A rollback to an earlier AUTHENTIC snapshot
- * cannot be detected from this file alone (a one-shot pump has no external anchor): that is caught by the
- * audit reconciliation in src/responder/responder.js before any send.
+ * ONE STATE FILE PER CREDENTIAL INSTANCE (`state-<tag16>.json`), one shared `lock` for the directory
+ * (so one pump at a time per session). After a credential rotation the new instance starts a new file
+ * and the previous instance's file stays as a tombstone: old bindings are therefore unusable while NEW
+ * requests are answered normally (review r2 R09).
  *
- * Review r1 F06: win32 is refused. Windows ACLs are not verified by this implementation, so the
- * responder does not run there rather than claiming protection it has not checked.
- * Review r1 F12: a lock left by a dead holder is reported as RESPONDER_LOCK_STALE (never reclaimed).
+ * Each committed body carries a monotonic counter, the previous commit's MAC and
+ * `mac = HMAC-SHA256(stateKey, canonicalJson(body))`, with `stateKey` derived from the session
+ * credential the pump holds in memory and never written here. This detects CORRUPTION and cross-instance
+ * mix-ups and refuses such a file without rewriting it. It is NOT a defence against a same-user process
+ * with arbitrary file write: that adversary is explicitly out of scope (DESIGN.md §4), because it can
+ * equally read the daemon's own credential files or replace this package's code. The MAC is verified
+ * BEFORE any field of the body is used for a diagnosis (r2 R13).
+ *
+ * win32 is refused: this implementation does not verify Windows file-access semantics, so it does not
+ * run there rather than claim a protection it has not checked (r1 F06).
+ * A lock left by a dead holder is reported as RESPONDER_LOCK_STALE and never reclaimed (r1 F12).
  *
  * Never persisted: the session bearer or its plain digest (only a derived tag), the telepty token, the
  * challenge (digest only), the request text, the reply body (hash only).
@@ -26,10 +31,10 @@ import path from "node:path";
 import { createHmac, hkdfSync, randomBytes, timingSafeEqual } from "node:crypto";
 
 export const RESPONDER_SCHEMA = "telesession-responder";
-export const RESPONDER_VERSION = 2;
+export const RESPONDER_VERSION = 3;
 export const RESPONDER_STORE_LIMITS = Object.freeze({
-  bindings: 256, audit: 256, sentHashes: 256, stateBytes: 1024 * 1024, retainMs: 3600000,
-  sentHashRetainMs: 5400000, attempts: 3,
+  bindings: 256, audit: 256, consumed: 64, stateBytes: 1024 * 1024, retainMs: 3600000,
+  consumedRetainMs: 3600000, attempts: 3, sweepEntries: 256, tmpGraceMs: 60000,
 });
 
 const STATE_KEY_SALT = "telesession-responder/state-key/v1";
@@ -46,7 +51,12 @@ const ERRNO_RE = /^E[A-Z0-9]{1,31}$/;
 const ORIGIN_RE = /^http:\/\/(?:127(?:\.\d{1,3}){3}|\[::1\]):[1-9]\d{0,4}$/;
 const HOST_RE = /^[A-Za-z0-9._:[\]-]{1,253}$/;
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/;
-const TMP_RE = /^\.responder\.json\.[0-9a-f]{16}\.tmp$/;
+// Our own state file and temporary names. Nothing else in the directory is ever written or removed.
+const STATE_NAME_RE = /^state-[0-9a-f]{16}\.json$/;
+const TMP_RE = /^\.state-[0-9a-f]{16}\.json\.[0-9a-f]{16}\.tmp$/;
+// Queue names the drop directory uses, repeated here because the consumed-input record is state.
+const QUEUE_RE = /^(?:inbound|replies)$/;
+const INPUT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.json$/;
 const LOCK_BYTES = 4096;
 const STATES = new Set(["issued", "sending", "accepted", "refused"]);
 const RESULTS = new Set(["sent", "uncertain", "refused"]);
@@ -154,19 +164,19 @@ function isAuditEntry(e) {
     && (e.inject_id === null || isStr(e.inject_id, INJECT_ID_RE));
 }
 
-// Every reply payload this credential instance has prepared for a send (F01: the audit reconciliation
-// compares the daemon's rows against exactly this list).
-const isSentHash = (x) => isPlain(x) && isStr(x.sha256, HEX64_RE) && isInt(x.at_ms);
+// An input file this pass has answered and is allowed to remove: name + exact content hash (r2 R06).
+const isConsumed = (x) => isPlain(x) && isStr(x.name, INPUT_NAME_RE) && isStr(x.queue, QUEUE_RE)
+  && isStr(x.sha256, HEX64_RE) && isInt(x.at_ms);
 
 function isResponderBody(s) {
   if (!isPlain(s) || s.schema !== RESPONDER_SCHEMA || s.version !== RESPONDER_VERSION || !isInt(s.generation)) return false;
   if (!isPlain(s.binding) || !isStr(s.binding.origin, ORIGIN_RE) || !isStr(s.binding.session, SID_RE)) return false;
   if (!isStr(s.credential_tag, HEX64_RE) || !(s.prev_mac === "" || isStr(s.prev_mac, HEX64_RE))) return false;
-  if (!isPlain(s.bindings) || !Array.isArray(s.audit) || !Array.isArray(s.sent_hashes)) return false;
+  if (!isPlain(s.bindings) || !Array.isArray(s.audit) || !Array.isArray(s.consumed)) return false;
   if (Object.keys(s.bindings).length > RESPONDER_STORE_LIMITS.bindings || s.audit.length > RESPONDER_STORE_LIMITS.audit
-      || s.sent_hashes.length > RESPONDER_STORE_LIMITS.sentHashes) return false;
+      || s.consumed.length > RESPONDER_STORE_LIMITS.consumed) return false;
   return Object.entries(s.bindings).every(([k, b]) => isBinding(k, b)) && s.audit.every(isAuditEntry)
-    && s.sent_hashes.every(isSentHash);
+    && s.consumed.every(isConsumed);
 }
 
 /**
@@ -190,7 +200,10 @@ export function openResponderStore(opts, seams) {
   if (!Buffer.isBuffer(stateKey) || stateKey.length !== 32) throw new ResponderStoreError("RESPONDER_STATE_KEY_REQUIRED");
 
   const credentialTag = credentialTagOf(stateKey);
-  const statePath = path.join(dir, "responder.json");
+  // r2 R09: the state file belongs to ONE credential instance. A rotation starts a new file, leaves the
+  // old one untouched as a tombstone, and so refuses old bindings while new requests are answered.
+  const stateName = `state-${credentialTag.slice(0, 16)}.json`;
+  const statePath = path.join(dir, stateName);
   const lockPath = path.join(dir, "lock");
   const iso = (ms) => new Date(ms).toISOString();
 
@@ -324,22 +337,33 @@ export function openResponderStore(opts, seams) {
     try { fsx.unlinkSync(lockPath); syncDir(dir); } catch { /* best effort */ }
   }
 
+  // r2 R11/R06: bounded, and it removes ONLY our own abandoned state temporaries — our exact tmp name
+  // pattern, a regular file, older than the grace period (so a concurrent writer's temporary survives).
+  // Nothing else in this directory is ever removed, and it never recurses.
   function sweepTmp() {
-    let names;
-    try { names = fsx.readdirSync(dir); } catch { return; }
-    for (const name of names) {
-      if (!TMP_RE.test(name)) continue;
-      try {
-        const p = path.join(dir, name);
-        if (fsx.lstatSync(p).isFile()) fsx.unlinkSync(p);
-      } catch { /* best effort */ }
+    let d;
+    try { d = fsx.opendirSync(dir); } catch { return; }
+    let scanned = 0;
+    const cutoff = now() - RESPONDER_STORE_LIMITS.tmpGraceMs;
+    try {
+      for (let e = d.readSync(); e !== null && scanned < RESPONDER_STORE_LIMITS.sweepEntries; e = d.readSync()) {
+        scanned += 1;
+        if (!TMP_RE.test(e.name)) continue;
+        const p = path.join(dir, e.name);
+        try {
+          const st = fsx.lstatSync(p);
+          if (st.isFile() && st.nlink === 1 && st.mtimeMs < cutoff) fsx.unlinkSync(p);
+        } catch { /* gone or not ours to touch */ }
+      }
+    } finally {
+      try { d.closeSync(); } catch { /* best effort */ }
     }
   }
 
   const freshBody = () => ({
     schema: RESPONDER_SCHEMA, version: RESPONDER_VERSION, generation: 0,
     binding: { origin, session }, credential_tag: credentialTag,
-    bindings: {}, sent_hashes: [], audit: [], prev_mac: "",
+    bindings: {}, consumed: [], audit: [], prev_mac: "",
   });
 
   let state;
@@ -358,10 +382,12 @@ export function openResponderStore(opts, seams) {
       if (parsed.version !== RESPONDER_VERSION) throw new ResponderStoreError("RESPONDER_VERSION_UNSUPPORTED");
       const { mac, ...body } = parsed;
       if (!isResponderBody(body)) throw new ResponderStoreError("RESPONDER_CORRUPT");
+      // r2 R13: the MAC is checked FIRST. Nothing in the body is used to diagnose anything (rotation,
+      // binding) before it verifies, so a corrupted field cannot produce a misleading reason.
+      if (!macEqual(typeof mac === "string" ? mac : "", macOf(stateKey, body))) throw new ResponderStoreError("RESPONDER_STATE_UNAUTHENTIC");
       // A file written for another session, origin or credential instance is never adopted or rewritten.
       if (body.binding.origin !== origin || body.binding.session !== session) throw new ResponderStoreError("RESPONDER_BINDING_MISMATCH");
-      if (body.credential_tag !== credentialTag) throw new ResponderStoreError("RESPONDER_CREDENTIAL_ROTATED");
-      if (!macEqual(typeof mac === "string" ? mac : "", macOf(stateKey, body))) throw new ResponderStoreError("RESPONDER_STATE_UNAUTHENTIC");
+      if (body.credential_tag !== credentialTag) throw new ResponderStoreError("RESPONDER_CREDENTIAL_MISMATCH");
       state = body;
       stateMac = mac;
     }
@@ -403,22 +429,25 @@ export function openResponderStore(opts, seams) {
     while (draft.audit.length > RESPONDER_STORE_LIMITS.audit) draft.audit.shift();
   }
 
-  // The hash of a reply payload this instance is about to inject. Recorded BEFORE the send, so the audit
-  // reconciliation can account for the row even if the outcome write is lost. Full and nothing prunable
-  // means no send: dropping a hash that the audit window still shows would look like a rollback.
-  function addSentHash(draft, sha256, atMs) {
-    if (draft.sent_hashes.some((x) => x.sha256 === sha256)) return { ok: true };
-    if (draft.sent_hashes.length >= RESPONDER_STORE_LIMITS.sentHashes) return { ok: false, code: "RESPONDER_FULL" };
-    draft.sent_hashes.push({ sha256, at_ms: atMs });
+  // r2 R06: an input file this pass has answered, recorded in our own state BEFORE it may be removed.
+  // The drop directory removes an input only when its name, queue and exact content hash match a record
+  // here and the file on disk is still that same object.
+  function addConsumed(draft, { queue, name, sha256 }, atMs) {
+    if (!QUEUE_RE.test(String(queue)) || !INPUT_NAME_RE.test(String(name)) || !HEX64_RE.test(String(sha256))) {
+      return { ok: false, code: "RESPONDER_INVALID_MUTATION" };
+    }
+    draft.consumed = draft.consumed.filter((x) => !(x.queue === queue && x.name === name));
+    draft.consumed.push({ queue, name, sha256, at_ms: atMs });
+    while (draft.consumed.length > RESPONDER_STORE_LIMITS.consumed) draft.consumed.shift();
     return { ok: true };
   }
 
-  // Past retention: the binding (and its recorded outcome) and old send hashes are dropped.
+  // Past retention: the binding (and its recorded outcome) and old consumed-input records are dropped.
   function pruneDraft(draft, t) {
     for (const [k, b] of Object.entries(draft.bindings)) {
       if (t > b.expires_ms + RESPONDER_STORE_LIMITS.retainMs) delete draft.bindings[k];
     }
-    draft.sent_hashes = draft.sent_hashes.filter((x) => t <= x.at_ms + RESPONDER_STORE_LIMITS.sentHashRetainMs);
+    draft.consumed = draft.consumed.filter((x) => t <= x.at_ms + RESPONDER_STORE_LIMITS.consumedRetainMs);
   }
 
   // Open-time recovery: `sending` is a send whose outcome this process never saw. The inject MAY have
@@ -457,8 +486,9 @@ export function openResponderStore(opts, seams) {
     bindings() {
       return Object.values(structuredClone(state.bindings));
     },
-    sentHashes() {
-      return structuredClone(state.sent_hashes);
+    consumed(queue, name) {
+      const hit = state.consumed.find((x) => x.queue === queue && x.name === name);
+      return hit === undefined ? null : { ...hit };
     },
     audit() {
       return structuredClone(state.audit);
@@ -466,13 +496,16 @@ export function openResponderStore(opts, seams) {
     commit,
     pushAudit,
     pruneDraft,
-    addSentHash,
+    addConsumed,
     limits: RESPONDER_STORE_LIMITS,
     lockState() {
       return lockHeld() ? "held" : "lost";
     },
     info() {
-      return { mode: "durable", session, origin, credential_tag: credentialTag, permissions: "verified", authenticated: true };
+      return {
+        mode: "durable", session, origin, credential_tag: credentialTag, state_name: stateName,
+        permissions: "verified", authenticated: true,
+      };
     },
     close() {
       if (closed) return;

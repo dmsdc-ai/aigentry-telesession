@@ -50,8 +50,8 @@ Once published, `npm install @dmsdc-ai/telesession@0.2.0` installs it without a 
 | `TELESESSION_RELAY_INTERVAL_MS` (optional, **unsupported in 0.2.0** — see [Relay](#relay-and-destination-unsupported-in-020)) | unset/`0` = relay runner off (default); otherwise an integer 1000–3600000 ms, requires a state dir. Turning it on in a live deployment is a separate approval (spec §10). One tick on demand: `telesession-relay-tick` (refuses a held ledger lock, exit 3) | `CONFIG_RELAY_INTERVAL_INVALID`, `CONFIG_STATE_DIR_REQUIRED` |
 
 | `TELESESSION_RESPONDER` (optional, **default off** — see [Scoped responder](#scoped-responder-issue-18-opt-in-default-off)) | unset/anything but `1` = off. `1` activates `telesession-responder-pump` only; it changes who can cause a trusted send and is a separate approval | `RESPONDER_NOT_ACTIVATED` |
-| `TELESESSION_RESPONDER_TOOL_ENV` (required with the responder) | must be `filtered`: the operator's declaration that the model's tool runtime does NOT inherit the session credential. Verify it by running `env \| grep TELEPTY_SESSION` **inside that tool shell** and seeing no output | `RESPONDER_TOOL_ENV_UNVERIFIED` |
-| `TELESESSION_RESPONDER_DROP_DIR` (optional) | absolute, normalized path of the private drop directory the tool runtime writes to; owner-only (POSIX only — the responder refuses Windows). It may not contain, or live inside, the state dir | `RESPONDER_DROP_DIR_INVALID`, `RESPONDER_DROP_DIR_OVERLAPS_STATE`, `RESPONDER_DROP_PERMISSIONS_INVALID` |
+| `TELESESSION_RESPONDER_DROP_DIR` (optional) | absolute, normalized path of the private drop directory the tool runtime writes to; owner-only (POSIX only — the responder refuses Windows). It must be a directory this feature created (it carries a marker file), and it may not contain or live inside the state dir, decided on resolved paths and filesystem identity | `RESPONDER_DROP_DIR_INVALID`, `RESPONDER_DROP_DIR_OVERLAPS_STATE`, `RESPONDER_DROP_NOT_OURS`, `RESPONDER_DROP_PERMISSIONS_INVALID` |
+| `TELEPTY_SESSION_ID` / `TELEPTY_SESSION_TOKEN` / `TELEPTY_SESSION_EPOCH` (required with the responder) | this session's own credential, read from the HOST process environment. The epoch is required: an unknown live session instance is refused, never assumed | `RESPONDER_SESSION_CREDENTIAL_MISSING`, `RESPONDER_SESSION_EPOCH_REQUIRED` |
 
 No defaults, no `~/.telepty` lookup, no credential minting. The token never appears in tool
 arguments, results, logs or the state dir. telepty's own peer-lane guard still applies and is not
@@ -213,7 +213,7 @@ Enabling `TELESESSION_RELAY_INTERVAL_MS` in a live deployment is a separate appr
 ## Scoped responder (issue #18; opt-in, default off)
 Some clients filter the environment of the model's tool runtime, so a reply the model sends from there
 has no session id, token or credential path and arrives as a `claimed_only` candidate whose body stays
-quarantined. The scoped responder lets such a session answer **without** giving its tool runtime a
+quarantined. The scoped responder lets such a session answer **without** handing its tool runtime a
 reusable session bearer:
 
 1. The host records the trusted inbound request binding. A request text alone proves nothing: the
@@ -226,51 +226,69 @@ reusable session bearer:
    expiring with the requester's own deadline, no bearer.
 3. The tool runtime writes `<drop>/replies/<binding_id>.json` with `{v, binding_id, challenge, body}`.
    `body` is the only caller-supplied content; a file naming a destination, nonce or principal is
-   refused, not obeyed. Before its one inject the host re-proves its own instance, checks the
-   requester's instance and reconciles the daemon's audit against its own send history; then it composes
+   refused, not obeyed. Before its one inject the host re-proves its own live instance, requires the
+   destination to still be present and still the bound instance, re-checks the requester's deadline with
+   a send margin, and asks the daemon whether this exact reply is already in its audit; then it composes
    `REPLY <nonce> <body>` and injects it with the session credential it already owns.
 
 ```
-TELESESSION_RESPONDER=1 TELESESSION_RESPONDER_TOOL_ENV=filtered \
-  TELESESSION_RESPONDER_DROP_DIR=<abs private dir> \
+TELESESSION_RESPONDER=1 TELESESSION_RESPONDER_DROP_DIR=<abs private dir> \
   TELEPTY_SESSION_ID=<this session id> TELEPTY_SESSION_TOKEN=<this session's token> \
-  telesession-responder-pump     # one bounded pass; exit 0 ran, 1 failed, 2 config/activation, 3 state
+  TELEPTY_SESSION_EPOCH=<this session's epoch> \
+  telesession-responder-pump     # one bounded pass; exit 0 clean, 1 failed, 2 config/activation, 3 state
 ```
 
-Run it in the **session host** process, where those variables exist — never in the model's tool shell,
-which is exactly the environment that has none of them. Bindings, outcomes and a bounded audit of every
-acceptance and refusal live in `<state dir>/responder` under their own lock; the bearer, the challenge,
-the request text and the reply body are never persisted (digests and hashes only).
+Run it in the **session host** process, where those variables exist — never in the model's tool shell.
+Bindings, outcomes and a bounded audit of every acceptance and refusal live in `<state dir>/responder`,
+one state file per credential instance under one lock.
 
-**What holds, and where.** Each committed record is authenticated with a key derived from the session
-credential this host process holds in memory and never writes down, so a process that cannot read that
-credential cannot edit, transplant or forge a binding — an altered file is refused
-(`RESPONDER_STATE_UNAUTHENTIC`), one from another credential instance is refused
-(`RESPONDER_CREDENTIAL_ROTATED`). Because a one-shot command cannot by itself tell an authentic older
-snapshot from the current one, the daemon's audit — which the tool runtime cannot write — decides
-whether this instance has already replied: an audit row that this store's own history does not account
-for refuses the send (`AUDIT_UNACCOUNTED_REPLY`). **This guarantee covers the configuration issue #18 is
-about, where the tool runtime does not hold the session credential.** A tool runtime that does hold it
-(for example codex-cli with its default shell policy) can reply as the session directly, with or without
-this component, so nothing here constrains it; that is why `TELESESSION_RESPONDER_TOOL_ENV=filtered` is
-required, and the operator must verify it. A same-user actor can always delete or corrupt the drop
-directory or the state file and stop replies from working (denial of service); it cannot redirect or
-duplicate a trusted send.
+### What the responder guarantees — and what it does not
+- **G1 No reusable bearer is handed out.** The session token stays in the host process: it is never
+  written to the tool runtime's environment, the drop directory, a capability, a result, the pass output
+  or the state. A capability is a single-use value bound to one request id.
+- **G2 A reply is bound to its request.** Destination, nonce, principal and session instance come from
+  the verified inbound audit row, never from a file or an argument. A remote sender, a forged or stale
+  request, or an honest tool runtime that makes a mistake — wrong id, duplicate, late, retried after a
+  crash, two calls at once — cannot cause a send to another destination, as another principal, twice, or
+  after the requester's deadline.
+- **G3 Quarantine and default-off are unchanged.** No requester code changed, so a reply without
+  verified sender evidence is still `claimed_only` with its body dropped, and nothing in this package
+  reaches the responder unless an operator activates it.
+- **G4 It does not damage the host.** It deletes only files it wrote itself (capabilities, results, its
+  own stale temporaries) plus the one input file it has just answered, identified by name, queue and
+  exact content hash recorded in its own state and re-verified immediately before the unlink. Anything
+  else in those directories — your files, directories, symlinks — is left untouched and only counted. It
+  never recurses, never removes a directory, works only inside a directory carrying its own marker
+  (`RESPONDER_DROP_NOT_OURS` otherwise), and the question it asks the daemon before sending is about one
+  payload only, so the ordinary traffic of an intact installation is never blocked.
 
-At most one authenticated send per binding: a duplicate returns the recorded outcome, an expired
-binding is refused and an earlier result is preserved, a rotated session credential cannot even open the
-state, and a send interrupted by a restart stays `uncertain` and is never repeated (still not
-exactly-once). Quarantine is unchanged: nothing that is quarantined today becomes readable, and a
-request without verified sender evidence gives the tool runtime no reply route at all.
+**Not guaranteed, stated plainly.** This feature does **not** protect against a process running as the
+same OS user with arbitrary file write. Such a process can read the daemon's own credential files,
+rewrite this package's code or replace this command, so no local design can hold against it: it is out of
+scope here, and confining it is a deployment matter (a host-only identity or an OS sandbox for the state
+and the installed code). The record MAC in the state file is corruption and mix-up detection, not
+tamper-proofing. Availability is likewise not guaranteed: anyone who can write those directories can
+delete files, hold the lock or fill the queues and stop replies from working. Exactly-once delivery is
+not provided — a send whose response is lost stays `uncertain` and is never repeated. A requester inbox
+that is replaced without leaving any audit row and keeps its id is detected only from the delivery
+observation afterwards, because telepty has no epoch-pinned inject in this release. After an abrupt exit
+the directory stays locked (`RESPONDER_LOCK_STALE` when the holder is gone, `RESPONDER_LOCKED` while it
+lives) and an operator removes `<state dir>/responder/lock` once no pump runs, as for the other stores.
 
-**Activation step (separate approval).** Set `TELESESSION_RESPONDER=1` (with
-`TELESESSION_RESPONDER_TOOL_ENV=filtered`) for that one host process after approval. Without it the
-command refuses (`RESPONDER_NOT_ACTIVATED`) and no other code path in this package reaches the
-responder. **Windows is refused** (`RESPONDER_PLATFORM_UNSUPPORTED`): this implementation does not
-verify Windows ACLs, so it does not claim that protection. Profile mode (issue #16) is not supported
-yet either (`RESPONDER_PROFILE_UNSUPPORTED`). After an abrupt exit the directory stays locked
-(`RESPONDER_LOCK_STALE` when the holder is gone, `RESPONDER_LOCKED` while it lives); recovery is the
-operator removing `<state dir>/responder/lock` once no pump is running, exactly as for the other stores.
+**On-disk lifetime.** In the binding store: no bearer, no challenge, no request text, no reply body —
+derived tags, digests and hashes only. In the drop directory, by design: an inbound claim holds the
+request text and a reply drop holds the body in plaintext until the pass that answers it removes them; a
+capability holds its challenge until it is spent, refused terminally or swept after its deadline; a
+result holds codes, hashes and an outcome, and is swept after 24 h.
+
+**Activation step (separate approval).** Set `TELESESSION_RESPONDER=1` for that one host process after
+approval. Without it the command refuses (`RESPONDER_NOT_ACTIVATED`) and no other code path in this
+package reaches the responder. **Windows is refused** (`RESPONDER_PLATFORM_UNSUPPORTED`): this
+implementation does not verify Windows file-access semantics and does not claim a protection it has not
+checked. Profile mode (issue #16) is refused too (`RESPONDER_PROFILE_UNSUPPORTED`). If you want to know
+whether a host's tool runtime inherits the session credential, use a presence-only check —
+`env | grep -c '^TELEPTY_SESSION_TOKEN='` prints 0 or 1 and never a value; never print the environment
+itself in a model-visible shell.
 
 ## Known limitations
 - **Silent reply rejection (#10, open).** The durable inbox rejects a verified-format reply with 503 when

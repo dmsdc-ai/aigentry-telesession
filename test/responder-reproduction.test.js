@@ -33,6 +33,7 @@ const SKIP = NO_LOOPBACK || (POSIX ? false : "NOTRUN: the responder refuses win3
 // The daemon surface the responder host needs, over the fake daemon's own state (no HTTP of our own).
 function responderDaemon(fake) {
   return {
+    sessions: async () => ({ ok: true, ids: [...fake.sessions.keys()] }),
     injects: async ({ to, from, since, until, limit }) => ({
       ok: true,
       injects: fake.audit.filter((r) => (to === undefined || r.to === to)

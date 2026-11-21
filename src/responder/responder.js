@@ -22,12 +22,19 @@
  * Nothing that is quarantined today becomes readable: an inbound request without verified sender
  * evidence yields no binding, and no path here changes how a reply is classified on the requester's side.
  *
- * Guarantee scope (review r1 F01, field result 2026-11-21): the store is authenticated with a key
- * derived from the session credential the pump holds in memory. That resists a same-user actor which
- * cannot read that credential — the filtered tool runtime of issue #18. A tool runtime that DOES inherit
- * the session credential (codex-cli default shell policy) can reply directly without this component, so
- * no property here constrains it; the command refuses to run unless the operator declares the filtered
- * configuration (`TELESESSION_RESPONDER_TOOL_ENV=filtered`).
+ * WHAT THIS GUARANTEES (and what it does not — see DESIGN.md §4 for the full statement):
+ *   G1 the tool runtime is never handed a reusable session bearer by this feature;
+ *   G2 a reply is bound to the trusted inbound request — destination, nonce, principal and session
+ *      instance come from the verified inbound audit row, and a remote sender, a forged or stale
+ *      request, or an honest tool runtime that makes a mistake (wrong id, duplicate, late, retried after
+ *      a crash, concurrent calls) cannot cause a send to another destination, as another principal,
+ *      twice, or after the requester's deadline;
+ *   G3 claimed-only quarantine and the default-off behaviour are unchanged;
+ *   G4 the feature never damages the host.
+ * OUT OF SCOPE: a process running as the same OS user with arbitrary file write. It can read the
+ * daemon's own credential files, rewrite this package's code or replace the pump, so no local design
+ * can hold against it. The record MAC below is corruption and mix-up detection, NOT a defence against
+ * that actor.
  *
  * INERT until an operator activates it (`activated: true`; `TELESESSION_RESPONDER=1` for the command).
  * Node >= 20 builtins only. No shell, no daemon lifecycle, no credential written to disk.
@@ -41,6 +48,8 @@ export const RESPONDER_LIMITS = Object.freeze({
   // F05: the trusted row is stamped at or after the requester's send, so `row.ts + ttl - margin` is at or
   // before the requester's deadline unless the daemon stamped the row more than `margin` late.
   deadlineMarginMs: 30000,
+  // r2 R04: a send is only started when it can still complete inside that deadline.
+  sendMarginMs: 2000,
   inboundLookbackMs: 15 * 60 * 1000,   // a claim may be presented any time inside the request's life
   inboundSkewMs: 2000,                 // …and the row may be at most this far after the claimed arrival
   reconcileSkewMs: 5000,
@@ -118,20 +127,26 @@ export function selectInboundRow(rows, { session, replyTo, payloadSha256, lo, hi
 }
 
 /**
- * Review r1 F07: the daemon's answer to a reply inject, classified by the SAME uncertainty rules as
- * src/transports/telepty.js (:126-132). An inject may have taken effect before an error, and an
- * explicitly uncertain answer is never a refusal — `sent: "no"` (a definitive refusal with no
- * uncertainty marker) is the only case that records `refused`; everything else stays `uncertain`, so the
- * binding is spent and nothing is ever re-sent. Pure: `r` is {ok, status, parsed, tooLarge}.
+ * Review r1 F07 + r2 R10: the daemon's answer to a reply inject, classified by the SAME rules as
+ * src/transports/telepty.js (:126-132, :1354-1357). An inject may have taken effect before an error, so
+ * `sent: "no"` (a definitive refusal, no uncertainty marker, a readable body) is the only case recorded
+ * as `refused`; everything else stays `uncertain`, the binding is spent and nothing is ever re-sent.
+ * Success additionally requires the exact-target echoes, so a malformed 200 is never reported as sent.
+ * Pure: `r` is {ok, status, parsed, tooLarge, bodyFailed}, `expect` is {to}.
  */
-export function classifyInjectResponse(r) {
+export function classifyInjectResponse(r, expect = {}) {
   const res = isPlain(r) ? r : {};
   const parsed = isPlain(res.parsed) ? res.parsed : null;
-  if (res.ok === true && parsed && parsed.success === true && typeof parsed.inject_id === "string" && INJECT_ID_RE.test(parsed.inject_id)) {
+  const to = isPlain(expect) ? expect.to : undefined;
+  if (res.ok === true && parsed && parsed.success === true
+      && typeof parsed.inject_id === "string" && INJECT_ID_RE.test(parsed.inject_id)
+      && parsed.exact_target === true && (to === undefined || parsed.session_id === to)) {
     return { ok: true, inject_id: parsed.inject_id };
   }
   if (res.status === null || res.status === undefined) return { ok: false, code: "DAEMON_UNREACHABLE", sent: "unknown" };
   if (res.tooLarge === true) return { ok: false, code: "DAEMON_BODY_TOO_LARGE", sent: "unknown" };
+  // A response whose body was lost after the headers says nothing about the effect (r2 R10).
+  if (res.bodyFailed === true) return { ok: false, code: "DAEMON_BODY_UNREADABLE", sent: "unknown" };
   const code = parsed && typeof parsed.code === "string" && CODE_RE.test(parsed.code) ? parsed.code : `DAEMON_HTTP_${res.status}`;
   const uncertain = res.status >= 500 || code === "DELIVERY_UNCERTAIN" || (parsed && parsed.delivery_uncertain === true) || res.ok === true;
   return { ok: false, code, sent: uncertain ? "unknown" : "no" };
@@ -144,15 +159,16 @@ export function classifyInjectResponse(r) {
  * `credential` — () => {sid, bearer, epoch?, generation?}: the session credential this HOST process owns.
  *                The bearer is used for the inject; it is never stored, returned or logged.
  * `daemon`   — {injects({to, from, since, until, limit}), inject({to, prompt, from, sessionToken}),
- *              observe(injectId)}: the three telepty reads/writes this needs, injected so the component
- *              stays transport-agnostic.
+ *              observe(injectId), sessions()}: the four telepty reads/writes this needs, injected so the
+ *              component stays transport-agnostic.
  * `activated` — must be true. Without it the responder refuses to exist (operator activation gate).
  */
 export function createResponder({ store, credential, daemon, now = Date.now, activated = false } = {}) {
   if (activated !== true) throw new ResponderError("RESPONDER_NOT_ACTIVATED");
   if (!store || typeof store.commit !== "function" || typeof store.binding !== "function") throw new ResponderError("RESPONDER_STORE_REQUIRED");
   if (typeof credential !== "function") throw new ResponderError("RESPONDER_CREDENTIAL_REQUIRED");
-  if (!daemon || typeof daemon.injects !== "function" || typeof daemon.inject !== "function" || typeof daemon.observe !== "function") {
+  if (!daemon || typeof daemon.injects !== "function" || typeof daemon.inject !== "function"
+      || typeof daemon.observe !== "function" || typeof daemon.sessions !== "function") {
     throw new ResponderError("RESPONDER_DAEMON_REQUIRED");
   }
 
@@ -162,15 +178,17 @@ export function createResponder({ store, credential, daemon, now = Date.now, act
   // The credential of THIS session, as this process holds it. The store was opened with a key derived
   // from the same bearer, so `credential_tag` is the credential INSTANCE: a rotated session credential
   // cannot even open this directory (RESPONDER_CREDENTIAL_ROTATED).
+  // r2 R03: an UNKNOWN live instance is a refusal, not a pass. The epoch of this session must be
+  // supplied by the host, so every instance comparison below is against a known live value.
   function principal() {
     let c;
     try { c = credential(); } catch { return null; }
     if (!isPlain(c) || typeof c.sid !== "string" || !SID_RE.test(c.sid)) return null;
     if (typeof c.bearer !== "string" || !BEARER_RE.test(c.bearer)) return null;
+    if (!isEpoch(c.epoch)) return null;
     if (c.sid !== store.info().session) return null;
     return {
-      sid: c.sid, bearer: c.bearer, credential_tag: credentialTag,
-      epoch: isEpoch(c.epoch) ? c.epoch : null,
+      sid: c.sid, bearer: c.bearer, credential_tag: credentialTag, epoch: c.epoch,
       generation: Number.isSafeInteger(c.generation) && c.generation >= 0 ? c.generation : null,
     };
   }
@@ -210,12 +228,15 @@ export function createResponder({ store, credential, daemon, now = Date.now, act
   }
 
   /**
-   * F01 (b): the daemon's audit is not same-user writable, so it — not the local file — decides whether
-   * this instance has already injected a reply into that inbox. Every row attributable to this session
-   * instance must be accounted for by this store's own send history; an unaccounted row means the local
-   * history was rolled back, deleted or written by something else, and nothing is sent.
+   * r2 R01 (in-scope corroboration) and R05: the daemon's own record of THIS reply. The question asked
+   * is narrow on purpose — "does a row for exactly the payload I am about to inject already exist from
+   * this session instance to that inbox?" — so an ordinary credentialed reply for a DIFFERENT request,
+   * or any other legitimate traffic of an intact installation, can never block a valid scoped reply
+   * (G4). A hit means this very reply already reached the daemon (an outcome lost to a crash), so
+   * nothing is sent again. An unreadable or truncated audit refuses the send rather than risking a
+   * second one; the single-use binding record remains the primary dedupe.
    */
-  async function reconcile(b, p) {
+  async function replyAlreadyInAudit(b, p, replySha) {
     const lo = b.origin_ts_ms - RESPONDER_LIMITS.reconcileSkewMs;
     const hi = now() + RESPONDER_LIMITS.reconcileSkewMs;
     let r;
@@ -228,37 +249,45 @@ export function createResponder({ store, credential, daemon, now = Date.now, act
     }
     if (!isPlain(r) || r.ok !== true) return { ok: false, code: codeOf(r, "AUDIT_UNAVAILABLE") };
     if (r.next_cursor != null) return { ok: false, code: "RECONCILE_AUDIT_INCOMPLETE" };
-    const known = new Set(store.sentHashes().map((x) => x.sha256));
     const mine = (Array.isArray(r.injects) ? r.injects : []).filter((row) => isPlain(row)
       && row.to === b.destination.session && row.verified_sender_sid === p.sid
-      && row.verified_sender_epoch === b.recipient_epoch && row.spoof_suspected === false
-      && typeof row.payload_sha256 === "string" && HEX64_RE.test(row.payload_sha256));
-    const unaccounted = mine.filter((row) => !known.has(row.payload_sha256));
-    if (unaccounted.length > 0) return { ok: false, code: "AUDIT_UNACCOUNTED_REPLY", unaccounted: unaccounted.length };
-    return { ok: true, replies: mine.length };
+      && row.verified_sender_epoch === p.epoch && row.spoof_suspected === false
+      && row.payload_sha256 === replySha);
+    return { ok: true, present: mine.length > 0, inject_id: mine.length === 1 && typeof mine[0].inject_id === "string" ? mine[0].inject_id : null };
   }
 
   /**
-   * F02: positive evidence that the destination inbox is still the instance the request came from. The
-   * daemon offers no epoch-pinned inject, so this is a pre-send check on the rows that exist plus the
-   * post-send observation below; absence of rows is not evidence and is not treated as one.
+   * r2 R02/R15: the destination inbox must still be there, and nothing may say it is now another
+   * instance. Checked immediately before the send:
+   *   - the daemon must still list that session id — an absent inbox is refused rather than injected
+   *     into whatever takes its place (`DESTINATION_ABSENT`), and an unreadable list refuses too;
+   *   - any row whose verified sender is that inbox AFTER the bound request (older rows belong to the
+   *     retired instance and must not refuse a newer request, R15) must carry the bound epoch.
+   * telepty has no epoch-pinned inject in this release, so a replacement that leaves no row and keeps
+   * the id is only detected from the delivery observation afterwards; that residual is stated in
+   * FINDING-MAP-R2.md and FOLLOWUPS.md, not papered over.
    */
-  async function destinationInstanceOk(b, p) {
+  async function destinationStillBound(b, p) {
+    let list;
+    try { list = await daemon.sessions(); } catch { return { ok: false, code: "DAEMON_UNREACHABLE" }; }
+    if (!isPlain(list) || list.ok !== true || !Array.isArray(list.ids)) return { ok: false, code: codeOf(list, "DAEMON_BAD_RESPONSE") };
+    if (!list.ids.includes(b.destination.session)) return { ok: false, code: "DESTINATION_ABSENT" };
     if (b.destination_instance.epoch === null) return { ok: true, checked: false };
     let r;
     try {
       r = await daemon.injects({
-        to: p.sid, from: b.destination.session, since: iso(b.origin_ts_ms - RESPONDER_LIMITS.reconcileSkewMs),
+        to: p.sid, from: b.destination.session, since: iso(b.origin_ts_ms),
         until: iso(now() + RESPONDER_LIMITS.reconcileSkewMs), limit: RESPONDER_LIMITS.auditRows,
       });
     } catch {
       return { ok: false, code: "DAEMON_UNREACHABLE" };
     }
     if (!isPlain(r) || r.ok !== true) return { ok: false, code: codeOf(r, "AUDIT_UNAVAILABLE") };
-    const theirs = (Array.isArray(r.injects) ? r.injects : []).filter((row) => isPlain(row)
-      && row.verified_sender_sid === b.destination.session && isEpoch(row.verified_sender_epoch));
-    const changed = theirs.some((row) => row.verified_sender_epoch !== b.destination_instance.epoch);
-    return changed ? { ok: false, code: "DESTINATION_INSTANCE_CHANGED" } : { ok: true, checked: theirs.length > 0 };
+    const after = (Array.isArray(r.injects) ? r.injects : []).filter((row) => isPlain(row)
+      && row.verified_sender_sid === b.destination.session && isEpoch(row.verified_sender_epoch)
+      && Number.isFinite(Date.parse(row.ts)) && Date.parse(row.ts) >= b.origin_ts_ms);
+    const changed = after.some((row) => row.verified_sender_epoch !== b.destination_instance.epoch);
+    return changed ? { ok: false, code: "DESTINATION_INSTANCE_CHANGED" } : { ok: true, checked: after.length > 0 };
   }
 
   /**
@@ -312,13 +341,14 @@ export function createResponder({ store, credential, daemon, now = Date.now, act
     // F05: the deadline comes from the trusted row, never from the caller's arrival.
     const originTs = Date.parse(sel.row.ts);
     const expires = originTs + RESPONDER_LIMITS.ttlMs - RESPONDER_LIMITS.deadlineMarginMs;
-    if (t0 >= expires) return refuse("INBOUND_PAST_DEADLINE", "past_deadline", { extra: { expires_at: iso(expires) } });
+    // No capability is issued for a request that could not be answered in time anyway (r2 R04).
+    if (t0 + RESPONDER_LIMITS.sendMarginMs >= expires) return refuse("INBOUND_PAST_DEADLINE", "past_deadline", { extra: { expires_at: iso(expires) } });
 
     // F03: the daemon's observation of that inject must name THIS session and the instance it is now.
     const obs = await observed(sel.row.inject_id);
     if (!obs.ok) return refuse(obs.code, "recipient_instance_unproven");
     if (obs.session_id !== p.sid) return refuse("RECIPIENT_MISMATCH", "recipient_mismatch");
-    if (p.epoch !== null && obs.session_epoch !== p.epoch) return refuse("RECIPIENT_INSTANCE_CHANGED", "recipient_instance_changed");
+    if (obs.session_epoch !== p.epoch) return refuse("RECIPIENT_INSTANCE_CHANGED", "recipient_instance_changed");
 
     const challenge = randomBytes(32).toString("base64url");
     const challengeSha = sha256hex(challenge);
@@ -377,6 +407,9 @@ export function createResponder({ store, credential, daemon, now = Date.now, act
     return ok({ ...view(store.binding(bindingId)), challenge, reissued: false, deduplicated: false });
   }
 
+  // r2 R04: a send may only start when it can still complete before the requester's deadline.
+  const inTime = (b, t) => t + RESPONDER_LIMITS.sendMarginMs <= b.expires_ms;
+
   const outcomeOf = (result, reason) => ({
     at: iso(now()), result, reason, inject_id: null, reply_sha256: null, destination_instance_ok: null,
   });
@@ -429,46 +462,67 @@ export function createResponder({ store, credential, daemon, now = Date.now, act
     if (b0.principal.sid !== p.sid) return settle(binding_id, outcomeOf("refused", "principal_mismatch"), "PRINCIPAL_MISMATCH");
     if (b0.principal.credential_tag !== p.credential_tag) return settle(binding_id, outcomeOf("refused", "session_generation_changed"), "SESSION_GENERATION_CHANGED");
 
-    // F05: the requester's own deadline, taken from the trusted inbound row at registration.
-    if (now() > b0.expires_ms) return settle(binding_id, outcomeOf("refused", "expired"), "BINDING_EXPIRED");
+    // F05 / r2 R04: the requester's own deadline, taken from the trusted inbound row at registration.
+    // It is checked here, again inside the intent commit, and once more immediately before the inject,
+    // each time with a margin for the send itself: a reply that cannot complete in time is not started.
+    if (!inTime(b0, now())) return settle(binding_id, outcomeOf("refused", "expired"), "BINDING_EXPIRED");
 
-    // F03: re-prove that this session is still the instance the request was delivered to.
+    // F03: re-prove that this session is still the instance the request was delivered to, against the
+    // LIVE epoch the host supplied (r2 R03: an unknown live instance never reaches this point).
     const obs = await observed(b0.origin_inject_id);
     if (!obs.ok) return refuse(obs.code, "recipient_instance_unproven", { binding_id });
     if (obs.session_id !== p.sid) return settle(binding_id, outcomeOf("refused", "recipient_mismatch"), "RECIPIENT_MISMATCH");
-    if (obs.session_epoch !== b0.recipient_epoch) return settle(binding_id, outcomeOf("refused", "recipient_instance_changed"), "RECIPIENT_INSTANCE_CHANGED");
-
-    // F02: contrary evidence that the requester inbox is now another instance refuses the send.
-    const dest = await destinationInstanceOk(b0, p);
-    if (!dest.ok) {
-      if (dest.code === "DESTINATION_INSTANCE_CHANGED") return settle(binding_id, outcomeOf("refused", "destination_instance_changed"), dest.code);
-      return refuse(dest.code, "destination_instance_unproven", { binding_id });
+    if (obs.session_epoch !== b0.recipient_epoch || p.epoch !== b0.recipient_epoch) {
+      return settle(binding_id, outcomeOf("refused", "recipient_instance_changed"), "RECIPIENT_INSTANCE_CHANGED");
     }
 
-    // F01: the daemon's audit must agree with this store's own send history before anything is sent.
-    const rec = await reconcile(b0, p);
-    if (!rec.ok) {
-      if (rec.code === "AUDIT_UNACCOUNTED_REPLY") {
-        return refuse(rec.code, "audit_unaccounted_reply", { binding_id, extra: { unaccounted: rec.unaccounted } });
+    // F02 / r2 R02: the destination must still be present and still the bound instance.
+    const dest = await destinationStillBound(b0, p);
+    if (!dest.ok) {
+      if (dest.code === "DESTINATION_INSTANCE_CHANGED" || dest.code === "DESTINATION_ABSENT") {
+        return settle(binding_id, outcomeOf("refused", dest.code === "DESTINATION_ABSENT" ? "destination_absent" : "destination_instance_changed"), dest.code);
       }
-      return refuse(rec.code, "reconcile_unavailable", { binding_id });
+      return refuse(dest.code, "destination_instance_unproven", { binding_id });
     }
 
     const prompt = composeReply(b0.nonce, body);
     const replySha = sha256hex(prompt);
-    // Intent first: the binding is durably `sending` and the payload hash is in the send history BEFORE
-    // the inject, so a crash in the middle can only become `uncertain` on the next open — never a second
-    // send — and the row this send creates is already accounted for by the next reconciliation.
+
+    // r2 R01/R05: has THIS reply already reached the daemon (an outcome lost to a crash)? Only this
+    // payload is looked for, so ordinary traffic of an intact installation cannot block the send.
+    const already = await replyAlreadyInAudit(b0, p, replySha);
+    if (!already.ok) return refuse(already.code, "reconcile_unavailable", { binding_id });
+    if (already.present) {
+      return settle(binding_id, {
+        at: iso(now()), result: "uncertain", reason: "REPLY_ALREADY_IN_AUDIT",
+        inject_id: already.inject_id, reply_sha256: replySha, destination_instance_ok: null,
+      }, "REPLY_UNCERTAIN");
+    }
+
+    // Intent first: the binding is durably `sending` BEFORE the inject, so a crash in the middle can
+    // only become `uncertain` on the next open — never a second send. The commit re-checks the
+    // capability digest, the state and the deadline (r2 R16/R04) under the single-writer lock, which is
+    // also what excludes a second pump for this session (r2 R01).
     const intent = store.commit((d) => {
       const b = d.bindings[binding_id];
       if (!b || b.state !== "issued" || b.outcome !== null) return { ok: false, code: "BINDING_STATE_CHANGED" };
-      const h = store.addSentHash(d, replySha, now());
-      if (!h.ok) return h;
+      if (b.challenge_sha256 !== b0.challenge_sha256) return { ok: false, code: "BINDING_STATE_CHANGED" };
+      if (!inTime(b, now())) return { ok: false, code: "BINDING_EXPIRED" };
       b.state = "sending";
       b.outcome = null;
       return undefined;
     });
-    if (!intent.ok) return fail(intent.code, intent.errno ? { errno: intent.errno } : {});
+    if (!intent.ok) {
+      if (intent.code === "BINDING_EXPIRED") return settle(binding_id, outcomeOf("refused", "expired"), "BINDING_EXPIRED");
+      return fail(intent.code, intent.errno ? { errno: intent.errno } : {});
+    }
+
+    // Last gate before the one inject: still in time, and this process still owns the lock that makes
+    // it the only pump for this session.
+    if (!inTime(b0, now()) || store.lockState() !== "held") {
+      return settle(binding_id, outcomeOf("refused", inTime(b0, now()) ? "lock_lost" : "expired"),
+        inTime(b0, now()) ? "RESPONDER_LOCK_LOST" : "BINDING_EXPIRED");
+    }
 
     let sendResult;
     try {
@@ -527,6 +581,21 @@ export function createResponder({ store, credential, daemon, now = Date.now, act
     return ok({ ...base, outcome: { ...outcome }, sent: true, duplicate: false, durability });
   }
 
+  /**
+   * r2 R06: record an input file this pass has answered, so the drop directory may remove exactly that
+   * file (name + queue + content hash) and nothing else. Returns the record it stored.
+   */
+  function noteConsumed({ queue, name, sha256 } = {}) {
+    const t = now();
+    const c = store.commit((d) => {
+      const r = store.addConsumed(d, { queue, name, sha256 }, t);
+      if (!r.ok) return r;
+      store.pruneDraft(d, t);
+      return undefined;
+    });
+    return c.ok ? { ok: true, record: store.consumed(queue, name) } : fail(c.code, c.errno ? { errno: c.errno } : {});
+  }
+
   // What the drop directory needs to know about a capability file without reading any record: whether it
   // can still be spent. `absent` / `spent` / `expired` mean its plaintext challenge may be swept (F13).
   function capabilityState(bindingId) {
@@ -547,5 +616,5 @@ export function createResponder({ store, credential, daemon, now = Date.now, act
     });
   }
 
-  return Object.freeze({ recordInbound, reply, status, capabilityState, limits: RESPONDER_LIMITS });
+  return Object.freeze({ recordInbound, reply, status, capabilityState, noteConsumed, limits: RESPONDER_LIMITS });
 }

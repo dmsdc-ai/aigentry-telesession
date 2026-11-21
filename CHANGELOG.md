@@ -28,13 +28,25 @@
     state directory. The session bearer, the challenge, the request text and the reply body are never
     persisted (derived tags, digests and hashes only).
   - Each committed record is authenticated with a key derived from the session credential the host
-    process holds in memory and never writes down: an edited or transplanted state file is refused, and
-    before any send the daemon's audit — which the tool runtime cannot write — must account for every
-    reply this instance has already made, so a restored or deleted history cannot produce a second send.
-    This holds where the tool runtime does not hold the session credential, which is the configuration
-    this fix is for; the command therefore requires the operator to declare it with
-    `TELESESSION_RESPONDER_TOOL_ENV=filtered`. A same-user actor can still stop replies from working
-    (denial of service); it cannot redirect or duplicate a trusted send.
+    process holds in memory and never writes down, and the state file belongs to one credential
+    instance: a corrupted, mixed-up or foreign record is refused rather than used. This is corruption
+    detection — **the feature does not claim to protect against a process running as the same OS user
+    with arbitrary file write**, which could equally read the daemon's own credential files or replace
+    this package; that adversary is out of scope and the README says so plainly.
+  - Before each send the daemon is asked whether this exact reply is already in its audit, so a reply
+    whose outcome was lost to a crash is not sent twice. The question covers that one payload only:
+    ordinary credentialed traffic of an intact installation can never block a valid scoped reply.
+  - The requester's deadline is enforced when the capability is issued, before the checks, inside the
+    durable intent and once more immediately before the inject, each time with a send margin — a reply
+    that cannot complete in time is never started. The destination must still be present at the daemon
+    and still the instance the request came from. An unknown live session instance is refused, so
+    `TELEPTY_SESSION_EPOCH` is now required.
+  - Cleanup is confined to what this feature wrote (capabilities, results, its own stale temporaries)
+    plus the one input it has just answered, identified by name, queue and exact content hash recorded
+    in its own state. Any other file, directory or symlink in those directories is left untouched and
+    only counted, it never recurses, and it works only inside a directory carrying its own marker.
+  - A credential rotation no longer blocks the next instance: old bindings stay unusable while new
+    requests are answered normally.
   - **Windows is refused** (`RESPONDER_PLATFORM_UNSUPPORTED`): this implementation does not verify
     Windows ACLs and does not claim protection it has not checked. A lock left by a dead pump is
     reported (`RESPONDER_LOCK_STALE`) and never reclaimed, as for the other stores.
@@ -43,8 +55,10 @@
   without an explicit activation flag. Activation changes who can cause a trusted send and is a
   separate approval; profile mode (issue #16) is not supported by the responder yet.
 - The reply inject follows the same uncertainty rules as every other inject in this package: an
-  explicitly uncertain or 5xx answer is recorded `uncertain`, never as a definitive refusal, and is
-  never re-sent. Daemon responses are read with a byte ceiling.
+  explicitly uncertain, 5xx or unreadable answer is recorded `uncertain`, never as a definitive refusal,
+  and is never re-sent; success additionally requires the daemon's exact-target echoes. Daemon responses
+  are read with a byte ceiling. A pass that could not read a queue or publish a result reports it and
+  fails, instead of looking like an idle pass.
 
 ## 0.3.0 — unreleased — issue #16 assistant profiles (client side of Telepty `client-profile-scope-v1`)
 
