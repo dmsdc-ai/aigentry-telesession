@@ -19,15 +19,18 @@ test('actual npm tarball contains both executables, runtime modules and linked A
       npm_config_globalconfig: path.join(root, 'no-global-config'), npm_config_update_notifier: 'false' }
   });
   const [pack] = JSON.parse(output), files = new Set(pack.files.map(file => file.path));
-  for (const file of ['bin/telesession-mcp.js', 'bin/telesession-tunnel-child.js', 'bin/telesession-relay-tick.js', 'bin/telesession-ledger-prune.js', 'src/index.js', 'src/adapters/mcp.js',
+  for (const file of ['bin/telesession-mcp.js', 'bin/telesession-tunnel-child.js', 'bin/telesession-relay-tick.js', 'bin/telesession-ledger-prune.js',
+    'bin/telesession-responder-pump.js', 'src/index.js', 'src/adapters/mcp.js', 'src/responder/responder.js',
     'src/transports/telepty.js', 'README.md', 'API-CONTRACT-TELESESSION.md', 'CHANGELOG.md']) assert.ok(files.has(file), file);
   assert.equal([...files].some(file => /^(node_modules|test|test-support)\//.test(file)), false);
   // Dated operational reports and repository status/CI records are evidence, not public payload.
   assert.equal([...files].some(file => /^docs\/(2026-10-31-|status\.md$|ci\.md$|contract-clarification)/.test(file)), false);
   // Exact public payload (RELEASE-FILES.json inventory); any addition or removal is a reviewed change.
   assert.deepEqual([...files].sort(), ['API-CONTRACT-TELESESSION.md', 'CHANGELOG.md', 'LICENSE', 'README.md',
-    'bin/telesession-ledger-prune.js', 'bin/telesession-mcp.js', 'bin/telesession-relay-tick.js', 'bin/telesession-tunnel-child.js',
+    'bin/telesession-ledger-prune.js', 'bin/telesession-mcp.js', 'bin/telesession-relay-tick.js', 'bin/telesession-responder-pump.js',
+    'bin/telesession-tunnel-child.js',
     'docs/architecture.md', 'docs/install.md', 'docs/specs/2026-10-11-e2e-delivery-protocol.md', 'docs/tunnel-child.md',
     'package.json', 'src/adapters/mcp.js', 'src/config.js', 'src/index.js', 'src/relay/adapters.js', 'src/relay/ledger.js',
-    'src/relay/relay.js', 'src/relay/route.js', 'src/relay/runner.js', 'src/store.js', 'src/transports/telepty.js', 'src/tunnel-child.js']);
+    'src/relay/relay.js', 'src/relay/route.js', 'src/relay/runner.js', 'src/responder/drop.js', 'src/responder/responder.js',
+    'src/responder/store.js', 'src/store.js', 'src/transports/telepty.js', 'src/tunnel-child.js']);
 });

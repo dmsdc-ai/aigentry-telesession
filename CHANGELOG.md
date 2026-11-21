@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.1 — unreleased — issue #18 scoped responder for tool runtimes without a session credential
+
+- Some assistant clients filter the environment of the model's tool runtime (for example a Codex tool
+  shell with `inherit=core`), so a reply the model sends from there carries no session id, token or
+  credential path. Such a reply reaches the requester as a `claimed_only` candidate and its body stays
+  quarantined and unreadable. That quarantine is correct and is unchanged.
+- New opt-in scoped responder for the host side of such a session (`src/responder/`, command
+  `telesession-responder-pump`): the tool runtime only writes files into a private drop directory and
+  never receives a reusable session bearer. The host-side component, which already owns the session
+  credential, performs the authenticated reply itself.
+  - A request is bound only after the daemon's own audit proves it: exactly one row of a complete page,
+    to this session, stamped local, not spoofed, same payload hash, whose **verified** sender is the
+    request's own reply-to inbox. A claimed, forged or stale request yields no binding at all.
+  - Destination, nonce, principal and session generation come from that recorded binding; the reply
+    body is the only caller-supplied content. A drop file that names anything else is refused.
+  - The capability handed to the tool runtime is single use and request-bound, expires with the request
+    (15 min) and carries no bearer. Wrong capability attempts are bounded.
+  - At most one authenticated send per binding: a duplicate answers with the recorded outcome, an
+    expired binding is refused while an earlier result is preserved, a rotated session credential
+    refuses the old binding, and a send interrupted by a restart stays `uncertain` and is never
+    repeated. Exactly-once delivery is still not provided.
+  - Every acceptance and refusal is recorded with its reason in the responder's own private, locked
+    state directory. The session bearer, the request text and the reply body are never persisted.
+- **Inert by default.** Nothing in the existing request, reply or trust path calls this code. The
+  command refuses to run without `TELESESSION_RESPONDER=1` and the library refuses to be constructed
+  without an explicit activation flag. Activation changes who can cause a trusted send and is a
+  separate approval; profile mode (issue #16) is not supported by the responder yet.
+
 ## 0.3.0 — unreleased — issue #16 assistant profiles (client side of Telepty `client-profile-scope-v1`)
 
 - Opt-in profile mode: `TELESESSION_PROFILE` + `TELESESSION_PROFILES_FILE` (`telesession.profiles/v1`) select the URL,

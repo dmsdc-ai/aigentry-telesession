@@ -49,6 +49,9 @@ Once published, `npm install @dmsdc-ai/telesession@0.2.0` installs it without a 
 | `TELESESSION_PERSIST_INBOX_CREDENTIAL` (optional) | unset/`0` or `1`; `1` requires a state dir and verified POSIX permissions (refused on Windows) | `CONFIG_PERSIST_INVALID`, `CONFIG_STATE_DIR_REQUIRED`, `STORE_CREDENTIAL_PLATFORM_UNSUPPORTED` |
 | `TELESESSION_RELAY_INTERVAL_MS` (optional, **unsupported in 0.2.0** — see [Relay](#relay-and-destination-unsupported-in-020)) | unset/`0` = relay runner off (default); otherwise an integer 1000–3600000 ms, requires a state dir. Turning it on in a live deployment is a separate approval (spec §10). One tick on demand: `telesession-relay-tick` (refuses a held ledger lock, exit 3) | `CONFIG_RELAY_INTERVAL_INVALID`, `CONFIG_STATE_DIR_REQUIRED` |
 
+| `TELESESSION_RESPONDER` (optional, **default off** — see [Scoped responder](#scoped-responder-issue-18-opt-in-default-off)) | unset/anything but `1` = off. `1` activates `telesession-responder-pump` only; it changes who can cause a trusted send and is a separate approval | `RESPONDER_NOT_ACTIVATED` |
+| `TELESESSION_RESPONDER_DROP_DIR` (optional) | absolute, normalized path of the private drop directory the tool runtime writes to; owner-only on POSIX (not verifiable on Windows). Only read when the responder is activated | `RESPONDER_DROP_DIR_INVALID`, `RESPONDER_DROP_PERMISSIONS_INVALID` |
+
 No defaults, no `~/.telepty` lookup, no credential minting. The token never appears in tool
 arguments, results, logs or the state dir. telepty's own peer-lane guard still applies and is not
 bypassed: full prompt exchange is only for a target the operator has designated as a true
@@ -205,6 +208,45 @@ but are **unsupported and default-off**, and no request can complete through the
   delivery.** Do not treat it as one.
 
 Enabling `TELESESSION_RELAY_INTERVAL_MS` in a live deployment is a separate approval.
+
+## Scoped responder (issue #18; opt-in, default off)
+Some clients filter the environment of the model's tool runtime, so a reply the model sends from there
+has no session id, token or credential path and arrives as a `claimed_only` candidate whose body stays
+quarantined. The scoped responder lets such a session answer **without** giving its tool runtime a
+reusable session bearer:
+
+1. The host records the trusted inbound request binding. A request text alone proves nothing: the
+   responder accepts it only when this daemon's audit has exactly one row (complete page) to this
+   session, stamped `trusted-local`, not spoofed, with the same payload hash, whose **verified** sender
+   is that request's own reply-to inbox. Otherwise no binding exists.
+2. The tool runtime gets only `{binding_id, challenge}` — single use, bound to that one request,
+   expiring with it (15 min), no bearer.
+3. The tool runtime writes `<drop>/replies/<binding_id>.json` with `{v, binding_id, challenge, body}`.
+   `body` is the only caller-supplied content; a file naming a destination, nonce or principal is
+   refused, not obeyed. The host composes `REPLY <nonce> <body>` and injects it with the session
+   credential it already owns.
+
+```
+TELESESSION_RESPONDER=1 TELESESSION_RESPONDER_DROP_DIR=<abs private dir> \
+  TELEPTY_SESSION_ID=<this session id> TELEPTY_SESSION_TOKEN=<this session's token> \
+  telesession-responder-pump     # one bounded pass; exit 0 ran, 1 failed, 2 config/activation, 3 state
+```
+
+Run it in the **session host** process, where those variables exist — never in the model's tool shell,
+which is exactly the environment that has none of them. Bindings, outcomes and a bounded audit of every
+acceptance and refusal live in `<state dir>/responder` under their own lock; the bearer, the request
+text and the reply body are never persisted.
+
+At most one authenticated send per binding: a duplicate returns the recorded outcome, an expired
+binding is refused and an earlier result is preserved, a rotated session credential refuses the old
+binding, and a send interrupted by a restart stays `uncertain` and is never repeated (still not
+exactly-once). Quarantine is unchanged: nothing that is quarantined today becomes readable, and a
+request without verified sender evidence gives the tool runtime no reply route at all.
+
+**Activation step (separate approval).** Set `TELESESSION_RESPONDER=1` for that one host process after
+approval. Without it the command refuses (`RESPONDER_NOT_ACTIVATED`) and no other code path in this
+package reaches the responder. Profile mode (issue #16) is not supported yet: the pump refuses with
+`RESPONDER_PROFILE_UNSUPPORTED`.
 
 ## Known limitations
 - **Silent reply rejection (#10, open).** The durable inbox rejects a verified-format reply with 503 when
