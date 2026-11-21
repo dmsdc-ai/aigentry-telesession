@@ -10,23 +10,41 @@
   `telesession-responder-pump`): the tool runtime only writes files into a private drop directory and
   never receives a reusable session bearer. The host-side component, which already owns the session
   credential, performs the authenticated reply itself.
-  - A request is bound only after the daemon's own audit proves it: exactly one row of a complete page,
-    to this session, stamped local, not spoofed, same payload hash, whose **verified** sender is the
-    request's own reply-to inbox. A claimed, forged or stale request yields no binding at all.
-  - Destination, nonce, principal and session generation come from that recorded binding; the reply
-    body is the only caller-supplied content. A drop file that names anything else is refused.
-  - The capability handed to the tool runtime is single use and request-bound, expires with the request
-    (15 min) and carries no bearer. Wrong capability attempts are bounded.
+  - A request is bound only after the daemon's own audit proves it: exactly one row of a complete page
+    carries that payload to this session, stamped local, delivered, not spoofed, with the request's own
+    reply-to inbox as its **verified** sender — and the daemon's observation of that inject must name
+    this session and its current instance. A claimed, forged, stale, ambiguous or
+    differently-addressed request yields no binding at all.
+  - Destination, nonce, principal, session instance and the deadline come from that recorded binding;
+    the reply body is the only caller-supplied content. A drop file that names anything else is refused.
+  - The capability handed to the tool runtime is single use and request-bound, expires with the
+    **requester's own** deadline (taken from the trusted row) and carries no bearer. Wrong capability
+    attempts are bounded.
   - At most one authenticated send per binding: a duplicate answers with the recorded outcome, an
-    expired binding is refused while an earlier result is preserved, a rotated session credential
-    refuses the old binding, and a send interrupted by a restart stays `uncertain` and is never
-    repeated. Exactly-once delivery is still not provided.
+    expired binding is refused while an earlier result is preserved, a rotated session credential cannot
+    open the state at all, and a send interrupted by a restart stays `uncertain` and is never repeated.
+    Exactly-once delivery is still not provided.
   - Every acceptance and refusal is recorded with its reason in the responder's own private, locked
-    state directory. The session bearer, the request text and the reply body are never persisted.
+    state directory. The session bearer, the challenge, the request text and the reply body are never
+    persisted (derived tags, digests and hashes only).
+  - Each committed record is authenticated with a key derived from the session credential the host
+    process holds in memory and never writes down: an edited or transplanted state file is refused, and
+    before any send the daemon's audit — which the tool runtime cannot write — must account for every
+    reply this instance has already made, so a restored or deleted history cannot produce a second send.
+    This holds where the tool runtime does not hold the session credential, which is the configuration
+    this fix is for; the command therefore requires the operator to declare it with
+    `TELESESSION_RESPONDER_TOOL_ENV=filtered`. A same-user actor can still stop replies from working
+    (denial of service); it cannot redirect or duplicate a trusted send.
+  - **Windows is refused** (`RESPONDER_PLATFORM_UNSUPPORTED`): this implementation does not verify
+    Windows ACLs and does not claim protection it has not checked. A lock left by a dead pump is
+    reported (`RESPONDER_LOCK_STALE`) and never reclaimed, as for the other stores.
 - **Inert by default.** Nothing in the existing request, reply or trust path calls this code. The
   command refuses to run without `TELESESSION_RESPONDER=1` and the library refuses to be constructed
   without an explicit activation flag. Activation changes who can cause a trusted send and is a
   separate approval; profile mode (issue #16) is not supported by the responder yet.
+- The reply inject follows the same uncertainty rules as every other inject in this package: an
+  explicitly uncertain or 5xx answer is recorded `uncertain`, never as a definitive refusal, and is
+  never re-sent. Daemon responses are read with a byte ceiling.
 
 ## 0.3.0 — unreleased — issue #16 assistant profiles (client side of Telepty `client-profile-scope-v1`)
 

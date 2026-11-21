@@ -50,7 +50,8 @@ Once published, `npm install @dmsdc-ai/telesession@0.2.0` installs it without a 
 | `TELESESSION_RELAY_INTERVAL_MS` (optional, **unsupported in 0.2.0** — see [Relay](#relay-and-destination-unsupported-in-020)) | unset/`0` = relay runner off (default); otherwise an integer 1000–3600000 ms, requires a state dir. Turning it on in a live deployment is a separate approval (spec §10). One tick on demand: `telesession-relay-tick` (refuses a held ledger lock, exit 3) | `CONFIG_RELAY_INTERVAL_INVALID`, `CONFIG_STATE_DIR_REQUIRED` |
 
 | `TELESESSION_RESPONDER` (optional, **default off** — see [Scoped responder](#scoped-responder-issue-18-opt-in-default-off)) | unset/anything but `1` = off. `1` activates `telesession-responder-pump` only; it changes who can cause a trusted send and is a separate approval | `RESPONDER_NOT_ACTIVATED` |
-| `TELESESSION_RESPONDER_DROP_DIR` (optional) | absolute, normalized path of the private drop directory the tool runtime writes to; owner-only on POSIX (not verifiable on Windows). Only read when the responder is activated | `RESPONDER_DROP_DIR_INVALID`, `RESPONDER_DROP_PERMISSIONS_INVALID` |
+| `TELESESSION_RESPONDER_TOOL_ENV` (required with the responder) | must be `filtered`: the operator's declaration that the model's tool runtime does NOT inherit the session credential. Verify it by running `env \| grep TELEPTY_SESSION` **inside that tool shell** and seeing no output | `RESPONDER_TOOL_ENV_UNVERIFIED` |
+| `TELESESSION_RESPONDER_DROP_DIR` (optional) | absolute, normalized path of the private drop directory the tool runtime writes to; owner-only (POSIX only — the responder refuses Windows). It may not contain, or live inside, the state dir | `RESPONDER_DROP_DIR_INVALID`, `RESPONDER_DROP_DIR_OVERLAPS_STATE`, `RESPONDER_DROP_PERMISSIONS_INVALID` |
 
 No defaults, no `~/.telepty` lookup, no credential minting. The token never appears in tool
 arguments, results, logs or the state dir. telepty's own peer-lane guard still applies and is not
@@ -216,37 +217,60 @@ quarantined. The scoped responder lets such a session answer **without** giving 
 reusable session bearer:
 
 1. The host records the trusted inbound request binding. A request text alone proves nothing: the
-   responder accepts it only when this daemon's audit has exactly one row (complete page) to this
-   session, stamped `trusted-local`, not spoofed, with the same payload hash, whose **verified** sender
-   is that request's own reply-to inbox. Otherwise no binding exists.
+   responder accepts it only when this daemon's audit holds exactly one row (complete page) carrying
+   that payload to this session — stamped `trusted-local`, delivered, not spoofed, and **verified** as
+   sent by that request's own reply-to inbox — and only when the daemon's observation of that same
+   inject names this session and its current instance. A second delivery of the same payload, verified
+   or not, makes it ambiguous and issues nothing. The deadline comes from that row, not from the claim.
 2. The tool runtime gets only `{binding_id, challenge}` — single use, bound to that one request,
-   expiring with it (15 min), no bearer.
+   expiring with the requester's own deadline, no bearer.
 3. The tool runtime writes `<drop>/replies/<binding_id>.json` with `{v, binding_id, challenge, body}`.
    `body` is the only caller-supplied content; a file naming a destination, nonce or principal is
-   refused, not obeyed. The host composes `REPLY <nonce> <body>` and injects it with the session
-   credential it already owns.
+   refused, not obeyed. Before its one inject the host re-proves its own instance, checks the
+   requester's instance and reconciles the daemon's audit against its own send history; then it composes
+   `REPLY <nonce> <body>` and injects it with the session credential it already owns.
 
 ```
-TELESESSION_RESPONDER=1 TELESESSION_RESPONDER_DROP_DIR=<abs private dir> \
+TELESESSION_RESPONDER=1 TELESESSION_RESPONDER_TOOL_ENV=filtered \
+  TELESESSION_RESPONDER_DROP_DIR=<abs private dir> \
   TELEPTY_SESSION_ID=<this session id> TELEPTY_SESSION_TOKEN=<this session's token> \
   telesession-responder-pump     # one bounded pass; exit 0 ran, 1 failed, 2 config/activation, 3 state
 ```
 
 Run it in the **session host** process, where those variables exist — never in the model's tool shell,
 which is exactly the environment that has none of them. Bindings, outcomes and a bounded audit of every
-acceptance and refusal live in `<state dir>/responder` under their own lock; the bearer, the request
-text and the reply body are never persisted.
+acceptance and refusal live in `<state dir>/responder` under their own lock; the bearer, the challenge,
+the request text and the reply body are never persisted (digests and hashes only).
+
+**What holds, and where.** Each committed record is authenticated with a key derived from the session
+credential this host process holds in memory and never writes down, so a process that cannot read that
+credential cannot edit, transplant or forge a binding — an altered file is refused
+(`RESPONDER_STATE_UNAUTHENTIC`), one from another credential instance is refused
+(`RESPONDER_CREDENTIAL_ROTATED`). Because a one-shot command cannot by itself tell an authentic older
+snapshot from the current one, the daemon's audit — which the tool runtime cannot write — decides
+whether this instance has already replied: an audit row that this store's own history does not account
+for refuses the send (`AUDIT_UNACCOUNTED_REPLY`). **This guarantee covers the configuration issue #18 is
+about, where the tool runtime does not hold the session credential.** A tool runtime that does hold it
+(for example codex-cli with its default shell policy) can reply as the session directly, with or without
+this component, so nothing here constrains it; that is why `TELESESSION_RESPONDER_TOOL_ENV=filtered` is
+required, and the operator must verify it. A same-user actor can always delete or corrupt the drop
+directory or the state file and stop replies from working (denial of service); it cannot redirect or
+duplicate a trusted send.
 
 At most one authenticated send per binding: a duplicate returns the recorded outcome, an expired
-binding is refused and an earlier result is preserved, a rotated session credential refuses the old
-binding, and a send interrupted by a restart stays `uncertain` and is never repeated (still not
+binding is refused and an earlier result is preserved, a rotated session credential cannot even open the
+state, and a send interrupted by a restart stays `uncertain` and is never repeated (still not
 exactly-once). Quarantine is unchanged: nothing that is quarantined today becomes readable, and a
 request without verified sender evidence gives the tool runtime no reply route at all.
 
-**Activation step (separate approval).** Set `TELESESSION_RESPONDER=1` for that one host process after
-approval. Without it the command refuses (`RESPONDER_NOT_ACTIVATED`) and no other code path in this
-package reaches the responder. Profile mode (issue #16) is not supported yet: the pump refuses with
-`RESPONDER_PROFILE_UNSUPPORTED`.
+**Activation step (separate approval).** Set `TELESESSION_RESPONDER=1` (with
+`TELESESSION_RESPONDER_TOOL_ENV=filtered`) for that one host process after approval. Without it the
+command refuses (`RESPONDER_NOT_ACTIVATED`) and no other code path in this package reaches the
+responder. **Windows is refused** (`RESPONDER_PLATFORM_UNSUPPORTED`): this implementation does not
+verify Windows ACLs, so it does not claim that protection. Profile mode (issue #16) is not supported
+yet either (`RESPONDER_PROFILE_UNSUPPORTED`). After an abrupt exit the directory stays locked
+(`RESPONDER_LOCK_STALE` when the holder is gone, `RESPONDER_LOCKED` while it lives); recovery is the
+operator removing `<state dir>/responder/lock` once no pump is running, exactly as for the other stores.
 
 ## Known limitations
 - **Silent reply rejection (#10, open).** The durable inbox rejects a verified-format reply with 503 when

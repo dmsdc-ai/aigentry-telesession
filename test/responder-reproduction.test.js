@@ -1,6 +1,6 @@
 // Issue #18 reproduction, then the scoped responder (REPRODUCTION-LINUX-20261121). Daemon-free: the
 // loopback fake telepty (helpers/fake-telepty.js) models the daemon, a real durable store holds the
-// requester's records and a real responder store holds the bindings.
+// requester's records and a real authenticated responder store holds the bindings.
 //
 // (a) TODAY: the model's tool runtime has NO session id, token or credential path, so the reply it sends
 //     itself carries no verified sender. The requester keeps it as a `claimed_only` candidate and never
@@ -8,15 +8,15 @@
 // (b) THE FIX: the same reply, issued through the scoped responder (the host-side component that owns the
 //     session credential), is trusted and readable, bound to the original request.
 //
-// The responder's two daemon calls are the same ones bin/telesession-responder-pump.js makes over HTTP:
-// GET /api/injects (the control token) and POST /api/sessions/:id/inject (the SESSION token).
+// The responder's three daemon calls are the ones bin/telesession-responder-pump.js makes over HTTP:
+// GET /api/injects and GET /api/inject-observations/:id (the control token) and
+// POST /api/sessions/:id/inject (the SESSION token).
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs";
 import path from "node:path";
 import { normalizeConfig, createTeleptyTransport, classifyAuditRows } from "../src/index.js";
-import { openResponderStore } from "../src/responder/store.js";
+import { openResponderStore, deriveStateKey } from "../src/responder/store.js";
 import { createResponder } from "../src/responder/responder.js";
 import { waitFor } from "./helpers.js";
 import { makeSandbox } from "./helpers/fault-fs.js";
@@ -24,23 +24,33 @@ import { startFakeTelepty, parseWire } from "./helpers/fake-telepty.js";
 
 const PREFIX = "tsr18";
 const TARGET = "target-1";
+const POSIX = process.platform !== "win32";
 const NO_LOOPBACK = process.env.TELESESSION_TEST_NO_LOOPBACK === "1"
   ? "NOTRUN: loopback bind/connect not permitted here (TELESESSION_TEST_NO_LOOPBACK=1)" : false;
+// The responder refuses win32 (review r1 F06), so its half of this file is NOTRUN there.
+const SKIP = NO_LOOPBACK || (POSIX ? false : "NOTRUN: the responder refuses win32 (review r1 F06)");
 
 // The daemon surface the responder host needs, over the fake daemon's own state (no HTTP of our own).
 function responderDaemon(fake) {
   return {
-    injects: async ({ to, since, until, limit }) => ({
+    injects: async ({ to, from, since, until, limit }) => ({
       ok: true,
-      injects: fake.audit.filter((r) => r.to === to
+      injects: fake.audit.filter((r) => (to === undefined || r.to === to)
+        && (from === undefined || r.claimed_from === from || r.verified_sender_sid === from)
         && Date.parse(r.ts) >= Date.parse(since) && Date.parse(r.ts) <= Date.parse(until)).slice(0, limit),
       next_cursor: null,
     }),
+    observe: async (injectId) => {
+      const o = fake.observations.get(injectId);
+      return o === undefined || typeof o.session_epoch !== "string"
+        ? { ok: false, code: "OBSERVATION_UNAVAILABLE" }
+        : { ok: true, session_id: o.session_id, session_epoch: o.session_epoch };
+    },
     inject: async ({ to, prompt, from, sessionToken }) => {
       const r = fake.injectAs(sessionToken, to, prompt, from);
       return r.status === 200 && r.body.success === true
         ? { ok: true, inject_id: r.body.inject_id }
-        : { ok: false, code: `DAEMON_HTTP_${r.status}`, sent: "yes" };
+        : { ok: false, code: `DAEMON_HTTP_${r.status}`, sent: "no" };
     },
   };
 }
@@ -62,7 +72,7 @@ test("#18 unchanged trust decision: an audit row without a verified sender is st
     { trusted: false, reason: "claimed_only" });
 });
 
-describe("issue #18 — claimed-only reply from a filtered tool runtime, then the scoped responder", { skip: NO_LOOPBACK }, () => {
+describe("issue #18 — claimed-only reply from a filtered tool runtime, then the scoped responder", { skip: SKIP }, () => {
   test("#18 (a) direct reply without session evidence → claimed_only and quarantined; (b) the scoped responder's reply → trusted and readable", async (t) => {
     const sb = makeSandbox("ts-18-");
     const fake = await startFakeTelepty({ targets: [TARGET] });
@@ -71,7 +81,10 @@ describe("issue #18 — claimed-only reply from a filtered tool runtime, then th
     });
     const tr = createTeleptyTransport(cfg, sb.seam());
     const session = fake.sessions.get(TARGET);
-    const store = openResponderStore({ dir: path.join(sb.root, "responder"), session: TARGET, origin: fake.origin });
+    const store = openResponderStore({
+      dir: path.join(sb.root, "responder"), session: TARGET, origin: fake.origin,
+      stateKey: deriveStateKey(session.bearer, { origin: fake.origin, session: TARGET }),
+    });
     t.after(async () => {
       store.close();
       try { await tr.close(); } catch { /* closed */ }
@@ -113,9 +126,12 @@ describe("issue #18 — claimed-only reply from a filtered tool runtime, then th
     assert.deepEqual(rec.destination, { host: "local", session: s.reply_to });
     assert.match(rec.challenge, /^[A-Za-z0-9_-]{43}$/);
 
+    // The impostor's claimed-only row above is NOT this instance's send, so it neither blocks the
+    // reconciliation nor counts as an earlier reply.
     const out = await responder.reply({ binding_id: rec.binding_id, challenge: rec.challenge, body: "status: green" });
     assert.equal(out.ok, true, JSON.stringify(out));
     assert.equal(out.outcome.result, "sent");
+    assert.equal(out.outcome.destination_instance_ok, true);
 
     const rr = await tr.readReply({ nonce: s.nonce, wait_ms: 8000 });
     assert.equal(rr.reply, "trusted", JSON.stringify(rr));
@@ -125,11 +141,11 @@ describe("issue #18 — claimed-only reply from a filtered tool runtime, then th
     assert.equal(rr.completion_fact, null);
     assert.equal(JSON.stringify(rr).includes("filtered tool runtime"), false, "the quarantined candidate stayed quarantined");
 
-    // The session bearer never reaches the responder's durable state.
-    const raw = fs.readFileSync(path.join(sb.root, "responder", "responder.json"), "utf8");
-    assert.equal(raw.includes(session.bearer), false);
-    assert.equal(raw.includes(rec.challenge), false);
-    assert.equal(raw.includes("status: green"), false);
+    // No secret reaches the responder's durable record (the on-disk bytes are asserted in responder.test.js).
+    const recorded = JSON.stringify(store.snapshot());
+    for (const secret of [session.bearer, rec.challenge, "status: green", "what is the status?"]) {
+      assert.equal(recorded.includes(secret), false, secret);
+    }
 
     // The single use is spent: the same capability sends nothing more, and the readback is stable.
     const again = await responder.reply({ binding_id: rec.binding_id, challenge: rec.challenge, body: "status: red" });
@@ -143,7 +159,10 @@ describe("issue #18 — claimed-only reply from a filtered tool runtime, then th
     const sb = makeSandbox("ts-18-forged-");
     const fake = await startFakeTelepty({ targets: [TARGET] });
     const session = fake.sessions.get(TARGET);
-    const store = openResponderStore({ dir: path.join(sb.root, "responder"), session: TARGET, origin: fake.origin });
+    const store = openResponderStore({
+      dir: path.join(sb.root, "responder"), session: TARGET, origin: fake.origin,
+      stateKey: deriveStateKey(session.bearer, { origin: fake.origin, session: TARGET }),
+    });
     t.after(async () => { store.close(); await fake.close(); sb.remove(); });
     const responder = createResponder({
       store, activated: true, daemon: responderDaemon(fake),
